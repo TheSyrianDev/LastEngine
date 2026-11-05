@@ -11,6 +11,8 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Cmd {
     Serve(ServeArgs),
+    /// Print hardware facts as stable JSON on stdout (for launchers / model recommendation).
+    Probe,
     /// Print GGUF header metadata.
     Inspect { path: String },
     H2d { path: String },

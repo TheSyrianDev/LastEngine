@@ -31,3 +31,13 @@ Ideas per source engine: see TECHNIQUES.md. Rule: ideas only, no source copying.
 - Sage-A1.5 facts (from header): arch qwen35moe, 41 layers, full attention every 4th layer (rest DeltaNet/SSM: conv 4, state 128, inner 4096), 256 experts / 8 used, expert ff 512 + shared expert 512, 16 heads / 2 KV heads, head dim 256, rope dim 64, 1 MTP layer, tokenizer gpt2/qwen35 pre-tokenizer, Jinja chat template (needs a Jinja engine; plan: minijinja crate).
 - Local references: engines in ~/AI/engines (llama-mainline baseline, gs-mce-wiki docs for expert-cache ideas), llama-swap config ~/AI/rig/router/config.yaml, launch guard ~/AI/rig/tools/lastengine-serve.sh (first arg = min free MiB).
 - 2026-11-05 Stats endpoints (user request): GET /stats (model info, uptime, active requests, totals incl. prefill/decode tok/s, avg TTFT, last request), GET /stats/requests?limit=N (last 200 requests). Each chat response also carries a llama.cpp-style `timings` object (prompt_n/ms/per_second, predicted_*, cache_n, time_to_first_token_ms). Backends report `Usage.prefill_ms`; the server measures TTFT and decode time. Per-token latency, VRAM/cache hit rate and expert-cache stats to be added when real backends exist.
+
+## Status 2026-11-05 and next steps
+Done: tcq3 KV (buun-llama MIT design), q8/q4 KV, YaRN, split-PV decode attention, flash prefill, DeltaNet register state, `probe --json`.
+Next, in order:
+1. **Measured auto-tune** (`lastengine tune --model M`): run short prefill+decode trials over chunk x kv x expert-slot budget, cache the best by (gpu, model hash, ctx) in ~/.cache/lastengine; `serve` loads the cached result when flags are unset. Today's defaults are only rules.
+2. **MTP / speculative decode**: Sage has MTP block blk.40; draft 1-3 tokens, verify as a batch through the prefill path; legacy reached up to 110 tok/s on larger GPUs.
+3. **Expert-miss reduction**: ~40% of expert lookups miss on 4 GB VRAM; options: CPU-compute missed experts (needs CPU kernels), persistent expert-heat file, predictive prefetch from the previous token's routing.
+4. **Prefill GEMM pipelining** (cp.async double-buffer in mmq tiles).
+5. **Per-layer sync removal / CUDA graphs** for decode (about 16 of 35 ms/token is host gaps).
+6. Embedded library crate + Vulkan/Metal backends behind the Backend trait.

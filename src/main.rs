@@ -1,6 +1,7 @@
 //! lastengine: `lastengine serve --model X.gguf --addr 127.0.0.1:PORT [flags]`
 mod backend;
 mod cli;
+mod probe;
 mod cpu_ref;
 mod gguf;
 mod gpu;
@@ -94,6 +95,7 @@ async fn main() {
             println!("decode {} tok in {:.2}s = {:.1} tok/s  hits {} misses {}", nn, t1.elapsed().as_secs_f32(), nn as f32 / t1.elapsed().as_secs_f32(), gp.hits, gp.misses);
             println!("{}", String::from_utf8_lossy(&tk.decode_bytes(&out)));
         }
+        cli::Cmd::Probe => println!("{}", probe::probe_json()),
         cli::Cmd::H2d { path } => gpu::h2d_bench(&path),
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {
