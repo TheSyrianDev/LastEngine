@@ -522,6 +522,9 @@ __device__ __forceinline__ void mma16(int* c, int a0, int a1, int b0) {
   asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
                : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
 }
+#ifndef NODEQ
+#define NODEQ 0
+#endif
 template <int TY, bool HALF>
 __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_idx, const int* out_idx, const signed char* xq, const float* xd, const int* xs,
                          float* out, int rows, int cols) {
@@ -547,7 +550,7 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
     int u = u0 + la_u;
     {
       int w[8]; float s0 = 0.f, s1 = 0.f, mn = 0.f;
-      if (wok) { uload<TY>(wrow + (u / UB) * BY, u % UB, w, s0, s1, mn); } else { for (int i = 0; i < 8; i++) w[i] = 0; }
+      if (wok && !NODEQ) { uload<TY>(wrow + (u / UB) * BY, u % UB, w, s0, s1, mn); } else { for (int i = 0; i < 8; i++) w[i] = 0; }
       #pragma unroll
       for (int i = 0; i < 8; i++) As[la_u][la_row][i] = w[i];
       Sa0[la_u][la_row] = s0; Sa1[la_u][la_row] = s1; Sam[la_u][la_row] = mn;
