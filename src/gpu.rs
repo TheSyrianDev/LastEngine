@@ -192,13 +192,14 @@ impl Gpu {
         let snap: Vec<(Dp, Dp)> = if mtp_on { (0..c.n_layer).map(|l| if conv[l] != 0 { (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4)) } else { (0, 0) }).collect() } else { vec![] };
         if mtp_on { let l = c.n_layer; let _ = l; dzero(kc[c.n_layer], if kvq == 0 { ctx_len * nkv * hd * 2 } else if kvq == 1 { ctx_len * nkv * hd } else if kvq == 3 { ctx_len * nkv * (hd / 128) * 52 } else { ctx_len * nkv * hd / 2 }); }
         let ib = dalloc(128);
+        let egb = a(16 * c.ff_exp);
         Gpu {
             nall, mtp, hprev: dalloc(c.n_embd * 4), mcat: dalloc(2 * c.n_embd * 4), snap, rows_out: vec![], want_rows: false,
             store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), mmq: std::env::var("LE_MMQ").map_or(true, |v| v != "0"), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
             cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: ib + 64, prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
             idx: ib, rw: a(16), shg: a(4),
-            eg: a(c.n_used * c.ff_exp), eu: a(c.n_used * c.ff_exp), ea: a(c.n_used * c.ff_exp), ed: a(c.n_used * c.n_embd),
+            eg: egb, eu: egb + (8 * c.ff_exp * 4) as u64, ea: a(c.n_used * c.ff_exp), ed: a(c.n_used * c.n_embd),
             shg_t: a(c.ff_shexp), shu_t: a(c.ff_shexp), sha_t: a(c.ff_shexp), shd_t: a(c.n_embd),
             ptr_g: pbase, ptr_u: pbase + 64, ptr_d: pbase + 128,
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
@@ -540,8 +541,11 @@ impl Gpu {
             let pd: Vec<u64> = slots.iter().map(|&s| base(s, 2)).collect();
             { let mut all = [0u64; 24]; for (n, v) in pg.iter().enumerate() { all[n] = *v; all[8 + n] = pu[n]; all[16 + n] = pd[n]; } unsafe { result::memcpy_htod_sync(self.ptr_g, &all).unwrap() }; }
             let k = c.n_used;
-            self.mv_ptrs(ly.ety[0], self.ptr_g, self.h, 0, self.eg, c.ff_exp, c.n_embd, 0, k);
-            self.mv_ptrs(ly.ety[1], self.ptr_u, self.h, 0, self.eu, c.ff_exp, c.n_embd, 0, k);
+            if ly.ety[0] == ly.ety[1] && k == 8 { self.mv_ptrs(ly.ety[0], self.ptr_g, self.h, 0, self.eg, c.ff_exp, c.n_embd, 0, 16); }
+            else {
+                self.mv_ptrs(ly.ety[0], self.ptr_g, self.h, 0, self.eg, c.ff_exp, c.n_embd, 0, k);
+                self.mv_ptrs(ly.ety[1], self.ptr_u, self.h, 0, self.eu, c.ff_exp, c.n_embd, 0, k);
+            }
             self.swiglu(self.eg, self.eu, self.ea, k * c.ff_exp);
             self.qx(self.ea, k * c.ff_exp, 1);
             self.mv_ptrs(ly.ety[2], self.ptr_d, self.ea, 1, self.ed, c.n_embd, c.ff_exp, c.ff_exp, k);
