@@ -3,7 +3,7 @@
 use super::*;
 use crate::cpu_ref::Cfg as Config;
 
-pub fn tmax() -> usize { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *T.get_or_init(|| std::env::var("LE_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(1024)) }
+pub fn tmax() -> usize { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *T.get_or_init(|| std::env::var("LE_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048)) }
 pub const WV: usize = 32;
 
 pub struct Pf {
