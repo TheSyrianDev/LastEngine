@@ -46,6 +46,13 @@ impl Gpu {
         // Auto-tune the knobs the user left unset, from the free VRAM and the requested context.
         {
             let (free0, _) = result::mem_get_info().expect("meminfo");
+            let tkey = format!("{}|{}-{}-{}|{}", crate::tune::gpu_name(), m.cfg.n_layer, m.cfg.n_embd, m.cfg.n_expert, ctx_len);
+            eprintln!("tunekey {tkey}");
+            if std::env::var("LE_NOTUNE").is_err() { if let Some(e) = crate::tune::lookup(&tkey) {
+                if std::env::var("LE_KV").is_err() { std::env::set_var("LE_KV", &e.kv); }
+                if std::env::var("LE_TMAX").is_err() { std::env::set_var("LE_TMAX", e.chunk.to_string()); }
+                eprintln!("gpu: using tuned settings kv {} chunk {}", e.kv, e.chunk);
+            } }
             let kv_auto = match std::env::var("LE_KV").ok().as_deref() { None | Some("") | Some("auto") => true, _ => false };
             if kv_auto { std::env::set_var("LE_KV", if ctx_len <= 8192 { "f16" } else { "q8" }); }
             if std::env::var("LE_TMAX").is_err() { std::env::set_var("LE_TMAX", if free0 >= (3200usize << 20) { "2048" } else { "1024" }); }

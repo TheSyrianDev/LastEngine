@@ -13,6 +13,8 @@ pub enum Cmd {
     Serve(ServeArgs),
     /// Print hardware facts as stable JSON on stdout (for launchers / model recommendation).
     Probe,
+    /// Measure candidate kv/chunk settings on this machine and cache the best for `serve`.
+    Tune { model: String, #[arg(long, default_value_t = 8192)] ctx: usize },
     /// Print GGUF header metadata.
     Inspect { path: String },
     H2d { path: String },
