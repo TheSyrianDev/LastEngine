@@ -13,6 +13,7 @@ pub enum Cmd {
     Serve(ServeArgs),
     /// Print GGUF header metadata.
     Inspect { path: String },
+    Template { path: String },
     /// Print token ids for TEXT using the model's tokenizer.
     Tokenize { path: String, text: String },
 }

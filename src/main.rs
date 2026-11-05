@@ -3,6 +3,7 @@ mod backend;
 mod cli;
 mod gguf;
 mod server;
+mod template;
 mod tokenizer;
 
 use clap::Parser;
@@ -26,6 +27,12 @@ async fn main() {
             let ids = t.encode(&text);
             println!("{ids:?}");
             println!("{:?}", String::from_utf8_lossy(&t.decode_bytes(&ids)));
+        }
+        cli::Cmd::Template { path } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let t = g.kv.get("tokenizer.chat_template").and_then(|v| v.as_str()).expect("no template");
+            let msgs: Vec<serde_json::Value> = serde_json::from_str(r#"[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!"},{"role":"user","content":"Bye"}]"#).unwrap();
+            println!("{}", template::render(t, &msgs, None, true, "", "").unwrap_or_else(|e| e));
         }
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {
