@@ -24,3 +24,9 @@ Goal: fast local inference for MoE models on small machines, started by llama-sw
 9. Vulkan, then Metal; later SSD experts, vision, embeddings.
 
 Ideas per source engine: see TECHNIQUES.md. Rule: ideas only, no source copying.
+
+## Status log
+- 2026-11-05 M1 done: `lastengine serve --stub` serves /v1/models, /props, /health, /v1/chat/completions (SSE + usage + cached_tokens, stops when client disconnects).
+- 2026-11-05 M2 part 1: `src/gguf.rs` reads headers from spec; `lastengine inspect FILE` verified on Sage-A1.5 (15 GB).
+- Sage-A1.5 facts (from header): arch qwen35moe, 41 layers, full attention every 4th layer (rest DeltaNet/SSM: conv 4, state 128, inner 4096), 256 experts / 8 used, expert ff 512 + shared expert 512, 16 heads / 2 KV heads, head dim 256, rope dim 64, 1 MTP layer, tokenizer gpt2/qwen35 pre-tokenizer, Jinja chat template (needs a Jinja engine; plan: minijinja crate).
+- Local references: engines in ~/AI/engines (llama-mainline baseline, gs-mce-wiki docs for expert-cache ideas), llama-swap config ~/AI/rig/router/config.yaml, launch guard ~/AI/rig/tools/lastengine-serve.sh (first arg = min free MiB).

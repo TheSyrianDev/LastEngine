@@ -11,6 +11,8 @@ pub struct Cli {
 #[derive(Subcommand)]
 pub enum Cmd {
     Serve(ServeArgs),
+    /// Print GGUF header metadata.
+    Inspect { path: String },
 }
 
 #[derive(clap::Args, Clone, Debug)]
