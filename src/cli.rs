@@ -13,6 +13,8 @@ pub enum Cmd {
     Serve(ServeArgs),
     /// Print GGUF header metadata.
     Inspect { path: String },
+    /// GPU forward: top-N logprobs + 32-token greedy decode.
+    Gpu { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize, #[arg(default_value_t = 128)] margin: usize },
     /// CPU reference: print top-N next-token logprobs for PROMPT.
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },
     Dequant { path: String, name: String, n: usize, out: String },

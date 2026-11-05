@@ -135,3 +135,5 @@ pub fn dequant_row(ty: u32, src: &[u8], out: &mut [f32]) {
         _ => panic!("unsupported quant type {ty}"),
     }
 }
+
+pub fn iq3_grid() -> &'static [[u8; 4]; 256] { &IQ3XXS_GRID }

@@ -3,6 +3,7 @@ mod backend;
 mod cli;
 mod cpu_ref;
 mod gguf;
+mod gpu;
 mod server;
 mod quant;
 mod template;
@@ -71,6 +72,26 @@ async fn main() {
             let mut ix: Vec<usize> = (0..logits.len()).collect();
             ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
+        }
+        cli::Cmd::Gpu { path, prompt, top, margin } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let m = std::sync::Arc::new(cpu_ref::Model::load(&path, &g));
+            let mut gp = gpu::Gpu::new(m, 2048, margin);
+            let ids = tk.encode(&prompt);
+            let t0 = std::time::Instant::now();
+            let mut logits = vec![];
+            for id in ids.iter() { logits = gp.forward(*id); }
+            println!("prefill {} tok in {:.2}s", ids.len(), t0.elapsed().as_secs_f32());
+            let mut ix: Vec<usize> = (0..logits.len()).collect();
+            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let lse = mx + logits.iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
+            ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
+            for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
+            let mut cur = ix[0] as u32; let t1 = std::time::Instant::now(); let mut out = vec![];
+            for _ in 0..32 { out.push(cur); logits = gp.forward(cur); cur = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32; }
+            println!("decode 32 tok in {:.2}s = {:.1} tok/s  hits {} misses {}", t1.elapsed().as_secs_f32(), 32.0 / t1.elapsed().as_secs_f32(), gp.hits, gp.misses);
+            println!("{}", String::from_utf8_lossy(&tk.decode_bytes(&out)));
         }
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {

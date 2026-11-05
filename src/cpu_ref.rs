@@ -5,6 +5,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub struct Cfg {
     pub n_layer: usize, pub n_embd: usize, pub n_head: usize, pub n_kv: usize, pub head_dim: usize,
     pub rope_dim: usize, pub rope_base: f32, pub eps: f32, pub n_expert: usize, pub n_used: usize,
@@ -53,6 +54,30 @@ impl Model {
         Model { cfg, mmap, t, vocab, kv_repeat_interleave: std::env::var("KV_INTERLEAVE").is_ok() }
     }
 
+    pub fn embed(&self, token: u32) -> Vec<f32> {
+        let n = self.cfg.n_embd; let mut x = vec![0f32; n];
+        let (t, b) = self.bytes("token_embd.weight"); let rb = quant::row_bytes(t.ty, n);
+        quant::dequant_row(t.ty, &b[token as usize * rb..(token as usize + 1) * rb], &mut x); x
+    }
+    pub fn raw(&self, name: &str) -> &[u8] { self.bytes(name).1 }
+    /// (ggml type, cols = dims[0], rows = dims[1] or 1)
+    pub fn dims2(&self, name: &str) -> (u32, usize, usize) { let t = &self.t[name]; (t.ty, t.dims[0], *t.dims.get(1).unwrap_or(&1)) }
+    /// bytes of one expert's (gate, up, down) weights in layer l
+    pub fn expert_bytes(&self, l: usize) -> [usize; 3] {
+        ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].map(|n| {
+            let t = &self.t[&format!("blk.{l}.{n}")];
+            quant::row_bytes(t.ty, t.dims[0]) * t.dims[1]
+        })
+    }
+    pub fn expert_types(&self, l: usize) -> [u32; 3] {
+        ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"].map(|n| self.t[&format!("blk.{l}.{n}")].ty)
+    }
+    pub fn expert_parts(&self, l: usize, e: usize) -> [&[u8]; 3] {
+        let sizes = self.expert_bytes(l);
+        let names = ["ffn_gate_exps.weight", "ffn_up_exps.weight", "ffn_down_exps.weight"];
+        let mut i = 0;
+        names.map(|n| { let t = &self.t[&format!("blk.{l}.{n}")]; let o = t.off + e * sizes[i]; let r = &self.mmap[o..o + sizes[i]]; i += 1; r })
+    }
     pub fn new_state(&self) -> State {
         let c = &self.cfg;
         State {
@@ -75,7 +100,7 @@ impl Model {
         o
     }
     /// y[r] = W[r,:]·x for rows [r0, r0+rows) of a 2D tensor (row length = dims[0]); `expert` selects a slab of a 3D tensor.
-    fn matvec(&self, name: &str, expert: usize, x: &[f32]) -> Vec<f32> {
+    pub fn matvec(&self, name: &str, expert: usize, x: &[f32]) -> Vec<f32> {
         let (t, b) = self.bytes(name);
         let (cols, rows) = (t.dims[0], t.dims[1]);
         let rb = quant::row_bytes(t.ty, cols);
