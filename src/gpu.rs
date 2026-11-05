@@ -92,7 +92,7 @@ impl Gpu {
         let out_norm = vec1("output_norm.weight");
         let out_w = mat("output.weight");
         let (hd, nkv, nh) = (c.head_dim, c.n_kv, c.n_head);
-        let conv_ch = c.d_inner * 2 + 2 * c.n_group * c.d_state;
+        let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
         let (mut conv, mut sdelta, mut kc, mut vc) = (vec![], vec![], vec![], vec![]);
         for l in 0..c.n_layer {
             if (l + 1) % c.interval == 0 {
@@ -183,10 +183,69 @@ impl Gpu {
     fn add(&self, x: Dp, y: Dp, n: usize) { self.launch("add_inplace", (n.div_ceil(256) as u32, 1), 256, 0, &[P(x), P(y), I(n as i32)]); }
     fn swiglu(&self, g: Dp, u: Dp, o: Dp, n: usize) { self.launch("swiglu", (n.div_ceil(256) as u32, 1), 256, 0, &[P(g), P(u), P(o), I(n as i32)]); }
 
+    pub fn pos(&self) -> usize { self.pos }
+    /// Copy only the recurrent (DeltaNet) state to host; KV is append-only so a position is enough for it.
+    pub fn snap_recurrent(&mut self) -> Vec<u8> {
+        self.bind();
+        unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
+        let c = self.m.cfg.clone();
+        let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
+        let mut out = Vec::new();
+        for l in 0..c.n_layer { if !self.lay[l].full {
+            for (p, n) in [(self.conv[l], conv_ch * (c.conv_k - 1) * 4), (self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4)] {
+                let o = out.len(); out.resize(o + n, 0); unsafe { result::memcpy_dtoh_sync(&mut out[o..], p).unwrap() }
+            }
+        } }
+        out
+    }
+    pub fn restore_recurrent(&mut self, b: &[u8], pos: usize) {
+        self.bind();
+        let c = self.m.cfg.clone();
+        let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
+        let mut o = 0;
+        for l in 0..c.n_layer { if !self.lay[l].full {
+            for (p, n) in [(self.conv[l], conv_ch * (c.conv_k - 1) * 4), (self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4)] {
+                unsafe { result::memcpy_htod_sync(p, &b[o..o + n]).unwrap() }; o += n;
+            }
+        } }
+        self.pos = pos;
+    }
+    /// Serialise the model state (recurrent state + KV up to pos) into bytes.
+    pub fn export_state(&mut self) -> Vec<u8> {
+        self.bind();
+        unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
+        let c = self.m.cfg.clone();
+        let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(self.pos as u64).to_le_bytes());
+        let rd = |p: Dp, n: usize, out: &mut Vec<u8>| { let o = out.len(); out.resize(o + n, 0); unsafe { result::memcpy_dtoh_sync(&mut out[o..], p).unwrap() } };
+        for l in 0..c.n_layer {
+            if self.lay[l].full { let n = self.pos * c.n_kv * c.head_dim * 2; rd(self.kc[l], n, &mut out); rd(self.vc[l], n, &mut out); }
+            else { rd(self.conv[l], conv_ch * (c.conv_k - 1) * 4, &mut out); rd(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4, &mut out); }
+        }
+        out
+    }
+    pub fn import_state(&mut self, b: &[u8]) -> Result<(), String> {
+        self.bind();
+        let c = self.m.cfg.clone();
+        let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
+        if b.len() < 8 { return Err("short".into()); }
+        let pos = u64::from_le_bytes(b[..8].try_into().unwrap()) as usize;
+        if pos >= self.ctx_len { return Err("state longer than context".into()); }
+        let mut o = 8usize;
+        let mut wr = |p: Dp, n: usize| -> Result<(), String> { if o + n > b.len() { return Err("truncated".into()) } unsafe { result::memcpy_htod_sync(p, &b[o..o + n]).unwrap() }; o += n; Ok(()) };
+        for l in 0..c.n_layer {
+            if self.lay[l].full { let n = pos * c.n_kv * c.head_dim * 2; wr(self.kc[l], n)?; wr(self.vc[l], n)?; }
+            else { wr(self.conv[l], conv_ch * (c.conv_k - 1) * 4)?; wr(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4)?; }
+        }
+        self.pos = pos;
+        Ok(())
+    }
+
     pub fn reset(&mut self) {
         self.bind();
         let c = &self.m.cfg;
-        let conv_ch = c.d_inner * 2 + 2 * c.n_group * c.d_state;
+        let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
         for l in 0..c.n_layer { if !self.lay[l].full { dzero(self.conv[l], conv_ch * (c.conv_k - 1) * 4); dzero(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4); } }
         self.pos = 0;
     }

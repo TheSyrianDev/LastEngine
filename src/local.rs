@@ -4,7 +4,7 @@ use crate::{cpu_ref::Model, gguf::Gguf, gpu::Gpu, template, tokenizer::Tokenizer
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-struct Inner { gpu: Gpu, hist: Vec<u32>, rng: u64 }
+struct Inner { gpu: Gpu, hist: Vec<u32>, rng: u64, snap: Option<(Vec<u32>, Vec<u8>)> }
 pub struct Local { inner: Mutex<Inner>, tok: Tokenizer, tmpl: String, name: String, n_ctx: usize, n_params: u64, bos: String, eos: String }
 
 impl Local {
@@ -21,7 +21,7 @@ impl Local {
         let gpu = Gpu::new(m, ctx, margin);
         let s = |id: Option<u32>| id.map(|i| tok.tokens[i as usize].clone()).unwrap_or_default();
         let (bos, eos) = (s(tok.bos), s(tok.eos));
-        Ok(Local { inner: Mutex::new(Inner { gpu, hist: vec![], rng: 0x9E3779B97F4A7C15 }), tok, tmpl, name, n_ctx: ctx, n_params, bos, eos })
+        Ok(Local { inner: Mutex::new(Inner { gpu, hist: vec![], rng: 0x9E3779B97F4A7C15, snap: None }), tok, tmpl, name, n_ctx: ctx, n_params, bos, eos })
     }
 }
 
@@ -116,6 +116,35 @@ fn parse_tools(s: &str) -> Vec<ToolCall> {
 }
 
 impl Backend for Local {
+    fn slot_save(&self, path: &std::path::Path) -> Result<(usize, usize), String> {
+        let mut g = self.inner.lock().unwrap();
+        let g = &mut *g;
+        if g.hist.len() != g.gpu.pos() { return Err("context in flux".into()); }
+        let st = g.gpu.export_state();
+        let mut out = Vec::with_capacity(st.len() + g.hist.len() * 4 + 16);
+        out.extend_from_slice(b"LESLOT01");
+        out.extend_from_slice(&(g.hist.len() as u64).to_le_bytes());
+        for t in &g.hist { out.extend_from_slice(&t.to_le_bytes()); }
+        out.extend_from_slice(&st);
+        if let Some(d) = path.parent() { std::fs::create_dir_all(d).map_err(|e| e.to_string())?; }
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &out).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
+        Ok((g.hist.len(), out.len()))
+    }
+    fn slot_restore(&self, path: &std::path::Path) -> Result<(usize, usize), String> {
+        let b = std::fs::read(path).map_err(|e| e.to_string())?;
+        if b.len() < 16 || &b[..8] != b"LESLOT01" { return Err("bad slot file".into()); }
+        let n = u64::from_le_bytes(b[8..16].try_into().unwrap()) as usize;
+        if b.len() < 16 + n * 4 { return Err("truncated".into()); }
+        let hist: Vec<u32> = (0..n).map(|i| u32::from_le_bytes(b[16 + i * 4..20 + i * 4].try_into().unwrap())).collect();
+        let mut g = self.inner.lock().unwrap();
+        let g = &mut *g;
+        g.gpu.import_state(&b[16 + n * 4..])?;
+        if g.gpu.pos() != n { return Err("token/state mismatch".into()); }
+        g.hist = hist;
+        Ok((n, b.len()))
+    }
     fn model_id(&self) -> String { self.name.clone() }
     fn n_ctx(&self) -> usize { self.n_ctx }
     fn n_params(&self) -> u64 { self.n_params }
@@ -131,9 +160,25 @@ impl Backend for Local {
         let g = &mut *g;
         let max_pos = self.n_ctx.saturating_sub(1);
         let ids = if ids.len() > max_pos { ids[ids.len() - max_pos..].to_vec() } else { ids };
-        // Recurrent state cannot rewind: reuse only when the cached history is a prefix of the new prompt.
-        let cached = if !g.hist.is_empty() && ids.starts_with(&g.hist) && g.hist.len() < ids.len() { g.hist.len() } else { g.gpu.reset(); g.hist.clear(); 0 };
-        let mut logits = g.gpu.prefill(&ids[cached..]);
+        // Recurrent state cannot rewind: continue from the live state when it is a prefix of the prompt, else from the
+        // snapshot taken at the start of the previous assistant turn, else from scratch.
+        let live = if !g.hist.is_empty() && ids.starts_with(&g.hist) && g.hist.len() < ids.len() { g.hist.len() } else { 0 };
+        let snap_n = match &g.snap { Some((t, _)) if !t.is_empty() && ids.starts_with(t) && t.len() < ids.len() => t.len(), _ => 0 };
+        let mut cached = live;
+        if snap_n > live {
+            let (t, b) = g.snap.take().unwrap();
+            g.gpu.restore_recurrent(&b, t.len());
+            g.snap = Some((t, b)); cached = snap_n;
+        } else if live == 0 { g.gpu.reset(); }
+        // Snapshot at the last turn start so the next request (which re-renders this reply differently) can resume there.
+        let im = self.tok.special("<|im_start|>");
+        let split = im.and_then(|im| ids.iter().rposition(|&t| t == im)).filter(|&p| p > cached + 16).unwrap_or(0);
+        let mut logits = if split > 0 {
+            g.gpu.prefill(&ids[cached..split]);
+            let b = g.gpu.snap_recurrent();
+            g.snap = Some((ids[..split].to_vec(), b));
+            g.gpu.prefill(&ids[split..])
+        } else { g.gpu.prefill(&ids[cached..]) };
         g.hist = ids.clone();
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let start_in_think = prompt.trim_end().ends_with("<think>");

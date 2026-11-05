@@ -34,6 +34,9 @@ pub trait Backend: Send + Sync {
     fn supports_tools(&self) -> bool { false }
     /// Streams deltas to `emit`; `emit` returns false when the client is gone (stop generating).
     fn generate(&self, req: &GenRequest, emit: &mut dyn FnMut(Delta) -> bool) -> Usage;
+    /// Save the current context (tokens + model state) to `path`; returns (tokens, bytes).
+    fn slot_save(&self, _path: &std::path::Path) -> Result<(usize, usize), String> { Err("slots not supported".into()) }
+    fn slot_restore(&self, _path: &std::path::Path) -> Result<(usize, usize), String> { Err("slots not supported".into()) }
 }
 
 pub struct Stub;

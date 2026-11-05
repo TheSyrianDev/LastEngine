@@ -81,6 +81,7 @@ impl Tokenizer {
     }
 
     /// Encode text; special tokens appearing literally in the text map to their ids.
+    pub fn special(&self, s: &str) -> Option<u32> { self.specials.iter().find(|(t, _)| t == s).map(|(_, i)| *i) }
     pub fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::new();
         let mut rest = text;

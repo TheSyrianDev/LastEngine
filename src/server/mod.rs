@@ -25,7 +25,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         let l = tokio::task::spawn_blocking(move || crate::local::Local::load(&path, ctx, margin, tf.as_deref())).await.map_err(|e| e.to_string())??;
         Arc::new(l)
     };
-    let st = Arc::new(App { be, stats: Stats::new() });
+    let st = Arc::new(App { be, slot_dir: a.slot_save_path.clone().map(std::path::PathBuf::from), stats: Stats::new() });
     let app = Router::new()
         .route("/stats", get(stats_summary))
         .route("/stats/requests", get(stats_requests))
@@ -33,6 +33,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         .route("/props", get(props))
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/v1/chat/completions", post(chat))
+        .route("/slots/{id}", post(slot_action))
         .with_state(st);
     let l = tokio::net::TcpListener::bind(&a.addr).await.map_err(|e| format!("bind {}: {e}", a.addr))?;
     eprintln!("lastengine listening on {}", a.addr);
@@ -41,6 +42,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
 
 pub struct App {
     be: Shared,
+    slot_dir: Option<std::path::PathBuf>,
     stats: Stats,
 }
 
@@ -172,4 +174,30 @@ fn timings(s: &ReqStat) -> Value {
         "predicted_n": s.completion_tokens, "predicted_ms": s.decode_ms, "predicted_per_second": s.decode_tok_s,
         "cache_n": s.cached_tokens, "time_to_first_token_ms": s.time_to_first_token_ms,
     })
+}
+
+async fn slot_action(State(app): State<Arc<App>>, axum::extract::Path(id): axum::extract::Path<u32>,
+                     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>, Json(body): Json<Value>) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let err = |code: u16, m: &str| (axum::http::StatusCode::from_u16(code).unwrap(), Json(json!({"error": {"code": code, "message": m, "type": "invalid_request_error"}}))).into_response();
+    let Some(dir) = app.slot_dir.clone() else { return err(501, "slot save path not configured (--slot-save-path)") };
+    let Some(name) = body.get("filename").and_then(|v| v.as_str()).map(|s| s.to_string()) else { return err(400, "filename required") };
+    if name.is_empty() || name.contains('/') || name.contains("..") || name.contains('\\') { return err(400, "invalid filename"); }
+    let path = dir.join(&name);
+    let action = q.get("action").cloned().unwrap_or_default();
+    let be = app.be.clone();
+    let t0 = std::time::Instant::now();
+    let r = tokio::task::spawn_blocking(move || match action.as_str() {
+        "save" => be.slot_save(&path).map(|r| (true, r)),
+        "restore" => be.slot_restore(&path).map(|r| (false, r)),
+        _ => Err("action must be save or restore".into()),
+    }).await.unwrap();
+    match r {
+        Ok((save, (n, bytes))) => {
+            let ms = t0.elapsed().as_secs_f64() * 1000.0;
+            if save { Json(json!({"id_slot": id, "filename": name, "n_saved": n, "n_written": bytes, "timings": {"save_ms": ms}})).into_response() }
+            else { Json(json!({"id_slot": id, "filename": name, "n_restored": n, "n_read": bytes, "timings": {"restore_ms": ms}})).into_response() }
+        }
+        Err(e) => err(400, &e),
+    }
 }
