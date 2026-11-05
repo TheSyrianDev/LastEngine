@@ -13,6 +13,8 @@ pub enum Cmd {
     Serve(ServeArgs),
     /// Print GGUF header metadata.
     Inspect { path: String },
+    /// CPU reference: print top-N next-token logprobs for PROMPT.
+    Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },
     Dequant { path: String, name: String, n: usize, out: String },
     Template { path: String },
     /// Print token ids for TEXT using the model's tokenizer.
