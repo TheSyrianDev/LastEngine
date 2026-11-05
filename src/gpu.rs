@@ -191,12 +191,13 @@ impl Gpu {
         let mtp = if mtp_on { Some(Mtp { eh: mat(&format!("blk.{}.nextn.eh_proj.weight", c.n_layer)), enorm: vec1(&format!("blk.{}.nextn.enorm.weight", c.n_layer)), hnorm: vec1(&format!("blk.{}.nextn.hnorm.weight", c.n_layer)), shn: vec1(&format!("blk.{}.nextn.shared_head_norm.weight", c.n_layer)) }) } else { None };
         let snap: Vec<(Dp, Dp)> = if mtp_on { (0..c.n_layer).map(|l| if conv[l] != 0 { (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4)) } else { (0, 0) }).collect() } else { vec![] };
         if mtp_on { let l = c.n_layer; let _ = l; dzero(kc[c.n_layer], if kvq == 0 { ctx_len * nkv * hd * 2 } else if kvq == 1 { ctx_len * nkv * hd } else if kvq == 3 { ctx_len * nkv * (hd / 128) * 52 } else { ctx_len * nkv * hd / 2 }); }
+        let ib = dalloc(128);
         Gpu {
             nall, mtp, hprev: dalloc(c.n_embd * 4), mcat: dalloc(2 * c.n_embd * 4), snap, rows_out: vec![], want_rows: false,
             store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), mmq: std::env::var("LE_MMQ").map_or(true, |v| v != "0"), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
-            cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: dalloc(64), prw: a(16), pf_extra, pf_issued: 0,
+            cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: ib + 64, prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
-            idx: dalloc(64), rw: a(16), shg: a(4),
+            idx: ib, rw: a(16), shg: a(4),
             eg: a(c.n_used * c.ff_exp), eu: a(c.n_used * c.ff_exp), ea: a(c.n_used * c.ff_exp), ed: a(c.n_used * c.n_embd),
             shg_t: a(c.ff_shexp), shu_t: a(c.ff_shexp), sha_t: a(c.ff_shexp), shd_t: a(c.n_embd),
             ptr_g: pbase, ptr_u: pbase + 64, ptr_d: pbase + 128,
@@ -514,21 +515,21 @@ impl Gpu {
             self.mv(ly.router, self.h, 0, self.logits);
             self.qx(self.h, c.n_embd, 0);
             self.launch("router_topk", (1, 1), 32, 0, &[P(self.logits), I(c.n_expert as i32), I(c.n_used as i32), P(self.idx), P(self.rw)]);
-            let mut idx = [0i32; 8];
-            unsafe { result::memcpy_dtoh_sync(&mut idx[..c.n_used], self.idx).unwrap() };
-            let mut slots: Vec<usize> = Vec::new();
-            for i in 0..c.n_used { let s = self.slot_for(l, idx[i] as usize, &slots); slots.push(s); }
-            if self.pf_pending { unsafe { sys::cuStreamWaitEvent(self.st.cu_stream(), self.ev, 0).result().unwrap() }; self.pf_pending = false; }
-            if l + 1 < c.n_layer {
+            let kk = (c.n_used + self.pf_extra).min(16);
+            let has_next = l + 1 < c.n_layer;
+            if has_next {
                 let nl = &self.lay[l + 1] as *const Lay; let nl = unsafe { &*nl };
                 self.rms(self.x, nl.post_norm, self.ph, c.n_embd);
                 self.mv(nl.router, self.ph, 0, self.plog);
-                let kk = (c.n_used + self.pf_extra).min(16);
                 self.launch("router_topk", (1, 1), 32, 0, &[P(self.plog), I(c.n_expert as i32), I(kk as i32), P(self.pidx), P(self.prw)]);
-                let mut pi = [0i32; 16];
-                unsafe { result::memcpy_dtoh_sync(&mut pi[..kk], self.pidx).unwrap() };
-                self.prefetch(l + 1, &pi[..kk], &slots);
             }
+            let mut both = [0i32; 32];
+            unsafe { result::memcpy_dtoh_sync(&mut both, self.idx).unwrap() };
+            let idx = &both[..16]; let pi = &both[16..32];
+            let mut slots: Vec<usize> = Vec::new();
+            for i in 0..c.n_used { let s = self.slot_for(l, idx[i] as usize, &slots); slots.push(s); }
+            if self.pf_pending { unsafe { sys::cuStreamWaitEvent(self.st.cu_stream(), self.ev, 0).result().unwrap() }; self.pf_pending = false; }
+            if has_next { self.prefetch(l + 1, &pi[..kk], &slots); }
             let base = |s: usize, part: usize| self.arena + (s * self.slot_bytes) as u64 + ly.ebytes[..part].iter().sum::<usize>() as u64;
             let pg: Vec<u64> = slots.iter().map(|&s| base(s, 0)).collect();
             let pu: Vec<u64> = slots.iter().map(|&s| base(s, 1)).collect();
