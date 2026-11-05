@@ -199,16 +199,24 @@ extern "C" __global__ void swiglu(const float* g, const float* u, float* o, int 
 
 // Router: softmax over n experts, top-k, renormalise. One block of 256 threads, n <= 1024.
 extern "C" __global__ void router_topk(const float* logits, int n, int k, int* idx_out, float* w_out) {
-  __shared__ float p[1024]; __shared__ float red[32]; __shared__ int sel[32]; __shared__ float selw[32];
-  for (int i = threadIdx.x; i < n; i += blockDim.x) p[i] = logits[i];
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float m = -1e30f; for (int i = 0; i < n; i++) m = fmaxf(m, p[i]);
-    float s = 0.f; for (int i = 0; i < n; i++) { p[i] = __expf(p[i] - m); s += p[i]; }
-    float tot = 0.f;
-    for (int t = 0; t < k; t++) { int b = 0; float bv = -1.f; for (int i = 0; i < n; i++) if (p[i] > bv) { bv = p[i]; b = i; } sel[t] = b; selw[t] = bv / s; tot += bv / s; p[b] = -2.f; }
-    for (int t = 0; t < k; t++) { idx_out[t] = sel[t]; w_out[t] = selw[t] / tot; }
+  // one warp; lane owns experts lane, lane+32, ...
+  __shared__ float p[1024]; int lane = threadIdx.x & 31;
+  if (threadIdx.x >= 32) return;
+  float m = -1e30f; for (int i = lane; i < n; i += 32) { p[i] = logits[i]; m = fmaxf(m, p[i]); }
+  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
+  float s = 0.f; for (int i = lane; i < n; i += 32) { p[i] = __expf(p[i] - m); s += p[i]; }
+  for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
+  __syncwarp();
+  float tot = 0.f; float selw[16]; int sel[16];
+  for (int t = 0; t < k; t++) {
+    float bv = -1.f; int bi = 0x7fffffff;
+    for (int i = lane; i < n; i += 32) if (p[i] > bv) { bv = p[i]; bi = i; }
+    for (int o = 16; o; o >>= 1) { float ov = __shfl_xor_sync(FULL, bv, o); int oi = __shfl_xor_sync(FULL, bi, o); if (ov > bv || (ov == bv && oi < bi)) { bv = ov; bi = oi; } }
+    sel[t] = bi; selw[t] = bv / s; tot += bv / s;
+    if (lane == (bi & 31)) p[bi] = -2.f;
+    __syncwarp();
   }
+  if (lane == 0) for (int t = 0; t < k; t++) { idx_out[t] = sel[t]; w_out[t] = selw[t] / tot; }
 }
 // moe combine: out[i] += sum_s w[s]*down[s*n+i] + sigmoid(gate)*sh[i]
 extern "C" __global__ void moe_combine(float* out, const float* down, const float* w, int k, const float* sh, const float* shgate, int n) {
