@@ -78,7 +78,7 @@ async fn main() {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
             let m = std::sync::Arc::new(cpu_ref::Model::load(&path, &g));
-            let mut gp = gpu::Gpu::new(m, 2048, margin);
+            let mut gp = gpu::Gpu::new(m, std::env::var("LE_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048), margin);
             let ids = tk.encode(&prompt);
             let t0 = std::time::Instant::now();
             let mut logits = vec![];

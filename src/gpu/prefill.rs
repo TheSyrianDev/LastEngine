@@ -82,14 +82,19 @@ impl Gpu {
                 self.dense(ly.q.unwrap(), 0, pf.b0, t); self.dense(ly.k.unwrap(), 0, pf.b1, t); self.dense(ly.v.unwrap(), 0, pf.b2, t);
                 self.launch("attn_prep_b", ((nh + nkv) as u32, t as u32), 256, 0, &[P(pf.b0), P(pf.b1), P(pf.b2), P(ly.qn), P(ly.kn), P(pf.y), P(pf.b3), P(self.kc[l]), P(self.vc[l]),
                     I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(c.rope_base), I(pos0 as i32), F(c.eps)]);
+                if hd == 256 && std::env::var("LE_FLASH").map_or(true, |v| v != "0") {
+                    let smem = ((64 + 32) * (hd + 8) + hd * 40) * 2;
+                    self.launch("attn_flash_256", (t.div_ceil(64) as u32, nh as u32), 128, smem as u32, &[P(pf.y), P(self.kc[l]), P(self.vc[l]), P(pf.b3), P(pf.o), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32)]);
+                } else {
                 let mut tb = 0;
-                while tb < t {
-                    let g = pf.g.min(t - tb); let pos_first = pos0 + tb; let nmax = pos_first + g;
-                    self.launch3("attn_scores_b", (nmax.div_ceil(8) as u32, nkv as u32, g as u32), 256, 0, &[P(pf.y), P(self.kc[l]), P(pf.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
-                    self.launch("attn_softmax_b", (nh as u32, g as u32), 256, 0, &[P(pf.scores), I(nh as i32), I(self.ctx_len as i32), I(pos_first as i32)]);
-                    self.launch("attn_pv_b", (nkv as u32, g as u32), hd as u32, 0, &[P(pf.scores), P(self.vc[l]), P(pf.b3), P(pf.o), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
-                    tb += g;
-                }
+                    while tb < t {
+                        let g = pf.g.min(t - tb); let pos_first = pos0 + tb; let nmax = pos_first + g;
+                        self.launch3("attn_scores_b", (nmax.div_ceil(8) as u32, nkv as u32, g as u32), 256, 0, &[P(pf.y), P(self.kc[l]), P(pf.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
+                        self.launch("attn_softmax_b", (nh as u32, g as u32), 256, 0, &[P(pf.scores), I(nh as i32), I(self.ctx_len as i32), I(pos_first as i32)]);
+                        self.launch("attn_pv_b", (nkv as u32, g as u32), hd as u32, 0, &[P(pf.scores), P(self.vc[l]), P(pf.b3), P(pf.o), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
+                        tb += g;
+                    }
+    }
                 self.pqx(pf.o, nu(nh * hd), 1, 0); self.dense(ly.o.unwrap(), 1, pf.b1, t);
                 self.launch("add_inplace", ((t * c.n_embd).div_ceil(256) as u32, 1), 256, 0, &[P(pf.x), P(pf.b1), I((t * c.n_embd) as i32)]);
             } else {
