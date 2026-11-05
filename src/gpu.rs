@@ -33,7 +33,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -94,15 +94,19 @@ impl Gpu {
         let out_w = mat("output.weight");
         let (hd, nkv, nh) = (c.head_dim, c.n_kv, c.n_head);
         let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
+        let kvq: i32 = match std::env::var("LE_KV").unwrap_or_default().to_lowercase().as_str() { "" | "f16" | "fp16" => 0, s if s.contains('4') || s.starts_with("tcq") => 2, _ => 1 };
+        let (mut ksc, mut vsc) = (vec![], vec![]);
         let (mut conv, mut sdelta, mut kc, mut vc) = (vec![], vec![], vec![], vec![]);
         for l in 0..c.n_layer {
             if (l + 1) % c.interval == 0 {
                 conv.push(0); sdelta.push(0);
-                let (a, b) = (dalloc(ctx_len * nkv * hd * 2), dalloc(ctx_len * nkv * hd * 2)); kc.push(a); vc.push(b);
+                let eb = match kvq { 0 => ctx_len * nkv * hd * 2, 1 => ctx_len * nkv * hd, _ => ctx_len * nkv * hd / 2 };
+                let (a, b) = (dalloc(eb), dalloc(eb)); kc.push(a); vc.push(b);
+                let sb = if kvq == 0 { 16 } else { ctx_len * nkv * (hd / 32) * 2 }; ksc.push(dalloc(sb)); vsc.push(dalloc(sb));
             } else {
                 let (a, b) = (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4));
                 dzero(a, conv_ch * (c.conv_k - 1) * 4); dzero(b, c.n_vhead * c.d_state * c.d_state * 4);
-                conv.push(a); sdelta.push(b); kc.push(0); vc.push(0);
+                conv.push(a); sdelta.push(b); kc.push(0); vc.push(0); ksc.push(0); vsc.push(0);
             }
         }
         let mut slot_bytes = 0;
@@ -152,7 +156,7 @@ impl Gpu {
             ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
-            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0,
+            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, kvq, ksc, vsc,
             f, st, _ctx: ctx, m,
         }
     }
@@ -221,10 +225,15 @@ impl Gpu {
         out.extend_from_slice(&(self.pos as u64).to_le_bytes());
         let rd = |p: Dp, n: usize, out: &mut Vec<u8>| { let o = out.len(); out.resize(o + n, 0); unsafe { result::memcpy_dtoh_sync(&mut out[o..], p).unwrap() } };
         for l in 0..c.n_layer {
-            if self.lay[l].full { let n = self.pos * c.n_kv * c.head_dim * 2; rd(self.kc[l], n, &mut out); rd(self.vc[l], n, &mut out); }
+            if self.lay[l].full { let (n, ns) = self.kv_bytes(self.pos); rd(self.kc[l], n, &mut out); rd(self.vc[l], n, &mut out); if ns > 0 { rd(self.ksc[l], ns, &mut out); rd(self.vsc[l], ns, &mut out); } }
             else { rd(self.conv[l], conv_ch * (c.conv_k - 1) * 4, &mut out); rd(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4, &mut out); }
         }
         out
+    }
+    /// (data bytes per K or V buffer, scale bytes per buffer) for `pos` cached positions.
+    fn kv_bytes(&self, pos: usize) -> (usize, usize) {
+        let c = &self.m.cfg; let v = pos * c.n_kv * c.head_dim;
+        match self.kvq { 0 => (v * 2, 0), 1 => (v, pos * c.n_kv * (c.head_dim / 32) * 2), _ => (v / 2, pos * c.n_kv * (c.head_dim / 32) * 2) }
     }
     pub fn import_state(&mut self, b: &[u8]) -> Result<(), String> {
         self.bind();
@@ -233,10 +242,11 @@ impl Gpu {
         if b.len() < 8 { return Err("short".into()); }
         let pos = u64::from_le_bytes(b[..8].try_into().unwrap()) as usize;
         if pos >= self.ctx_len { return Err("state longer than context".into()); }
+        let kvb = |p: usize| self.kv_bytes(p);
         let mut o = 8usize;
         let mut wr = |p: Dp, n: usize| -> Result<(), String> { if o + n > b.len() { return Err("truncated".into()) } unsafe { result::memcpy_htod_sync(p, &b[o..o + n]).unwrap() }; o += n; Ok(()) };
         for l in 0..c.n_layer {
-            if self.lay[l].full { let n = pos * c.n_kv * c.head_dim * 2; wr(self.kc[l], n)?; wr(self.vc[l], n)?; }
+            if self.lay[l].full { let (n, ns) = kvb(pos); wr(self.kc[l], n)?; wr(self.vc[l], n)?; if ns > 0 { wr(self.ksc[l], ns)?; wr(self.vsc[l], ns)?; } }
             else { wr(self.conv[l], conv_ch * (c.conv_k - 1) * 4)?; wr(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4)?; }
         }
         self.pos = pos;
@@ -334,11 +344,11 @@ impl Gpu {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.q.unwrap(), self.h, 0, self.t0); self.mv(ly.k.unwrap(), self.h, 0, self.t1); self.mv(ly.v.unwrap(), self.h, 0, self.t2);
                 self.launch("attn_prep", ((nh + nkv) as u32, 1), 256, 0, &[P(self.t0), P(self.t1), P(self.t2), P(ly.qn), P(ly.kn), P(self.y), P(self.t3), P(self.kc[l]), P(self.vc[l]),
-                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(c.rope_base), I(pos as i32), F(c.eps)]);
+                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(c.rope_base), I(pos as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq)]);
                 let n = pos + 1;
-                self.launch("attn_scores", (n.div_ceil(8) as u32, nh as u32), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32)]);
+                self.launch("attn_scores", (n.div_ceil(8) as u32, nh as u32), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.ksc[l]), I(self.kvq)]);
                 self.launch("attn_softmax", (nh as u32, 1), 256, 0, &[P(self.scores), I(n as i32), I(self.ctx_len as i32)]);
-                self.launch("attn_pv", (nh as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.t3), P(self.t0), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32)]);
+                self.launch("attn_pv", (nh as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.t3), P(self.t0), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.vsc[l]), I(self.kvq)]);
                 self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             } else {

@@ -218,10 +218,33 @@ extern "C" __global__ void moe_combine(float* out, const float* down, const floa
   out[i] += a;
 }
 
+
+// ---- quantised KV cache: kvq 0 = f16, 1 = int8, 2 = int4; one f16 scale per 32 values (data and scales in separate arrays) ----
+__device__ __forceinline__ float kv_wmax(float v) { for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(FULL, v, o)); return v; }
+// Collective over the warp: element i of vector `vec` (hd values) gets value v. All 32 lanes must call it together.
+__device__ __forceinline__ void kv_store(void* c, __half* sc, int kvq, size_t vec, int i, float v, int hd) {
+  if (kvq == 0) { ((__half*)c)[vec * hd + i] = __float2half(v); return; }
+  float a = kv_wmax(fabsf(v)), lim = kvq == 1 ? 127.f : 7.f, s = a / lim;
+  __half sh = __float2half(s); float sr = __half2float(sh); float inv = sr > 0.f ? 1.f / sr : 0.f;
+  int q = (int)rintf(v * inv); q = max(-(int)lim - (kvq == 2), min((int)lim, q));
+  if ((i & 31) == 0) sc[vec * (hd / 32) + i / 32] = sh;
+  if (kvq == 1) ((signed char*)c)[vec * hd + i] = (signed char)q;
+  else {
+    int nb = __shfl_xor_sync(FULL, q, 1);
+    if ((i & 1) == 0) ((unsigned char*)c)[vec * (hd / 2) + i / 2] = (unsigned char)((q & 15) | ((nb & 15) << 4));
+  }
+}
+__device__ __forceinline__ float kv_ld(const void* c, const __half* sc, int kvq, size_t vec, int i, int hd) {
+  if (kvq == 0) return __half2float(((const __half*)c)[vec * hd + i]);
+  float s = __half2float(sc[vec * (hd / 32) + i / 32]);
+  if (kvq == 1) return (float)((const signed char*)c)[vec * hd + i] * s;
+  int b = ((const unsigned char*)c)[vec * (hd / 2) + i / 2]; int n = (i & 1) ? (b >> 4) : (b & 15);
+  return (float)((n ^ 8) - 8) * s;
+}
 // ---- full attention ----
 // split qf [nh][2*hd] -> q (rmsnorm*w, rope) and gate; k rmsnorm+rope; write k,v into f16 cache at pos. One block per head (nh q heads then nkv k heads).
 extern "C" __global__ void attn_prep(const float* qf, const float* kf, const float* vf, const float* qn, const float* kn,
-    float* q, float* gate, __half* kc, __half* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos, float eps) {
+    float* q, float* gate, void* kc, void* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos, float eps, __half* ksc, __half* vsc, int kvq) {
   __shared__ float buf[512]; __shared__ float red[32];
   int h = blockIdx.x; bool isq = h < nh; int hh = isq ? h : h - nh;
   const float* src = isq ? qf + (size_t)hh * 2 * hd : kf + (size_t)hh * hd;
@@ -240,15 +263,15 @@ extern "C" __global__ void attn_prep(const float* qf, const float* kf, const flo
     if (i < half) { float th = pos * powf(base, -2.f * i / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[i] * cs - buf[i + half] * sn; }
     else if (i < rope_dim) { int j = i - half; float th = pos * powf(base, -2.f * j / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[j] * sn + buf[i] * cs; }
     if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
-    else { kc[((size_t)pos * nkv + hh) * hd + i] = __float2half(v); vc[((size_t)pos * nkv + hh) * hd + i] = __float2half(vf[(size_t)hh * hd + i]); }
+    else { size_t vec = (size_t)pos * nkv + hh; kv_store(kc, ksc, kvq, vec, i, v, hd); kv_store(vc, vsc, kvq, vec, i, vf[(size_t)hh * hd + i], hd); }
   }
 }
 // scores[h][t] = q_h . k_t / sqrt(hd). grid (ceil(n/8), nh); each warp one position.
-extern "C" __global__ void attn_scores(const float* q, const __half* kc, float* scores, int nkv, int nh, int hd, int n, int stride) {
+extern "C" __global__ void attn_scores(const float* q, const void* kc, float* scores, int nkv, int nh, int hd, int n, int stride, const __half* ksc, int kvq) {
   int h = blockIdx.y, kvh = h / (nh / nkv); int t = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   if (t >= n) return;
-  const __half* k = kc + ((size_t)t * nkv + kvh) * hd; float a = 0.f;
-  for (int i = lane; i < hd; i += 32) a += q[h * hd + i] * __half2float(k[i]);
+  size_t vec = (size_t)t * nkv + kvh; float a = 0.f;
+  for (int i = lane; i < hd; i += 32) a += q[h * hd + i] * kv_ld(kc, ksc, kvq, vec, i, hd);
   a = warp_sum(a); if (lane == 0) scores[(size_t)h * stride + t] = a * rsqrtf((float)hd);
 }
 extern "C" __global__ void attn_softmax(float* scores, int n, int stride) {
@@ -265,9 +288,9 @@ extern "C" __global__ void attn_softmax(float* scores, int n, int stride) {
   for (int i = threadIdx.x; i < n; i += blockDim.x) s[i] *= inv;
 }
 // o[h][d] = sigmoid(gate) * sum_t p[t] v[t][d]. grid nh, block hd.
-extern "C" __global__ void attn_pv(const float* scores, const __half* vc, const float* gate, float* o, int nkv, int nh, int hd, int n, int stride) {
+extern "C" __global__ void attn_pv(const float* scores, const void* vc, const float* gate, float* o, int nkv, int nh, int hd, int n, int stride, const __half* vsc, int kvq) {
   int h = blockIdx.x, kvh = h / (nh / nkv), d = threadIdx.x; float a = 0.f;
-  for (int t = 0; t < n; t++) a += scores[(size_t)h * stride + t] * __half2float(vc[((size_t)t * nkv + kvh) * hd + d]);
+  for (int t = 0; t < n; t++) a += scores[(size_t)h * stride + t] * kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd);
   o[h * hd + d] = a * sigm_f(gate[h * hd + d]);
 }
 
@@ -398,7 +421,7 @@ extern "C" __global__ void moe_combine_b(float* out, const float* down, const fl
 // ---- batched full attention ----
 // grid (nh + nkv, T). qf [T][nh*2hd], kf/vf [T][nkv*hd]; q/gate out [T][nh*hd]. position = pos0 + token.
 extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const float* vf, const float* qn, const float* kn,
-    float* q, float* gate, __half* kc, __half* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos0, float eps) {
+    float* q, float* gate, void* kc, void* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos0, float eps, __half* ksc, __half* vsc, int kvq) {
   __shared__ float buf[512]; __shared__ float red[32];
   int t = blockIdx.y, pos = pos0 + t;
   qf += (size_t)t * nh * 2 * hd; kf += (size_t)t * nkv * hd; vf += (size_t)t * nkv * hd; q += (size_t)t * nh * hd; gate += (size_t)t * nh * hd;
@@ -419,16 +442,16 @@ extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const f
     if (i < half) { float th = pos * powf(base, -2.f * i / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[i] * cs - buf[i + half] * sn; }
     else if (i < rope_dim) { int j = i - half; float th = pos * powf(base, -2.f * j / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[j] * sn + buf[i] * cs; }
     if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
-    else { kc[((size_t)pos * nkv + hh) * hd + i] = __float2half(v); vc[((size_t)pos * nkv + hh) * hd + i] = __float2half(vf[(size_t)hh * hd + i]); }
+    else { size_t vec = (size_t)pos * nkv + hh; kv_store(kc, ksc, kvq, vec, i, v, hd); kv_store(vc, vsc, kvq, vec, i, vf[(size_t)hh * hd + i], hd); }
   }
 }
 // Query group: tokens tb..tb+G. scores[g][h][pos] for pos <= pos0+tb+g. grid (ceil(nmax/8), nh, G).
-extern "C" __global__ void attn_scores_b(const float* q, const __half* kc, float* scores, int nkv, int nh, int hd, int pos_first, int stride, int tb) {
+extern "C" __global__ void attn_scores_b(const float* q, const void* kc, float* scores, int nkv, int nh, int hd, int pos_first, int stride, int tb, const __half* ksc, int kvq) {
   int g = blockIdx.z, kvh = blockIdx.y, hpk = nh / nkv; int p = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   int n = pos_first + g + 1;
   if (p >= n) return;
-  const __half* k = kc + ((size_t)p * nkv + kvh) * hd; float kr[8];
-  for (int j = 0; j < 8; j++) { int i = lane + 32 * j; kr[j] = i < hd ? __half2float(k[i]) : 0.f; }
+  size_t kvec = (size_t)p * nkv + kvh; float kr[8];
+  for (int j = 0; j < 8; j++) { int i = lane + 32 * j; kr[j] = i < hd ? kv_ld(kc, ksc, kvq, kvec, i, hd) : 0.f; }
   float sc = rsqrtf((float)hd);
   for (int hh = 0; hh < hpk; hh++) {
     int h = kvh * hpk + hh; const float* qq = q + ((size_t)(tb + g) * nh + h) * hd; float a = 0.f;
@@ -451,11 +474,11 @@ extern "C" __global__ void attn_softmax_b(float* scores, int nh, int stride, int
   for (int i = threadIdx.x; i < n; i += blockDim.x) s[i] *= inv;
 }
 // grid (nkv, G), block hd.
-extern "C" __global__ void attn_pv_b(const float* scores, const __half* vc, const float* gate, float* o, int nkv, int nh, int hd, int pos_first, int stride, int tb) {
+extern "C" __global__ void attn_pv_b(const float* scores, const void* vc, const float* gate, float* o, int nkv, int nh, int hd, int pos_first, int stride, int tb, const __half* vsc, int kvq) {
   int kvh = blockIdx.x, g = blockIdx.y, hpk = nh / nkv, d = threadIdx.x, n = pos_first + g + 1; float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   const float* sc = scores + ((size_t)g * nh + kvh * hpk) * stride;
   for (int t = 0; t < n; t++) {
-    float v = __half2float(vc[((size_t)t * nkv + kvh) * hd + d]);
+    float v = kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd);
     #pragma unroll
     for (int hh = 0; hh < 8; hh++) if (hh < hpk) a[hh] += sc[(size_t)hh * stride + t] * v;
   }
@@ -645,7 +668,7 @@ __device__ __forceinline__ void mma16816h(float* c, unsigned a0, unsigned a1, un
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 template <int HD>
-__device__ void flash_impl(const float* q, const __half* kc, const __half* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv) {
+__device__ void flash_impl(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq) {
   constexpr int PQ = HD + 8, VT = 40;
   extern __shared__ __align__(16) __half fsm[];
   __half* qs = fsm; __half* ks = qs + 64 * PQ; __half* vt = ks + 32 * PQ;
@@ -668,11 +691,20 @@ __device__ void flash_impl(const float* q, const __half* kc, const __half* vc, c
     for (int i = tid; i < 32 * HD / 8; i += 128) {
       int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
       uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
-      if (k0 + r <= last) { size_t off = (size_t)(k0 + r) * kvd + kvh * HD + c; kv = *(const uint4*)(kc + off); vv = *(const uint4*)(vc + off); }
-      *(uint4*)(ks + r * PQ + c) = kv;
-      const __half* vh = (const __half*)&vv;
-      #pragma unroll
-      for (int j = 0; j < 8; j++) vt[(c + j) * VT + r] = vh[j];
+      if (kvq == 0) {
+        if (k0 + r <= last) { size_t off = (size_t)(k0 + r) * kvd + kvh * HD + c; kv = *(const uint4*)((const __half*)kc + off); vv = *(const uint4*)((const __half*)vc + off); }
+        *(uint4*)(ks + r * PQ + c) = kv;
+        const __half* vh = (const __half*)&vv;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) vt[(c + j) * VT + r] = vh[j];
+      } else {
+        size_t vec = (size_t)(k0 + r) * nkv + kvh; bool ok = k0 + r <= last;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+          ks[r * PQ + c + j] = __float2half(ok ? kv_ld(kc, ksc, kvq, vec, c + j, HD) : 0.f);
+          vt[(c + j) * VT + r] = __float2half(ok ? kv_ld(vc, vsc, kvq, vec, c + j, HD) : 0.f);
+        }
+      }
     }
     __syncthreads();
     float s[4][4];
@@ -729,6 +761,6 @@ __device__ void flash_impl(const float* q, const __half* kc, const __half* vc, c
     }
   }
 }
-extern "C" __global__ void __launch_bounds__(128) attn_flash_256(const float* q, const __half* kc, const __half* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv) {
-  flash_impl<256>(q, kc, vc, gate, out, pos0, T, nh, nkv);
+extern "C" __global__ void __launch_bounds__(128) attn_flash_256(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq) {
+  flash_impl<256>(q, kc, vc, gate, out, pos0, T, nh, nkv, ksc, vsc, kvq);
 }
