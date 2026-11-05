@@ -1,0 +1,26 @@
+# LastEngine plan (approved answers 2026-11-05)
+
+Goal: fast local inference for MoE models on small machines, started by llama-swap, used by LastHarness. Picks its own flags.
+
+## Decisions
+- HTTP boundary stays: llama-swap launches `lastengine-server`; LastHarness is unchanged.
+- Baselines: Sage-A1.5-35B-A3B (APEX-I-MiniPlus) on RTX 3050 4 GB / 24 GB RAM first; a Qwen3.x MoE as the universal second baseline. Compare against legacy binary and llama.cpp.
+- Model targets: Sage/Qwen MoE, LFM3 series (LFM2.5 dropped).
+- Platforms: all (Linux, Windows, macOS; NVIDIA, AMD/Intel, Apple, CPU-only). Design a backend trait from day one; CUDA + CPU first, then Vulkan, then Metal.
+- Explicit flags always override auto-tune. Keep the legacy flag names accepted (--model --addr --gpu --ctx --kv --chunk --vram-margin --threads --mtp --slot-save-path --chat-template-file, YaRN flags).
+
+## Server contract (from LastHarness, verified file:line in LastHarness/crates/lh-provider, lh-core)
+/v1/chat/completions SSE with stream_options.include_usage and prompt_tokens_details.cached_tokens; reasoning_content; tool_calls by index; stop generating when the client socket closes; /v1/models (health, data[0].meta.n_params); /props (n_ctx, supports_tools, supports_reasoning_effort, modalities.vision); /slots/0?action=save|restore with --slot-save-path (n_saved/n_restored). Not needed first: tool_choice, logprobs, seed, stop, vision input, Anthropic route, embeddings.
+
+## Milestones
+1. Server skeleton with stub backend + bench harness (legacy, llama.cpp, new).
+2. GGUF loader, tokenizer, chat templates (from specs).
+3. Backend trait; CPU backend; dense CUDA decode + sampling.
+4. Qwen MoE + DeltaNet, then LFM3; correctness vs legacy.
+5. Expert tiering (pinned host experts, VRAM cache, CPU misses, prefetch, persisted heat).
+6. KV slot save/restore.
+7. Auto-tune (probe + measured search, cached per machine+model).
+8. Prefill speed, KV quant, speculative decoding (MTP, n-gram).
+9. Vulkan, then Metal; later SSD experts, vision, embeddings.
+
+Ideas per source engine: see TECHNIQUES.md. Rule: ideas only, no source copying.
