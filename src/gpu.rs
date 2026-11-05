@@ -523,6 +523,10 @@ impl Gpu {
                 self.mv(nl.router, self.ph, 0, self.plog);
                 self.launch("router_topk", (1, 1), 32, 0, &[P(self.plog), I(c.n_expert as i32), I(kk as i32), P(self.pidx), P(self.prw)]);
             }
+            self.mv(ly.sh_gate, self.h, 0, self.shg_t); self.mv(ly.sh_up, self.h, 0, self.shu_t);
+            self.swiglu(self.shg_t, self.shu_t, self.sha_t, c.ff_shexp);
+            self.qx(self.sha_t, c.ff_shexp, 1); self.mv(ly.sh_down, self.sha_t, 1, self.shd_t);
+            self.mv(ly.shg_in, self.h, 0, self.shg);
             let mut both = [0i32; 32];
             unsafe { result::memcpy_dtoh_sync(&mut both, self.idx).unwrap() };
             let idx = &both[..16]; let pi = &both[16..32];
@@ -541,10 +545,6 @@ impl Gpu {
             self.swiglu(self.eg, self.eu, self.ea, k * c.ff_exp);
             self.qx(self.ea, k * c.ff_exp, 1);
             self.mv_ptrs(ly.ety[2], self.ptr_d, self.ea, 1, self.ed, c.n_embd, c.ff_exp, c.ff_exp, k);
-            self.mv(ly.sh_gate, self.h, 0, self.shg_t); self.mv(ly.sh_up, self.h, 0, self.shu_t);
-            self.swiglu(self.shg_t, self.shu_t, self.sha_t, c.ff_shexp);
-            self.qx(self.sha_t, c.ff_shexp, 1); self.mv(ly.sh_down, self.sha_t, 1, self.shd_t);
-            self.mv(ly.shg_in, self.h, 0, self.shg);
             self.launch("moe_combine", (c.n_embd.div_ceil(256) as u32, 1), 256, 0, &[P(self.x), P(self.ed), P(self.rw), I(k as i32), P(self.shd_t), P(self.shg), I(c.n_embd as i32)]);
             if self.dbg && pos == self.dbg_pos { let mut v = vec![0f32; c.n_embd]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, self.x).unwrap() }; eprintln!("L{l} {:.4} {:.4}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
         }
