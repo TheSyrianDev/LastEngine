@@ -44,7 +44,7 @@ impl Gpu {
         let ctx = CudaContext::new(0).expect("cuda");
         let st = ctx.default_stream();
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
-        let mut src = String::from("#include <cuda_fp16.h>\n__constant__ unsigned int IQ3_G32[256] = {");
+        let mut src = String::from("#include <cuda_fp16.h>\n__device__ const unsigned int IQ3_G32[256] = {");
         for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
         src.push_str("};\n");
         src.push_str(include_str!("cuda/kernels.cu"));
