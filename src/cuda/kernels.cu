@@ -404,10 +404,13 @@ extern "C" __global__ void delta_step(const float* y, const float* alpha, const 
   float a = alpha[vh] + dtb[vh]; float sp = a > 20.f ? a : logf(1.f + __expf(a));
   float eg = __expf(a_log[vh] * sp), beta = sigm_f(betaraw[vh]);
   float* Sh = S + (size_t)vh * dk * dk;
+  float col[128];
   float kmem = 0.f;
-  for (int i = 0; i < dk; i++) { float s = Sh[i * dk + j] * eg; Sh[i * dk + j] = s; kmem += s * ks[i]; }
+  #pragma unroll
+  for (int i = 0; i < 128; i++) { float s = Sh[i * dk + j] * eg; col[i] = s; kmem += s * ks[i]; }
   float d = (v[j] - kmem) * beta, oo = 0.f;
-  for (int i = 0; i < dk; i++) { float s = Sh[i * dk + j] + ks[i] * d; Sh[i * dk + j] = s; oo += s * qs[i]; }
+  #pragma unroll
+  for (int i = 0; i < 128; i++) { float s = col[i] + ks[i] * d; Sh[i * dk + j] = s; oo += s * qs[i]; }
   // gated rmsnorm over the head's dk outputs
   float s2 = warp_sum(oo * oo); if ((j & 31) == 0) red[j >> 5] = s2; __syncthreads();
   float rr = rsqrtf((red[0] + red[1] + red[2] + red[3]) / dk + eps);
