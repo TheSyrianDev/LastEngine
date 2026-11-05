@@ -15,6 +15,13 @@ async fn main() {
         cli::Cmd::Inspect { path } => match gguf::Gguf::open(&path) {
             Ok(g) => {
                 println!("GGUF v{} arch={:?} tensors={} data_start={}", g.version, g.arch(), g.tensors.len(), g.data_start);
+                let mut by: std::collections::BTreeMap<(u32, String), (usize, u64)> = Default::default();
+                for t in &g.tensors {
+                    let base = t.name.split('.').filter(|p| p.parse::<u32>().is_err()).collect::<Vec<_>>().join(".");
+                    let e = by.entry((t.ggml_type, base)).or_default();
+                    e.0 += 1; e.1 += t.dims.iter().product::<u64>();
+                }
+                for ((ty, name), (n, el)) in &by { println!("  type {ty:>2} x{n:<3} {name} ({el} elems)"); }
                 for (k, v) in &g.kv {
                     if !matches!(v, gguf::Value::Arr(_)) { println!("  {k} = {v:?}"); }
                 }
