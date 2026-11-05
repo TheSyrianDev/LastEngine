@@ -717,11 +717,24 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
         for (int j = 0; j < 8; j++) vt[(c + j) * VT + r] = vh[j];
       } else {
         size_t vec = (size_t)(k0 + r) * nkv + kvh; bool ok = k0 + r <= last;
+        float kf[8], vf[8];
         #pragma unroll
-        for (int j = 0; j < 8; j++) {
-          ks[r * PQ + c + j] = __float2half(ok ? kv_ld(kc, ksc, kvq, vec, c + j, HD) : 0.f);
-          vt[(c + j) * VT + r] = __float2half(ok ? kv_ld(vc, vsc, kvq, vec, c + j, HD) : 0.f);
+        for (int j = 0; j < 8; j++) { kf[j] = 0.f; vf[j] = 0.f; }
+        if (ok) {
+          float sk = __half2float(ksc[vec * (HD / 32) + c / 32]), sv = __half2float(vsc[vec * (HD / 32) + c / 32]);
+          if (kvq == 1) {
+            uint2 kk = *(const uint2*)((const signed char*)kc + vec * HD + c), vq = *(const uint2*)((const signed char*)vc + vec * HD + c);
+            const signed char* kb = (const signed char*)&kk; const signed char* vb = (const signed char*)&vq;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) { kf[j] = kb[j] * sk; vf[j] = vb[j] * sv; }
+          } else {
+            unsigned kk = *(const unsigned*)((const unsigned char*)kc + vec * (HD / 2) + c / 2), vq = *(const unsigned*)((const unsigned char*)vc + vec * (HD / 2) + c / 2);
+            #pragma unroll
+            for (int j = 0; j < 8; j++) { int kn = (kk >> (4 * j)) & 15, vn = (vq >> (4 * j)) & 15; kf[j] = ((kn ^ 8) - 8) * sk; vf[j] = ((vn ^ 8) - 8) * sv; }
+          }
         }
+        #pragma unroll
+        for (int j = 0; j < 8; j++) { ks[r * PQ + c + j] = __float2half(kf[j]); vt[(c + j) * VT + r] = __float2half(vf[j]); }
       }
     }
     __syncthreads();
