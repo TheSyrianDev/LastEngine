@@ -90,7 +90,7 @@ async fn main() {
             ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
             let mut cur = ix[0] as u32; let t1 = std::time::Instant::now(); let mut out = vec![];
-            for _ in 0..32 { out.push(cur); logits = gp.forward(cur); cur = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32; }
+            for _ in 0..std::env::var("LE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(32) { out.push(cur); logits = gp.forward(cur); cur = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32; }
             println!("decode 32 tok in {:.2}s = {:.1} tok/s  hits {} misses {}", t1.elapsed().as_secs_f32(), 32.0 / t1.elapsed().as_secs_f32(), gp.hits, gp.misses);
             println!("{}", String::from_utf8_lossy(&tk.decode_bytes(&out)));
         }
