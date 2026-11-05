@@ -82,7 +82,7 @@ async fn main() {
             let ids = tk.encode(&prompt);
             let t0 = std::time::Instant::now();
             let mut logits = vec![];
-            for id in ids.iter() { logits = gp.forward(*id); }
+            logits = gp.prefill(&ids);
             println!("prefill {} tok in {:.2}s", ids.len(), t0.elapsed().as_secs_f32());
             let mut ix: Vec<usize> = (0..logits.len()).collect();
             let mx = logits.iter().cloned().fold(f32::MIN, f32::max);

@@ -5,12 +5,14 @@ use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::{collections::HashMap, sync::Arc};
 
 type Dp = CUdeviceptr;
+mod prefill;
+fn mk_events() -> [sys::CUevent; 4] { let mut e = [std::ptr::null_mut(); 4]; for x in e.iter_mut() { unsafe { sys::cuEventCreate(x, 2).result().unwrap() }; } e }
 fn dalloc(bytes: usize) -> Dp { unsafe { result::malloc_sync(bytes.max(16)).expect("cuda alloc") } }
 fn dup<T>(data: &[T]) -> Dp { let p = dalloc(std::mem::size_of_val(data)); unsafe { result::memcpy_htod_sync(p, data).unwrap() }; p }
 fn dzero(p: Dp, bytes: usize) { unsafe { result::memset_d8_sync(p, 0, bytes).unwrap() } }
 
 #[derive(Clone, Copy)]
-pub struct W { cell: Dp, ty: u32, rows: usize, cols: usize }
+pub struct W { cell: Dp, ty: u32, rows: usize, cols: usize, raw: Dp }
 struct Lay {
     attn_norm: Dp, post_norm: Dp, router: W, shg_in: W,
     sh_gate: W, sh_up: W, sh_down: W,
@@ -30,6 +32,7 @@ pub struct Gpu {
     conv: Vec<Dp>, sdelta: Vec<Dp>, kc: Vec<Dp>, vc: Vec<Dp>,
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
+    pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
     pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
@@ -50,7 +53,8 @@ impl Gpu {
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
         for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "rmsnorm", "add_inplace", "swiglu",
-                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "delta_conv", "delta_step"] {
+                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "delta_conv", "delta_step",
+                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let c = &m.cfg;
@@ -58,16 +62,16 @@ impl Gpu {
         let mat = |name: &str| -> W {
             let (ty, cols, rows) = m.dims2(name);
             let d = dup(m.raw(name));
-            W { cell: dup(&[d]), ty, rows, cols }
+            W { cell: dup(&[d]), ty, rows, cols, raw: d }
         };
         let mut lay = Vec::new();
         for l in 0..c.n_layer {
             let p = |s: &str| format!("blk.{l}.{s}");
             let full = (l + 1) % c.interval == 0;
-            let z = W { cell: 0, ty: 0, rows: 0, cols: 0 };
-            let sg = { let (ty, cols, _) = m.dims2(&p("ffn_gate_inp_shexp.weight")); let mut o = vec![0f32; cols]; crate::quant::dequant_row(ty, m.raw(&p("ffn_gate_inp_shexp.weight")), &mut o); let d = dup(&o); W { cell: dup(&[d]), ty: 0, rows: 1, cols } };
+            let z = W { cell: 0, ty: 0, rows: 0, cols: 0, raw: 0 };
+            let sg = { let (ty, cols, _) = m.dims2(&p("ffn_gate_inp_shexp.weight")); let mut o = vec![0f32; cols]; crate::quant::dequant_row(ty, m.raw(&p("ffn_gate_inp_shexp.weight")), &mut o); let d = dup(&o); W { cell: dup(&[d]), ty: 0, rows: 1, cols, raw: d } };
             let mut ly = Lay {
-                attn_norm: vec1(&p("attn_norm.weight")), post_norm: vec1(&p("post_attention_norm.weight")), router: { let d = vec1(&p("ffn_gate_inp.weight")); W { cell: dup(&[d]), ty: 0, rows: c.n_expert, cols: c.n_embd } }, shg_in: sg,
+                attn_norm: vec1(&p("attn_norm.weight")), post_norm: vec1(&p("post_attention_norm.weight")), router: { let d = vec1(&p("ffn_gate_inp.weight")); W { cell: dup(&[d]), ty: 0, rows: c.n_expert, cols: c.n_embd, raw: d } }, shg_in: sg,
                 sh_gate: mat(&p("ffn_gate_shexp.weight")), sh_up: mat(&p("ffn_up_shexp.weight")), sh_down: mat(&p("ffn_down_shexp.weight")),
                 full, q: None, k: None, v: None, o: None, qn: 0, kn: 0, qkv: None, gate: None, beta: None, alpha: None, ssm_out: None, conv_w: 0, a_log: 0, dt_b: 0, ssm_norm: 0,
                 ety: m.expert_types(l), ebytes: m.expert_bytes(l),
@@ -78,7 +82,7 @@ impl Gpu {
                 ly.qn = vec1(&p("attn_q_norm.weight")); ly.kn = vec1(&p("attn_k_norm.weight"));
             } else {
                 ly.qkv = Some(mat(&p("attn_qkv.weight"))); ly.gate = Some(mat(&p("attn_gate.weight")));
-                let f32mat = |name: &str| -> W { let (ty, cols, rows) = m.dims2(name); let mut o = vec![0f32; cols * rows]; crate::quant::dequant_row(ty, m.raw(name), &mut o); let d = dup(&o); W { cell: dup(&[d]), ty: 0, rows, cols } };
+                let f32mat = |name: &str| -> W { let (ty, cols, rows) = m.dims2(name); let mut o = vec![0f32; cols * rows]; crate::quant::dequant_row(ty, m.raw(name), &mut o); let d = dup(&o); W { cell: dup(&[d]), ty: 0, rows, cols, raw: d } };
                 ly.beta = Some(f32mat(&p("ssm_beta.weight"))); ly.alpha = Some(f32mat(&p("ssm_alpha.weight")));
                 ly.ssm_out = Some(mat(&p("ssm_out.weight")));
                 ly.conv_w = vec1(&p("ssm_conv1d.weight")); ly.a_log = vec1(&p("ssm_a")); ly.dt_b = vec1(&p("ssm_dt.bias")); ly.ssm_norm = vec1(&p("ssm_norm.weight"));
@@ -103,8 +107,9 @@ impl Gpu {
         let mut slot_bytes = 0;
         for l in 0..c.n_layer { slot_bytes = slot_bytes.max(m.expert_bytes(l).iter().sum::<usize>()); }
         slot_bytes = slot_bytes.div_ceil(256) * 256;
+        let pf = prefill::Pf::new(c, ctx_len);
         let (free, _tot) = result::mem_get_info().expect("meminfo");
-        let scratch = 200usize << 20;
+        let scratch = 64usize << 20;
         let budget = free.saturating_sub(scratch + (vram_margin_mib << 20));
         let n_slots = (budget / slot_bytes).min(c.n_layer * c.n_expert).max(c.n_used);
         eprintln!("gpu: free {} MiB, slot {} KiB, {} expert slots ({} MiB)", free >> 20, slot_bytes >> 10, n_slots, (n_slots * slot_bytes) >> 20);
@@ -137,7 +142,7 @@ impl Gpu {
             eprintln!("pinned expert store {} MiB in {:.1}s", store_off[c.n_layer] >> 20, t0.elapsed().as_secs_f64());
         } else { store_p = std::ptr::null_mut(); }
         Gpu {
-            store: store_p as *mut u8, store_off,
+            store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
             cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: dalloc(64), prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
             idx: dalloc(64), rw: a(16), shg: a(4),
@@ -151,10 +156,11 @@ impl Gpu {
         }
     }
 
-    fn launch(&self, name: &str, grid: (u32, u32), block: u32, smem: u32, args: &[A]) {
+    fn launch(&self, name: &str, grid: (u32, u32), block: u32, smem: u32, args: &[A]) { self.launch3(name, (grid.0, grid.1, 1), block, smem, args) }
+    fn launch3(&self, name: &str, grid: (u32, u32, u32), block: u32, smem: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
-        unsafe { b.launch(LaunchConfig { grid_dim: (grid.0, grid.1, 1), block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
+        unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
     }
     fn qx(&self, x: Dp, n: usize, set: usize) {
         let units = n / 32;
@@ -173,6 +179,7 @@ impl Gpu {
     }
     pub fn mv(&self, w: W, x: Dp, set: usize, out: Dp) { self.mv_ptrs(w.ty, w.cell, x, set, out, w.rows, w.cols, 0, 1); }
     fn rms(&self, x: Dp, w: Dp, o: Dp, n: usize) { self.launch("rmsnorm", (1, 1), 256, 0, &[P(x), P(w), P(o), I(n as i32), F(self.m.cfg.eps)]); }
+    fn dump(&self, label: &str, p: Dp, n: usize) { let mut v = vec![0f32; n]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, p).unwrap() }; eprintln!("  {label} {:.4} {}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
     fn add(&self, x: Dp, y: Dp, n: usize) { self.launch("add_inplace", (n.div_ceil(256) as u32, 1), 256, 0, &[P(x), P(y), I(n as i32)]); }
     fn swiglu(&self, g: Dp, u: Dp, o: Dp, n: usize) { self.launch("swiglu", (n.div_ceil(256) as u32, 1), 256, 0, &[P(g), P(u), P(o), I(n as i32)]); }
 
@@ -246,6 +253,11 @@ impl Gpu {
     pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
         self.bind();
         let mut out = vec![];
+        if self.pf.is_some() && ids.len() >= 8 && std::env::var("LE_BATCH").map_or(true, |v| v != "0") {
+            let mut i = 0;
+            while i < ids.len() { let e = (i + prefill::TMAX).min(ids.len()); out = self.prefill_chunk(&ids[i..e], e == ids.len()); i = e; }
+            return out;
+        }
         for (i, &t) in ids.iter().enumerate() { out = self.forward_n(t, i + 1 == ids.len()); }
         out
     }
@@ -270,16 +282,19 @@ impl Gpu {
                 self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             } else {
-                let ch = c.d_inner * 2 + 2 * c.n_group * c.d_state;
+                let ch = c.d_inner + 2 * c.n_group * c.d_state;
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.qkv.unwrap(), self.h, 0, self.t0); self.mv(ly.gate.unwrap(), self.h, 0, self.t1);
                 self.mv(ly.beta.unwrap(), self.h, 0, self.t2); self.mv(ly.alpha.unwrap(), self.h, 0, self.t3);
+                if self.dbg && pos == self.dbg_pos && l == 0 { self.dump("qkv", self.t0, ch); self.dump("gate", self.t1, 4096); self.dump("beta", self.t2, 32); self.dump("alpha", self.t3, 32); }
                 self.launch("delta_conv", (ch.div_ceil(256) as u32, 1), 256, 0, &[P(self.t0), P(ly.conv_w), P(self.conv[l]), P(self.y), I(ch as i32), I(c.conv_k as i32)]);
                 self.launch("delta_step", (c.n_vhead as u32, 1), 128, 0, &[P(self.y), P(self.t3), P(self.t2), P(ly.a_log), P(ly.dt_b), P(self.t1), P(ly.ssm_norm), P(self.sdelta[l]), P(self.t0),
                     I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps)]);
+                if self.dbg && pos == self.dbg_pos && l == 0 { self.dump("conv", self.y, ch); self.dump("dout", self.t0, 4096); }
                 self.qx(self.t0, c.d_inner, 1); self.mv(ly.ssm_out.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             }
             // MoE
+            if self.dbg && pos == self.dbg_pos { self.dump("mix", self.x, c.n_embd); }
             self.rms(self.x, ly.post_norm, self.h, c.n_embd);
             self.mv(ly.router, self.h, 0, self.logits);
             self.qx(self.h, c.n_embd, 0);
@@ -315,6 +330,7 @@ impl Gpu {
             self.qx(self.sha_t, c.ff_shexp, 1); self.mv(ly.sh_down, self.sha_t, 1, self.shd_t);
             self.mv(ly.shg_in, self.h, 0, self.shg);
             self.launch("moe_combine", (c.n_embd.div_ceil(256) as u32, 1), 256, 0, &[P(self.x), P(self.ed), P(self.rw), I(k as i32), P(self.shd_t), P(self.shg), I(c.n_embd as i32)]);
+            if self.dbg && pos == self.dbg_pos { let mut v = vec![0f32; c.n_embd]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, self.x).unwrap() }; eprintln!("L{l} {:.4} {:.4}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
         }
         self.pos += 1;
         if !want { self.st.synchronize().unwrap(); return vec![]; }

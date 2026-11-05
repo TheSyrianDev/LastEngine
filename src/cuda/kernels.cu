@@ -260,3 +260,191 @@ extern "C" __global__ void delta_step(const float* y, const float* alpha, const 
   float rr = rsqrtf((red[0] + red[1] + red[2] + red[3]) / dk + eps);
   o[vh * dk + j] = oo * rr * nw[j] * silu_f(z[vh * dk + j]);
 }
+
+// =================== batched (prefill) kernels ===================
+// Grouped matmul: slot z has weights ptrs[z] [rows][cols] and tokens off[z]..off[z+1] (sorted-pair index i). Input row of pair i is
+// in_idx ? in_idx[i] : i; output row is out_idx ? out_idx[i] : i. Warp-per-row, 8 tokens at once.
+template <int TY>
+__device__ void mm_impl(const u8* const* ptrs, const int* off, const int* in_idx, const int* out_idx, const signed char* xq, const float* xd, const int* xs,
+                        float* out, int rows, int cols) {
+  extern __shared__ int sm[];
+  int units = cols >> 5, z = blockIdx.z;
+  int n = off[z + 1] - off[z], t0 = blockIdx.y * 8;
+  if (t0 >= n) return;
+  int nt = min(8, n - t0), base = off[z] + t0;
+  int* sxq = sm; float* sxd = (float*)(sm + 8 * units * 9); int* sxs = (int*)(sxd + 8 * units);
+  for (int j = 0; j < nt; j++) {
+    int xr = in_idx ? in_idx[base + j] : base + j;
+    const int* gq = (const int*)(xq + (size_t)xr * cols);
+    for (int i = threadIdx.x; i < units * 8; i += 256) sxq[(j * units + (i >> 3)) * 9 + (i & 7)] = gq[i];
+    for (int i = threadIdx.x; i < units; i += 256) { sxd[j * units + i] = xd[(size_t)xr * units + i]; sxs[j * units + i] = xs[(size_t)xr * units + i]; }
+  }
+  __syncthreads();
+  const int UB = Q<TY>::UB, BY = Q<TY>::BYTES;
+  int lpr = units < 32 ? units : 32, rpw = 32 / lpr;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int r = (blockIdx.x * 8 + warp) * rpw + lane / lpr, li = lane % lpr;
+  bool ok = r < rows;
+  const u8* row = ptrs[z] + (size_t)(ok ? r : 0) * (cols / (UB * 32)) * BY;
+  float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  if (ok) for (int u = li; u < units; u += lpr) {
+    const u8* wb = row + (u / UB) * BY; int uj = u % UB;
+    #pragma unroll
+    for (int j = 0; j < 8; j++) if (j < nt) acc[j] += udot<TY>(wb, uj, sxq + (j * units + u) * 9, sxd[j * units + u], sxs[j * units + u]);
+  }
+  #pragma unroll
+  for (int j = 0; j < 8; j++) for (int o = lpr >> 1; o; o >>= 1) acc[j] += __shfl_xor_sync(FULL, acc[j], o);
+  if (ok && li == 0) for (int j = 0; j < nt; j++) { int orow = out_idx ? out_idx[base + j] : base + j; out[(size_t)orow * rows + r] = acc[j]; }
+}
+#define MM(TY) extern "C" __global__ void mm_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mm_impl<TY>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
+MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(18)
+
+// F32 matmul O[t][r] = W[r].X[t] for T tokens. grid (ceil(rows/8), ceil(T/32)), 256 threads.
+extern "C" __global__ void mmf(const float* W, const float* X, float* O, int rows, int cols, int T) {
+  int r = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (r >= rows) return;
+  int tb = blockIdx.y * 32, te = min(T, tb + 32);
+  const float* w = W + (size_t)r * cols;
+  for (int t = tb; t < te; t++) {
+    const float* x = X + (size_t)t * cols; float a = 0.f;
+    for (int i = lane; i < cols; i += 32) a += w[i] * x[i];
+    a = warp_sum(a); if (lane == 0) O[(size_t)t * rows + r] = a;
+  }
+}
+extern "C" __global__ void rmsnorm_b(const float* x, const float* w, float* o, int n, float eps) {
+  __shared__ float red[32]; x += (size_t)blockIdx.x * n; o += (size_t)blockIdx.x * n;
+  float s = 0.f; for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i] * x[i];
+  s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; v = warp_sum(v); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads();
+  float r = rsqrtf(red[0] / n + eps);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = x[i] * r * w[i];
+}
+extern "C" __global__ void router_topk_b(const float* logits, int n, int k, int* idx_out, float* w_out) {
+  __shared__ float p[1024]; int t = blockIdx.x;
+  logits += (size_t)t * n; idx_out += t * k; w_out += t * k;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) p[i] = logits[i];
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float m = -1e30f; for (int i = 0; i < n; i++) m = fmaxf(m, p[i]);
+    float s = 0.f; for (int i = 0; i < n; i++) { p[i] = __expf(p[i] - m); s += p[i]; }
+    float tot = 0.f; int sel[16]; float selw[16];
+    for (int q = 0; q < k; q++) { int b = 0; float bv = -1.f; for (int i = 0; i < n; i++) if (p[i] > bv) { bv = p[i]; b = i; } sel[q] = b; selw[q] = bv / s; tot += bv / s; p[b] = -2.f; }
+    for (int q = 0; q < k; q++) { idx_out[q] = sel[q]; w_out[q] = selw[q] / tot; }
+  }
+}
+// out[t] += sum_s w[t*k+s]*down[(t*k+s)*n+i] + sigmoid(shgate[t])*sh[t*n+i]. grid (ceil(n/256), T)
+extern "C" __global__ void moe_combine_b(float* out, const float* down, const float* w, int k, const float* sh, const float* shgate, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, t = blockIdx.y; if (i >= n) return;
+  float a = 0.f; for (int s = 0; s < k; s++) a += w[t * k + s] * down[((size_t)t * k + s) * n + i];
+  a += sigm_f(shgate[t]) * sh[(size_t)t * n + i];
+  out[(size_t)t * n + i] += a;
+}
+// ---- batched full attention ----
+// grid (nh + nkv, T). qf [T][nh*2hd], kf/vf [T][nkv*hd]; q/gate out [T][nh*hd]. position = pos0 + token.
+extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const float* vf, const float* qn, const float* kn,
+    float* q, float* gate, __half* kc, __half* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos0, float eps) {
+  __shared__ float buf[512]; __shared__ float red[32];
+  int t = blockIdx.y, pos = pos0 + t;
+  qf += (size_t)t * nh * 2 * hd; kf += (size_t)t * nkv * hd; vf += (size_t)t * nkv * hd; q += (size_t)t * nh * hd; gate += (size_t)t * nh * hd;
+  int h = blockIdx.x; bool isq = h < nh; int hh = isq ? h : h - nh;
+  const float* src = isq ? qf + (size_t)hh * 2 * hd : kf + (size_t)hh * hd;
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) buf[i] = src[i];
+  __syncthreads();
+  float s = 0.f; for (int i = threadIdx.x; i < hd; i += blockDim.x) s += buf[i] * buf[i];
+  s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; v = warp_sum(v); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads();
+  float r = rsqrtf(red[0] / hd + eps); const float* w = isq ? qn : kn;
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) buf[i] = buf[i] * r * w[i];
+  __syncthreads();
+  int half = rope_dim / 2;
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+    float v = buf[i];
+    if (i < half) { float th = pos * powf(base, -2.f * i / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[i] * cs - buf[i + half] * sn; }
+    else if (i < rope_dim) { int j = i - half; float th = pos * powf(base, -2.f * j / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[j] * sn + buf[i] * cs; }
+    if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
+    else { kc[((size_t)pos * nkv + hh) * hd + i] = __float2half(v); vc[((size_t)pos * nkv + hh) * hd + i] = __float2half(vf[(size_t)hh * hd + i]); }
+  }
+}
+// Query group: tokens tb..tb+G. scores[g][h][pos] for pos <= pos0+tb+g. grid (ceil(nmax/8), nh, G).
+extern "C" __global__ void attn_scores_b(const float* q, const __half* kc, float* scores, int nkv, int nh, int hd, int pos_first, int stride, int tb) {
+  int g = blockIdx.z, h = blockIdx.y, kvh = h / (nh / nkv); int p = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  int n = pos_first + g + 1;
+  if (p >= n) return;
+  const float* qq = q + ((size_t)(tb + g) * nh + h) * hd;
+  const __half* k = kc + ((size_t)p * nkv + kvh) * hd; float a = 0.f;
+  for (int i = lane; i < hd; i += 32) a += qq[i] * __half2float(k[i]);
+  a = warp_sum(a); if (lane == 0) scores[((size_t)g * nh + h) * stride + p] = a * rsqrtf((float)hd);
+}
+extern "C" __global__ void attn_softmax_b(float* scores, int nh, int stride, int pos_first) {
+  __shared__ float red[32]; int n = pos_first + blockIdx.y + 1;
+  float* s = scores + ((size_t)blockIdx.y * nh + blockIdx.x) * stride;
+  float m = -1e30f; for (int i = threadIdx.x; i < n; i += blockDim.x) m = fmaxf(m, s[i]);
+  for (int o = 16; o; o >>= 1) m = fmaxf(m, __shfl_xor_sync(FULL, m, o));
+  if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = m; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : -1e30f; for (int o = 16; o; o >>= 1) v = fmaxf(v, __shfl_xor_sync(FULL, v, o)); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads(); m = red[0]; __syncthreads();
+  float sum = 0.f; for (int i = threadIdx.x; i < n; i += blockDim.x) { float e = __expf(s[i] - m); s[i] = e; sum += e; }
+  sum = warp_sum(sum); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = sum; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; v = warp_sum(v); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads(); float inv = 1.f / red[0];
+  for (int i = threadIdx.x; i < n; i += blockDim.x) s[i] *= inv;
+}
+// grid (nh, G), block hd.
+extern "C" __global__ void attn_pv_b(const float* scores, const __half* vc, const float* gate, float* o, int nkv, int nh, int hd, int pos_first, int stride, int tb) {
+  int h = blockIdx.x, g = blockIdx.y, kvh = h / (nh / nkv), d = threadIdx.x, n = pos_first + g + 1; float a = 0.f;
+  const float* sc = scores + ((size_t)g * nh + h) * stride;
+  for (int t = 0; t < n; t++) a += sc[t] * __half2float(vc[((size_t)t * nkv + kvh) * hd + d]);
+  size_t oi = ((size_t)(tb + g) * nh + h) * hd + d;
+  o[oi] = a * sigm_f(gate[oi]);
+}
+// ---- batched DeltaNet ----
+// conv over T tokens sequentially per channel. qkv [T][ch] -> y [T][ch].
+extern "C" __global__ void delta_conv_b(const float* qkv, const float* w, float* state, float* y, int ch, int K, int T) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= ch) return;
+  float st[4]; for (int k = 0; k < K - 1; k++) st[k] = state[(size_t)c * (K - 1) + k];
+  for (int t = 0; t < T; t++) {
+    float x = qkv[(size_t)t * ch + c], a = 0.f;
+    for (int k = 0; k < K - 1; k++) a += w[c * K + k] * st[k];
+    a += w[c * K + K - 1] * x;
+    for (int k = 0; k < K - 2; k++) st[k] = st[k + 1];
+    st[K - 2] = x;
+    y[(size_t)t * ch + c] = silu_f(a);
+  }
+  for (int k = 0; k < K - 1; k++) state[(size_t)c * (K - 1) + k] = st[k];
+}
+// One block per v-head, thread j owns column j of S held in registers (dk == 128). Sequential over T tokens.
+extern "C" __global__ void delta_step_b(const float* y, const float* alpha, const float* betaraw, const float* a_log, const float* dtb,
+    const float* z, const float* nw, float* S, float* o, int ng, int nv, int dk, float eps, int T, int ych) {
+  __shared__ float qs[128], ks[128], red[8], r2[8];
+  int vh = blockIdx.x, j = threadIdx.x, kh = vh % ng;
+  float* Sh = S + (size_t)vh * dk * dk;
+  float s[128];
+  #pragma unroll
+  for (int i = 0; i < 128; i++) s[i] = Sh[i * 128 + j];
+  for (int t = 0; t < T; t++) {
+    const float* yt = y + (size_t)t * ych;
+    const float* q = yt + kh * dk; const float* k = yt + ng * dk + kh * dk; const float* v = yt + 2 * ng * dk + vh * dk;
+    qs[j] = q[j]; ks[j] = k[j]; __syncthreads();
+    float sq = warp_sum(qs[j] * qs[j]), sk = warp_sum(ks[j] * ks[j]);
+    if ((j & 31) == 0) { red[j >> 5] = sq; r2[j >> 5] = sk; } __syncthreads();
+    float nq = fmaxf(sqrtf(red[0] + red[1] + red[2] + red[3]), 1e-6f), nk = fmaxf(sqrtf(r2[0] + r2[1] + r2[2] + r2[3]), 1e-6f);
+    __syncthreads();
+    qs[j] = qs[j] / nq * rsqrtf((float)dk); ks[j] = ks[j] / nk; __syncthreads();
+    float a = alpha[(size_t)t * nv + vh] + dtb[vh]; float sp = a > 20.f ? a : logf(1.f + __expf(a));
+    float eg = __expf(a_log[vh] * sp), beta = sigm_f(betaraw[(size_t)t * nv + vh]);
+    float kmem = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 128; i++) { s[i] *= eg; kmem += s[i] * ks[i]; }
+    float d = (v[j] - kmem) * beta, oo = 0.f;
+    #pragma unroll
+    for (int i = 0; i < 128; i++) { s[i] += ks[i] * d; oo += s[i] * qs[i]; }
+    float s2 = warp_sum(oo * oo); if ((j & 31) == 0) red[j >> 5] = s2; __syncthreads();
+    float rr = rsqrtf((red[0] + red[1] + red[2] + red[3]) / dk + eps);
+    o[((size_t)t * nv + vh) * dk + j] = oo * rr * nw[j] * silu_f(z[((size_t)t * nv + vh) * dk + j]);
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int i = 0; i < 128; i++) Sh[i * 128 + j] = s[i];
+}
