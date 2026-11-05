@@ -32,7 +32,7 @@ pub struct Gpu {
     conv: Vec<Dp>, sdelta: Vec<Dp>, kc: Vec<Dp>, vc: Vec<Dp>,
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
-    pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
+    pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
     pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
@@ -52,7 +52,7 @@ impl Gpu {
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "rmsnorm", "add_inplace", "swiglu",
+        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "delta_conv", "delta_step",
                   "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
@@ -142,7 +142,7 @@ impl Gpu {
             eprintln!("pinned expert store {} MiB in {:.1}s", store_off[c.n_layer] >> 20, t0.elapsed().as_secs_f64());
         } else { store_p = std::ptr::null_mut(); }
         Gpu {
-            store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
+            store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), mmq: std::env::var("LE_MMQ").map_or(true, |v| v != "0"), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
             cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: dalloc(64), prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
             idx: dalloc(64), rw: a(16), shg: a(4),

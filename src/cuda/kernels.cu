@@ -88,6 +88,54 @@ template <> __device__ float udot<18>(const u8* b, int j, const int* xq, float d
   }
   return h2f(b) * (0.5f + (float)(aux >> 28)) * 0.5f * dx * (float)a;
 }
+
+// Unpack one 32-value unit into 8 int32 (4 int8 each) + scales: result = dx * (s0*dot(w[0..3],x[0..3]) + s1*dot(w[4..7],x[4..7]) - mn*sx)
+template <int TY> __device__ void uload(const u8* b, int j, int* w, float& s0, float& s1, float& mn);
+template <> __device__ void uload<2>(const u8* b, int, int* w, float& s0, float& s1, float& mn) {
+  for (int i = 0; i < 4; i++) { int v = ld32(b + 2 + 4 * i); w[i] = v & 0x0F0F0F0F; w[4 + i] = (v >> 4) & 0x0F0F0F0F; }
+  s0 = s1 = h2f(b); mn = 8.f * s0;
+}
+template <> __device__ void uload<8>(const u8* b, int, int* w, float& s0, float& s1, float& mn) {
+  for (int i = 0; i < 8; i++) w[i] = ld32(b + 2 + 4 * i);
+  s0 = s1 = h2f(b); mn = 0.f;
+}
+template <> __device__ void uload<12>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  float d = h2f(b), dm = h2f(b + 2); int sc, m; sm_k4(j, b + 4, sc, m);
+  const u8* qs = b + 16 + (j >> 1) * 32; int sh = (j & 1) * 4;
+  for (int i = 0; i < 8; i++) w[i] = (ld32a(qs + 4 * i) >> sh) & 0x0F0F0F0F;
+  s0 = s1 = d * sc; mn = dm * m;
+}
+template <> __device__ void uload<13>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  float d = h2f(b), dm = h2f(b + 2); int sc, m; sm_k4(j, b + 4, sc, m);
+  const u8* qh = b + 16; const u8* qs = b + 48 + (j >> 1) * 32; int sh = (j & 1) * 4;
+  for (int i = 0; i < 8; i++) w[i] = ((ld32a(qs + 4 * i) >> sh) & 0x0F0F0F0F) | (((ld32a(qh + 4 * i) >> j) & 0x01010101) << 4);
+  s0 = s1 = d * sc; mn = dm * m;
+}
+template <> __device__ void uload<11>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  const u8* hm = b; const u8* qs = b + 32 + (j >> 2) * 32; const u8* sc = b + 96; int s2 = 2 * (j & 3);
+  for (int i = 0; i < 8; i++) { int v = (ld32(qs + 4 * i) >> s2) & 0x03030303, h = (~ld32(hm + 4 * i) >> j) & 0x01010101; w[i] = __vsubss4(v, h << 2); }
+  float d = h2f(b + 108); float r[2];
+  for (int h = 0; h < 2; h++) { int i = 2 * j + h; int lo = i < 8 ? (sc[i] & 15) : (sc[i - 8] >> 4); int hi = (sc[8 + (i & 3)] >> (2 * (i >> 2))) & 3; r[h] = (float)((lo | (hi << 4)) - 32); }
+  s0 = d * r[0]; s1 = d * r[1]; mn = 0.f;
+}
+template <> __device__ void uload<14>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  int half = j >> 2, s = j & 3; const u8* ql = b + half * 64 + (s & 1) * 32; const u8* qh = b + 128 + half * 32;
+  const i8* sc = (const i8*)(b + 192) + half * 8 + s * 2; int sh = (s >> 1) * 4;
+  for (int i = 0; i < 8; i++) w[i] = __vsubss4(((ld32(ql + 4 * i) >> sh) & 0x0F0F0F0F) | (((ld32(qh + 4 * i) >> (2 * s)) & 0x03030303) << 4), 0x20202020);
+  float d = h2f(b + 208); s0 = d * sc[0]; s1 = d * sc[1]; mn = 0.f;
+}
+template <> __device__ void uload<18>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  const u8* qs = b + 2 + j * 8; u32 aux = (u32)*(const u16*)(b + 66 + j * 4) | ((u32)*(const u16*)(b + 68 + j * 4) << 16);
+  for (int l = 0; l < 4; l++) {
+    u32 si = (aux >> (7 * l)) & 127; u32 sg = si | ((__popc(si) & 1) << 7);
+    for (int h = 0; h < 2; h++) {
+      u32 nib = (sg >> (4 * h)) & 15;
+      u32 m = (nib & 1 ? 0xFFu : 0) | (nib & 2 ? 0xFF00u : 0) | (nib & 4 ? 0xFF0000u : 0) | (nib & 8 ? 0xFF000000u : 0);
+      w[2 * l + h] = (int)__vsub4(IQ3_G32[qs[2 * l + h]] ^ m, m);
+    }
+  }
+  s0 = s1 = h2f(b) * (0.5f + (float)(aux >> 28)) * 0.5f; mn = 0.f;
+}
 template <int TY> struct Q { static const int UB = 8, BYTES = 0; };
 template <> struct Q<2>  { static const int UB = 1, BYTES = 18; };
 template <> struct Q<8>  { static const int UB = 1, BYTES = 34; };
@@ -290,7 +338,14 @@ __device__ void mm_impl(const u8* const* ptrs, const int* off, const int* in_idx
   if (ok) for (int u = li; u < units; u += lpr) {
     const u8* wb = row + (u / UB) * BY; int uj = u % UB;
     #pragma unroll
-    for (int j = 0; j < 8; j++) if (j < nt) acc[j] += udot<TY>(wb, uj, sxq + (j * units + u) * 9, sxd[j * units + u], sxs[j * units + u]);
+    int w[8]; float s0, s1, mn; uload<TY>(wb, uj, w, s0, s1, mn);
+    #pragma unroll
+    for (int j = 0; j < 8; j++) if (j < nt) {
+      const int* xq = sxq + (j * units + u) * 9; int a0 = 0, a1 = 0;
+      #pragma unroll
+      for (int i = 0; i < 4; i++) { a0 = DP(w[i], xq[i], a0); a1 = DP(w[4 + i], xq[4 + i], a1); }
+      acc[j] += sxd[j * units + u] * (s0 * (float)a0 + s1 * (float)a1 - mn * (float)sxs[j * units + u]);
+    }
   }
   #pragma unroll
   for (int j = 0; j < 8; j++) for (int o = lpr >> 1; o; o >>= 1) acc[j] += __shfl_xor_sync(FULL, acc[j], o);
@@ -448,3 +503,95 @@ extern "C" __global__ void delta_step_b(const float* y, const float* alpha, cons
   #pragma unroll
   for (int i = 0; i < 128; i++) Sh[i * 128 + j] = s[i];
 }
+
+// =================== tensor-core (int8 mma) grouped GEMM for prefill ===================
+// Tile: 64 weight rows x 64 tokens, 4 units (128 columns) per step, 8 warps (4 along rows x 2 along tokens, each 16 x 32).
+// Weights are unpacked to int8 in shared memory; per-unit int32 products are scaled in f32.
+__device__ __forceinline__ void mma32(int* c, int a0, int a1, int a2, int a3, int b0, int b1) {
+  asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+               : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ void mma16(int* c, int a0, int a1, int b0) {
+  asm volatile("mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {%0,%1,%2,%3}, {%4,%5}, {%6}, {%0,%1,%2,%3};\n"
+               : "+r"(c[0]), "+r"(c[1]), "+r"(c[2]), "+r"(c[3]) : "r"(a0), "r"(a1), "r"(b0));
+}
+template <int TY, bool HALF>
+__device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_idx, const int* out_idx, const signed char* xq, const float* xd, const int* xs,
+                         float* out, int rows, int cols) {
+  __shared__ int As[4][64][9], Bs[4][64][9];
+  __shared__ float Sa0[4][64], Sa1[4][64], Sam[4][64], Sbd[4][64], Sbs[4][64];
+  int z = blockIdx.z, n = off[z + 1] - off[z], t0 = blockIdx.y * 64;
+  if (t0 >= n) return;
+  int r0 = blockIdx.x * 64, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  int units = cols >> 5;
+  const int UB = Q<TY>::UB, BY = Q<TY>::BYTES;
+  // loader roles
+  int la_row = tid >> 2, la_u = tid & 3;                 // weight (row, unit-in-step)
+  int lb_tok = tid >> 2, lb_u = tid & 3;                 // activation (token, unit-in-step)
+  int wr = r0 + la_row; bool wok = wr < rows;
+  const u8* wrow = ptrs[z] + (size_t)(wok ? wr : 0) * (cols / (UB * 32)) * BY;
+  int tk = t0 + lb_tok; bool tok_ok = tk < n;
+  int xr = tok_ok ? (in_idx ? in_idx[off[z] + tk] : off[z] + tk) : 0;
+  float acc[4][4];
+  #pragma unroll
+  for (int i = 0; i < 4; i++) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f; }
+  int wm = (warp & 3) * 16, wn = (warp >> 2) * 32;
+  for (int u0 = 0; u0 < units; u0 += 4) {
+    int u = u0 + la_u;
+    {
+      int w[8]; float s0 = 0.f, s1 = 0.f, mn = 0.f;
+      if (wok) { uload<TY>(wrow + (u / UB) * BY, u % UB, w, s0, s1, mn); } else { for (int i = 0; i < 8; i++) w[i] = 0; }
+      #pragma unroll
+      for (int i = 0; i < 8; i++) As[la_u][la_row][i] = w[i];
+      Sa0[la_u][la_row] = s0; Sa1[la_u][la_row] = s1; Sam[la_u][la_row] = mn;
+    }
+    {
+      int ub = u0 + lb_u;
+      if (tok_ok) {
+        const int4* gq = (const int4*)(xq + (size_t)xr * cols + ub * 32);
+        int4 q0 = gq[0], q1 = gq[1];
+        Bs[lb_u][lb_tok][0] = q0.x; Bs[lb_u][lb_tok][1] = q0.y; Bs[lb_u][lb_tok][2] = q0.z; Bs[lb_u][lb_tok][3] = q0.w;
+        Bs[lb_u][lb_tok][4] = q1.x; Bs[lb_u][lb_tok][5] = q1.y; Bs[lb_u][lb_tok][6] = q1.z; Bs[lb_u][lb_tok][7] = q1.w;
+        Sbd[lb_u][lb_tok] = xd[(size_t)xr * units + ub]; Sbs[lb_u][lb_tok] = (float)xs[(size_t)xr * units + ub];
+      } else {
+        for (int i = 0; i < 8; i++) Bs[lb_u][lb_tok][i] = 0;
+        Sbd[lb_u][lb_tok] = 0.f; Sbs[lb_u][lb_tok] = 0.f;
+      }
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int uu = 0; uu < 4; uu++) {
+      int ra = wm + g, rb = wm + g + 8;
+      int a0 = As[uu][ra][t], a1 = As[uu][rb][t], a2 = As[uu][ra][t + 4], a3 = As[uu][rb][t + 4];
+      float sA0 = Sa0[uu][ra], sA1 = Sa0[uu][rb], mA0 = Sam[uu][ra], mA1 = Sam[uu][rb];
+      float sB0 = Sa1[uu][ra], sB1 = Sa1[uu][rb];
+      #pragma unroll
+      for (int nt = 0; nt < 4; nt++) {
+        int tb = wn + nt * 8 + g;
+        int b0 = Bs[uu][tb][t], b1 = Bs[uu][tb][t + 4];
+        int cc[4] = {0, 0, 0, 0}, c2[4] = {0, 0, 0, 0};
+        float d0 = Sbd[uu][wn + nt * 8 + 2 * t], d1 = Sbd[uu][wn + nt * 8 + 2 * t + 1];
+        float x0 = Sbs[uu][wn + nt * 8 + 2 * t], x1 = Sbs[uu][wn + nt * 8 + 2 * t + 1];
+        if (HALF) {
+          mma16(cc, a0, a1, b0); mma16(c2, a2, a3, b1);
+          acc[nt][0] += d0 * (sA0 * cc[0] + sB0 * c2[0]); acc[nt][1] += d1 * (sA0 * cc[1] + sB0 * c2[1]);
+          acc[nt][2] += d0 * (sA1 * cc[2] + sB1 * c2[2]); acc[nt][3] += d1 * (sA1 * cc[3] + sB1 * c2[3]);
+        } else {
+          mma32(cc, a0, a1, a2, a3, b0, b1);
+          acc[nt][0] += d0 * (sA0 * cc[0] - mA0 * x0); acc[nt][1] += d1 * (sA0 * cc[1] - mA0 * x1);
+          acc[nt][2] += d0 * (sA1 * cc[2] - mA1 * x0); acc[nt][3] += d1 * (sA1 * cc[3] - mA1 * x1);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int nt = 0; nt < 4; nt++)
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int r = r0 + wm + g + ((i >> 1) ? 8 : 0), tkn = t0 + wn + nt * 8 + 2 * t + (i & 1);
+      if (r < rows && tkn < n) { int ob = off[z] + tkn; int orow = out_idx ? out_idx[ob] : ob; out[(size_t)orow * rows + r] = acc[nt][i]; }
+    }
+}
+#define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
+MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(18, false)
