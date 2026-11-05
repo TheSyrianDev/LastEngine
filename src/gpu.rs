@@ -33,7 +33,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pv_part: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -55,13 +55,19 @@ impl Gpu {
         let mut src = String::from("#include <cuda_fp16.h>\n__device__ const unsigned int IQ3_G32[256] = {");
         for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
         src.push_str("};\n");
+        for (nm, bytes, n) in [("TCQ_CB_K", &include_bytes!("../assets/tcq3_cb_k.bin")[..], 512), ("TCQ_CB_V", &include_bytes!("../assets/tcq3_cb_v.bin")[..], 512),
+                               ("TCQ_S1", &include_bytes!("../assets/tcq3_signs1.bin")[..], 128), ("TCQ_S2", &include_bytes!("../assets/tcq3_signs2.bin")[..], 128)] {
+            src.push_str(&format!("__device__ const float {nm}[{n}] = {{"));
+            for ch in bytes.chunks(4) { src.push_str(&format!("{:e}f,", f32::from_le_bytes(ch.try_into().unwrap()))); }
+            src.push_str("};\n");
+        }
         src.push_str(include_str!("cuda/kernels.cu"));
         let opts = CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() };
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
         for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "rmsnorm", "add_inplace", "swiglu",
-                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "delta_conv", "delta_step",
+                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
                   "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
@@ -119,15 +125,15 @@ impl Gpu {
             (tab, if yarn { 1.0 + 0.1 * (1.0 / fs).ln() } else { 1.0 })
         };
         let rope_f = dup(&rope_tab);
-        let kvq: i32 = match std::env::var("LE_KV").unwrap_or_default().to_lowercase().as_str() { "" | "f16" | "fp16" => 0, s if s.contains('4') || s.starts_with("tcq") => 2, _ => 1 };
+        let kvq: i32 = match std::env::var("LE_KV").unwrap_or_default().to_lowercase().as_str() { "" | "f16" | "fp16" => 0, s if s.contains("tcq3") || s == "tcq" => 3, s if s.contains('4') || s.starts_with("tcq") => 2, _ => 1 };
         let (mut ksc, mut vsc) = (vec![], vec![]);
         let (mut conv, mut sdelta, mut kc, mut vc) = (vec![], vec![], vec![], vec![]);
         for l in 0..c.n_layer {
             if (l + 1) % c.interval == 0 {
                 conv.push(0); sdelta.push(0);
-                let eb = match kvq { 0 => ctx_len * nkv * hd * 2, 1 => ctx_len * nkv * hd, _ => ctx_len * nkv * hd / 2 };
+                let eb = match kvq { 0 => ctx_len * nkv * hd * 2, 1 => ctx_len * nkv * hd, 3 => ctx_len * nkv * (hd / 128) * 52, _ => ctx_len * nkv * hd / 2 };
                 let (a, b) = (dalloc(eb), dalloc(eb)); kc.push(a); vc.push(b);
-                let sb = if kvq == 0 { 16 } else { ctx_len * nkv * (hd / 32) * 2 }; ksc.push(dalloc(sb)); vsc.push(dalloc(sb));
+                let sb = if kvq == 0 || kvq == 3 { 16 } else { ctx_len * nkv * (hd / 32) * 2 }; ksc.push(dalloc(sb)); vsc.push(dalloc(sb));
             } else {
                 let (a, b) = (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4));
                 dzero(a, conv_ch * (c.conv_k - 1) * 4); dzero(b, c.n_vhead * c.d_state * c.d_state * 4);
@@ -181,7 +187,7 @@ impl Gpu {
             ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
-            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, pv_part: dalloc((ctx_len / 256 + 2) * nh * hd * 4), pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
+            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, kscr: dalloc(prefill::tmax().max(1) * nkv * hd * 4), pv_part: dalloc((ctx_len / 256 + 2) * nh * hd * 4), pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
             f, st, _ctx: ctx, m,
         }
     }
@@ -276,10 +282,18 @@ impl Gpu {
         unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
         self.pheat.iter_mut().for_each(|h| *h = 0);
     }
+    /// TCQ: encode this step's K (post-rope, in kscr) and V (raw) for `t` tokens at pos0, then rotate the queries `q` the same way.
+    pub(crate) fn tcq_after_prep(&self, l: usize, t: usize, pos0: usize, vsrc: Dp, q: Dp) {
+        let c = &self.m.cfg; let (nkv, hd, nh) = (c.n_kv, c.head_dim, c.n_head); let hdb = hd / 128;
+        let groups = (t * nkv * hdb) as u32;
+        self.launch("tcq_encode", (groups, 1), 512, 0, &[P(self.kscr), P(self.kc[l]), I(0), I(nkv as i32), I(hdb as i32), I(pos0 as i32), F(1.0)]);
+        self.launch("tcq_encode", (groups, 1), 512, 0, &[P(vsrc), P(self.vc[l]), I(1), I(nkv as i32), I(hdb as i32), I(pos0 as i32), F(1.04)]);
+        self.launch("tcq_rot", ((t * nh * hd / 128) as u32, 1), 128, 0, &[P(q), P(0), I(0)]);
+    }
     /// (data bytes per K or V buffer, scale bytes per buffer) for `pos` cached positions.
     fn kv_bytes(&self, pos: usize) -> (usize, usize) {
         let c = &self.m.cfg; let v = pos * c.n_kv * c.head_dim;
-        match self.kvq { 0 => (v * 2, 0), 1 => (v, pos * c.n_kv * (c.head_dim / 32) * 2), _ => (v / 2, pos * c.n_kv * (c.head_dim / 32) * 2) }
+        match self.kvq { 0 => (v * 2, 0), 3 => (pos * c.n_kv * (c.head_dim / 128) * 52, 0), 1 => (v, pos * c.n_kv * (c.head_dim / 32) * 2), _ => (v / 2, pos * c.n_kv * (c.head_dim / 32) * 2) }
     }
     pub fn import_state(&mut self, b: &[u8]) -> Result<(), String> {
         self.bind();
@@ -391,13 +405,15 @@ impl Gpu {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.q.unwrap(), self.h, 0, self.t0); self.mv(ly.k.unwrap(), self.h, 0, self.t1); self.mv(ly.v.unwrap(), self.h, 0, self.t2);
                 self.launch("attn_prep", ((nh + nkv) as u32, 1), 256, 0, &[P(self.t0), P(self.t1), P(self.t2), P(ly.qn), P(ly.kn), P(self.y), P(self.t3), P(self.kc[l]), P(self.vc[l]),
-                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
+                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos as i32), F(c.eps), P(if self.kvq == 3 { self.kscr } else { self.ksc[l] }), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
+                if self.kvq == 3 { self.tcq_after_prep(l, 1, pos, self.t2, self.y); }
                 let n = pos + 1;
                 self.launch3("attn_scores_b", (n.div_ceil(8) as u32, nkv as u32, 1), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos as i32), I(self.ctx_len as i32), I(0), P(self.ksc[l]), I(self.kvq)]);
                 self.launch("attn_softmax_b", (nh as u32, 1), 256, 0, &[P(self.scores), I(nh as i32), I(self.ctx_len as i32), I(pos as i32)]);
                 let nsp = n.div_ceil(256);
                 self.launch3("attn_pv_split", (nkv as u32, nsp as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.pv_part), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.vsc[l]), I(self.kvq), I(256)]);
-                self.launch("attn_pv_reduce", (nh as u32, 1), hd as u32, 0, &[P(self.pv_part), P(self.t3), P(self.t0), I(nh as i32), I(hd as i32), I(nsp as i32)]);
+                self.launch("attn_pv_reduce", (nh as u32, 1), hd as u32, 0, &[P(self.pv_part), P(self.t3), P(self.t0), I(nh as i32), I(hd as i32), I(nsp as i32), I(self.kvq)]);
+                if self.kvq == 3 { self.launch("tcq_rot", ((nh * hd / 128) as u32, 1), 128, 0, &[P(self.t0), P(self.t3), I(1)]); }
                 self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             } else {

@@ -234,12 +234,93 @@ __device__ __forceinline__ void kv_store(void* c, __half* sc, int kvq, size_t ve
     if ((i & 1) == 0) ((unsigned char*)c)[vec * (hd / 2) + i / 2] = (unsigned char)((q & 15) | ((nb & 15) << 4));
   }
 }
-__device__ __forceinline__ float kv_ld(const void* c, const __half* sc, int kvq, size_t vec, int i, int hd) {
+__device__ __forceinline__ float tcq_dec(const u8* b, int i, int isv) {
+  int bp = (i & 127) * 3; const u8* q = b + 2 + (bp >> 3);
+  int st = (((int)q[0] | ((int)q[1] << 8)) >> (bp & 7)) & 0x1FF;
+  return (isv ? TCQ_CB_V[st] : TCQ_CB_K[st]) * h2f(b);
+}
+__device__ __forceinline__ float kv_ld(const void* c, const __half* sc, int kvq, size_t vec, int i, int hd, int isv = 0) {
   if (kvq == 0) return __half2float(((const __half*)c)[vec * hd + i]);
+  if (kvq == 3) return tcq_dec((const u8*)c + (vec * (hd >> 7) + (i >> 7)) * 52, i, isv);
   float s = __half2float(sc[vec * (hd / 32) + i / 32]);
   if (kvq == 1) return (float)((const signed char*)c)[vec * hd + i] * s;
   int b = ((const unsigned char*)c)[vec * (hd / 2) + i / 2]; int n = (i & 1) ? (b >> 4) : (b & 15);
   return (float)((n ^ 8) - 8) * s;
+}
+// Trellis-coded 3-bit KV (TCQ): encoder after spiritbuun's design (buun-llama-cpp, MIT). One block per 128-value group, thread = trellis state.
+// src group g of [T][nkv*hd] floats -> 52-byte block at ((pos0+tok)*nkv*(hd/128)+rem).
+extern "C" __global__ void __launch_bounds__(512) tcq_encode(const float* src, unsigned char* dst, int isv, int nkv, int hdb, int pos0, float alpha) {
+  __shared__ float x[128]; __shared__ float cost[2][512]; __shared__ unsigned char bt[128 * 64]; __shared__ float pmin[64];
+  __shared__ unsigned char outs[128]; __shared__ float red[16]; __shared__ int s_init;
+  const int sid = threadIdx.x; const int per = nkv * hdb; const long g = blockIdx.x;
+  const long tok = g / per, rem = g % per;
+  const float* sp = src + (size_t)tok * per * 128 + rem * 128;
+  unsigned char* blk = dst + ((size_t)(pos0 + tok) * per + rem) * 52;
+  const float* cb = isv ? TCQ_CB_V : TCQ_CB_K;
+  if (sid < 128) x[sid] = sp[sid];
+  __syncthreads();
+  if (sid < 128) { float v = warp_sum(x[sid] * x[sid]); if ((sid & 31) == 0) red[sid >> 5] = v; }
+  __syncthreads();
+  const float gn = sqrtf(red[0] + red[1] + red[2] + red[3]);
+  __syncthreads();
+  if (sid < 128) x[sid] = (gn > 1e-20f ? x[sid] / gn : 0.f) * TCQ_S1[sid];
+  __syncthreads();
+  for (int h = 1; h < 128; h <<= 1) {
+    if (sid < 64) { int i = (sid / h) * 2 * h + (sid % h); float a = x[i], b = x[i + h]; x[i] = a + b; x[i + h] = a - b; }
+    __syncthreads();
+  }
+  if (sid < 128) x[sid] *= 0.08838834764831845f * TCQ_S2[sid];
+  cost[0][sid] = 0.f;
+  __syncthreads();
+  const float cbs = cb[sid];
+  for (int t = 0; t < 128; t++) {
+    const float* rd = cost[t & 1]; float* wr = cost[(t + 1) & 1];
+    if (sid < 64) {
+      float best = 3.0e38f; int bp = 0;
+      #pragma unroll
+      for (int p = 0; p < 8; p++) { float cc = rd[(sid << 3) | p]; if (cc < best) { best = cc; bp = p; } }
+      pmin[sid] = best; bt[t * 64 + sid] = (unsigned char)bp;
+    }
+    __syncthreads();
+    float d = x[t] - cbs; wr[sid] = pmin[sid & 63] + d * d;
+    __syncthreads();
+  }
+  if (sid == 0) {
+    const float* fc = cost[0]; float best = 3.0e38f; int st = 0;
+    for (int s2 = 0; s2 < 512; s2++) if (fc[s2] < best) { best = fc[s2]; st = s2; }
+    for (int t = 127; t >= 0; t--) { outs[t] = (unsigned char)(st >> 6); int p = bt[t * 64 + (st & 63)]; st = ((st & 63) << 3) | p; }
+    s_init = st;
+  }
+  __syncthreads();
+  const int prefix = (s_init >> 3) & 63;
+  if (sid < 128) {
+    int a = sid >= 2 ? outs[sid - 2] : (sid == 0 ? (prefix & 7) : ((prefix >> 3) & 7));
+    int b = sid >= 1 ? outs[sid - 1] : ((prefix >> 3) & 7);
+    int stt = a | (b << 3) | ((int)outs[sid] << 6);
+    float r = cb[stt]; float v = warp_sum(r * r); if ((sid & 31) == 0) red[4 + (sid >> 5)] = v;
+  }
+  __syncthreads();
+  if (sid == 0) {
+    float rn = sqrtf(red[4] + red[5] + red[6] + red[7]);
+    float cn = (rn > 1e-10f ? gn / rn : gn) * alpha;
+    *(__half*)blk = __float2half(cn);
+    unsigned char* qs = blk + 2;
+    for (int i = 0; i < 49; i++) qs[i] = 0;
+    for (int k = 0; k < 6; k++) qs[k >> 3] |= ((prefix >> k) & 1) << (k & 7);
+    for (int i = 0; i < 128; i++) { int bp = 6 + 3 * i; int v = outs[i]; for (int k = 0; k < 3; k++) qs[(bp + k) >> 3] |= ((v >> k) & 1) << ((bp + k) & 7); }
+  }
+}
+// Rotate (inv=0: x*S1, FWHT, *1/sqrt128*S2) or unrotate (inv=1: x*S2, FWHT, *1/sqrt128*S1, then * sigmoid(gate)) 128-groups in place. grid = groups, block 128.
+extern "C" __global__ void tcq_rot(float* x, const float* gate, int inv) {
+  __shared__ float b[128]; int t = threadIdx.x; size_t o = (size_t)blockIdx.x * 128 + t;
+  b[t] = x[o] * (inv ? TCQ_S2[t] : TCQ_S1[t]);
+  __syncthreads();
+  for (int h = 1; h < 128; h <<= 1) {
+    if (t < 64) { int i = (t / h) * 2 * h + (t % h); float a = b[i], c = b[i + h]; b[i] = a + c; b[i + h] = a - c; }
+    __syncthreads();
+  }
+  float v = b[t] * 0.08838834764831845f * (inv ? TCQ_S1[t] : TCQ_S2[t]);
+  x[o] = inv ? v * sigm_f(gate[o]) : v;
 }
 // ---- full attention ----
 // split qf [nh][2*hd] -> q (rmsnorm*w, rope) and gate; k rmsnorm+rope; write k,v into f16 cache at pos. One block per head (nh q heads then nkv k heads).
@@ -263,6 +344,7 @@ extern "C" __global__ void attn_prep(const float* qf, const float* kf, const flo
     if (i < half) { float th = pos * invf[i]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[i] * cs - buf[i + half] * sn; }
     else if (i < rope_dim) { int j = i - half; float th = pos * invf[j]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[j] * sn + buf[i] * cs; }
     if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
+    else if (kvq == 3) { ((float*)ksc)[(size_t)hh * hd + i] = v; }
     else { size_t vec = (size_t)pos * nkv + hh; kv_store(kc, ksc, kvq, vec, i, v, hd); kv_store(vc, vsc, kvq, vec, i, vf[(size_t)hh * hd + i], hd); }
   }
 }
@@ -290,8 +372,8 @@ extern "C" __global__ void attn_softmax(float* scores, int n, int stride) {
 // o[h][d] = sigmoid(gate) * sum_t p[t] v[t][d]. grid nh, block hd.
 extern "C" __global__ void attn_pv(const float* scores, const void* vc, const float* gate, float* o, int nkv, int nh, int hd, int n, int stride, const __half* vsc, int kvq) {
   int h = blockIdx.x, kvh = h / (nh / nkv), d = threadIdx.x; float a = 0.f;
-  for (int t = 0; t < n; t++) a += scores[(size_t)h * stride + t] * kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd);
-  o[h * hd + d] = a * sigm_f(gate[h * hd + d]);
+  for (int t = 0; t < n; t++) a += scores[(size_t)h * stride + t] * kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd, 1);
+  o[h * hd + d] = kvq == 3 ? a : a * sigm_f(gate[h * hd + d]);
 }
 
 // ---- Gated DeltaNet ----
@@ -442,6 +524,7 @@ extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const f
     if (i < half) { float th = pos * invf[i]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[i] * cs - buf[i + half] * sn; }
     else if (i < rope_dim) { int j = i - half; float th = pos * invf[j]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[j] * sn + buf[i] * cs; }
     if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
+    else if (kvq == 3) { ((float*)ksc)[((size_t)t * nkv + hh) * hd + i] = v; }
     else { size_t vec = (size_t)pos * nkv + hh; kv_store(kc, ksc, kvq, vec, i, v, hd); kv_store(vc, vsc, kvq, vec, i, vf[(size_t)hh * hd + i], hd); }
   }
 }
@@ -478,11 +561,11 @@ extern "C" __global__ void attn_pv_b(const float* scores, const void* vc, const 
   int kvh = blockIdx.x, g = blockIdx.y, hpk = nh / nkv, d = threadIdx.x, n = pos_first + g + 1; float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   const float* sc = scores + ((size_t)g * nh + kvh * hpk) * stride;
   for (int t = 0; t < n; t++) {
-    float v = kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd);
+    float v = kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd, 1);
     #pragma unroll
     for (int hh = 0; hh < 8; hh++) if (hh < hpk) a[hh] += sc[(size_t)hh * stride + t] * v;
   }
-  for (int hh = 0; hh < hpk; hh++) { size_t oi = ((size_t)(tb + g) * nh + kvh * hpk + hh) * hd + d; o[oi] = a[hh] * sigm_f(gate[oi]); }
+  for (int hh = 0; hh < hpk; hh++) { size_t oi = ((size_t)(tb + g) * nh + kvh * hpk + hh) * hd + d; o[oi] = kvq == 3 ? a[hh] : a[hh] * sigm_f(gate[oi]); }
 }
 // Decode PV, split over positions. grid (nkv, nsplit), block hd. part[(split*nh + h)*hd + d] = sum over the split's positions.
 extern "C" __global__ void attn_pv_split(const float* scores, const void* vc, float* part, int nkv, int nh, int hd, int n, int stride, const __half* vsc, int kvq, int chunk) {
@@ -490,17 +573,17 @@ extern "C" __global__ void attn_pv_split(const float* scores, const void* vc, fl
   int t0 = sp * chunk, t1 = min(n, t0 + chunk);
   const float* sc = scores + (size_t)(kvh * hpk) * stride;
   for (int t = t0; t < t1; t++) {
-    float v = kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd);
+    float v = kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd, 1);
     #pragma unroll
     for (int hh = 0; hh < 8; hh++) if (hh < hpk) a[hh] += sc[(size_t)hh * stride + t] * v;
   }
   for (int hh = 0; hh < hpk; hh++) part[((size_t)sp * nh + kvh * hpk + hh) * hd + d] = a[hh];
 }
 // grid nh, block hd: o[h][d] = sigmoid(gate) * sum_split part.
-extern "C" __global__ void attn_pv_reduce(const float* part, const float* gate, float* o, int nh, int hd, int nsplit) {
+extern "C" __global__ void attn_pv_reduce(const float* part, const float* gate, float* o, int nh, int hd, int nsplit, int kvq) {
   int h = blockIdx.x, d = threadIdx.x; float a = 0.f;
   for (int s = 0; s < nsplit; s++) a += part[((size_t)s * nh + h) * hd + d];
-  o[h * hd + d] = a * sigm_f(gate[h * hd + d]);
+  o[h * hd + d] = kvq == 3 ? a : a * sigm_f(gate[h * hd + d]);
 }
 // ---- batched DeltaNet ----
 // conv over T tokens sequentially per channel. qkv [T][ch] -> y [T][ch].
@@ -715,6 +798,14 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
         const __half* vh = (const __half*)&vv;
         #pragma unroll
         for (int j = 0; j < 8; j++) vt[(c + j) * VT + r] = vh[j];
+      } else if (kvq == 3) {
+        size_t vec = (size_t)(k0 + r) * nkv + kvh; bool ok = k0 + r <= last;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+          float kf = 0.f, vf = 0.f;
+          if (ok) { kf = kv_ld(kc, ksc, 3, vec, c + j, HD, 0); vf = kv_ld(vc, vsc, 3, vec, c + j, HD, 1); }
+          ks[r * PQ + c + j] = __float2half(kf); vt[(c + j) * VT + r] = __float2half(vf);
+        }
       } else {
         size_t vec = (size_t)(k0 + r) * nkv + kvh; bool ok = k0 + r <= last;
         float kf[8], vf[8];
@@ -788,7 +879,7 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
     float inv = 1.f / (r ? l1 : l0); size_t base = ((size_t)t * nh + h) * HD;
     #pragma unroll
     for (int d = 0; d < HD / 8; d++) for (int e = 0; e < 2; e++) {
-      int col = d * 8 + 2 * t4 + e; out[base + col] = o[d][2 * r + e] * inv * sigm_f(gate[base + col]);
+      int col = d * 8 + 2 * t4 + e; out[base + col] = o[d][2 * r + e] * inv * (kvq == 3 ? 1.f : sigm_f(gate[base + col]));
     }
   }
 }
