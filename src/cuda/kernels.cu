@@ -424,13 +424,17 @@ extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const f
 }
 // Query group: tokens tb..tb+G. scores[g][h][pos] for pos <= pos0+tb+g. grid (ceil(nmax/8), nh, G).
 extern "C" __global__ void attn_scores_b(const float* q, const __half* kc, float* scores, int nkv, int nh, int hd, int pos_first, int stride, int tb) {
-  int g = blockIdx.z, h = blockIdx.y, kvh = h / (nh / nkv); int p = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  int g = blockIdx.z, kvh = blockIdx.y, hpk = nh / nkv; int p = blockIdx.x * 8 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
   int n = pos_first + g + 1;
   if (p >= n) return;
-  const float* qq = q + ((size_t)(tb + g) * nh + h) * hd;
-  const __half* k = kc + ((size_t)p * nkv + kvh) * hd; float a = 0.f;
-  for (int i = lane; i < hd; i += 32) a += qq[i] * __half2float(k[i]);
-  a = warp_sum(a); if (lane == 0) scores[((size_t)g * nh + h) * stride + p] = a * rsqrtf((float)hd);
+  const __half* k = kc + ((size_t)p * nkv + kvh) * hd; float kr[8];
+  for (int j = 0; j < 8; j++) { int i = lane + 32 * j; kr[j] = i < hd ? __half2float(k[i]) : 0.f; }
+  float sc = rsqrtf((float)hd);
+  for (int hh = 0; hh < hpk; hh++) {
+    int h = kvh * hpk + hh; const float* qq = q + ((size_t)(tb + g) * nh + h) * hd; float a = 0.f;
+    for (int j = 0; j < 8; j++) { int i = lane + 32 * j; if (i < hd) a += qq[i] * kr[j]; }
+    a = warp_sum(a); if (lane == 0) scores[((size_t)g * nh + h) * stride + p] = a * sc;
+  }
 }
 extern "C" __global__ void attn_softmax_b(float* scores, int nh, int stride, int pos_first) {
   __shared__ float red[32]; int n = pos_first + blockIdx.y + 1;
@@ -446,13 +450,16 @@ extern "C" __global__ void attn_softmax_b(float* scores, int nh, int stride, int
   __syncthreads(); float inv = 1.f / red[0];
   for (int i = threadIdx.x; i < n; i += blockDim.x) s[i] *= inv;
 }
-// grid (nh, G), block hd.
+// grid (nkv, G), block hd.
 extern "C" __global__ void attn_pv_b(const float* scores, const __half* vc, const float* gate, float* o, int nkv, int nh, int hd, int pos_first, int stride, int tb) {
-  int h = blockIdx.x, g = blockIdx.y, kvh = h / (nh / nkv), d = threadIdx.x, n = pos_first + g + 1; float a = 0.f;
-  const float* sc = scores + ((size_t)g * nh + h) * stride;
-  for (int t = 0; t < n; t++) a += sc[t] * __half2float(vc[((size_t)t * nkv + kvh) * hd + d]);
-  size_t oi = ((size_t)(tb + g) * nh + h) * hd + d;
-  o[oi] = a * sigm_f(gate[oi]);
+  int kvh = blockIdx.x, g = blockIdx.y, hpk = nh / nkv, d = threadIdx.x, n = pos_first + g + 1; float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  const float* sc = scores + ((size_t)g * nh + kvh * hpk) * stride;
+  for (int t = 0; t < n; t++) {
+    float v = __half2float(vc[((size_t)t * nkv + kvh) * hd + d]);
+    #pragma unroll
+    for (int hh = 0; hh < 8; hh++) if (hh < hpk) a[hh] += sc[(size_t)hh * stride + t] * v;
+  }
+  for (int hh = 0; hh < hpk; hh++) { size_t oi = ((size_t)(tb + g) * nh + kvh * hpk + hh) * hd + d; o[oi] = a[hh] * sigm_f(gate[oi]); }
 }
 // ---- batched DeltaNet ----
 // conv over T tokens sequentially per channel. qkv [T][ch] -> y [T][ch].
@@ -595,3 +602,33 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
 }
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
 MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(18, false)
+
+// F32 tiled matmul O[t][r] = W[r].X[t]; block 16x16, each thread 4x4 outputs; tile 64 rows x 64 tokens, K step 16. grid (ceil(rows/64), ceil(T/64)).
+extern "C" __global__ void mmf2(const float* W, const float* X, float* O, int rows, int cols, int T) {
+  __shared__ float Ws[16][65], Xs[16][65];
+  int tx = threadIdx.x & 15, ty = threadIdx.x >> 4, r0 = blockIdx.x * 64, t0 = blockIdx.y * 64;
+  float acc[4][4] = {};
+  for (int k0 = 0; k0 < cols; k0 += 16) {
+    for (int i = threadIdx.x; i < 64 * 16; i += 256) {
+      int rr = i >> 4, kk = i & 15; int gr = r0 + rr, gt = t0 + rr;
+      Ws[kk][rr] = gr < rows && k0 + kk < cols ? W[(size_t)gr * cols + k0 + kk] : 0.f;
+      Xs[kk][rr] = gt < T && k0 + kk < cols ? X[(size_t)gt * cols + k0 + kk] : 0.f;
+    }
+    __syncthreads();
+    #pragma unroll
+    for (int kk = 0; kk < 16; kk++) {
+      float w[4], x[4];
+      #pragma unroll
+      for (int i = 0; i < 4; i++) { w[i] = Ws[kk][tx + 16 * i]; x[i] = Xs[kk][ty + 16 * i]; }
+      #pragma unroll
+      for (int i = 0; i < 4; i++)
+        #pragma unroll
+        for (int j = 0; j < 4; j++) acc[i][j] += w[i] * x[j];
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int i = 0; i < 4; i++)
+    #pragma unroll
+    for (int j = 0; j < 4; j++) { int r = r0 + tx + 16 * i, t = t0 + ty + 16 * j; if (r < rows && t < T) O[(size_t)t * rows + r] = acc[i][j]; }
+}

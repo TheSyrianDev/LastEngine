@@ -54,7 +54,7 @@ impl Gpu {
         let mut f = HashMap::new();
         for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "delta_conv", "delta_step",
-                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "delta_conv_b", "delta_step_b"] {
+                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let c = &m.cfg;
@@ -255,7 +255,7 @@ impl Gpu {
         let mut out = vec![];
         if self.pf.is_some() && ids.len() >= 8 && std::env::var("LE_BATCH").map_or(true, |v| v != "0") {
             let mut i = 0;
-            while i < ids.len() { let e = (i + prefill::TMAX).min(ids.len()); out = self.prefill_chunk(&ids[i..e], e == ids.len()); i = e; }
+            while i < ids.len() { let e = (i + prefill::tmax()).min(ids.len()); out = self.prefill_chunk(&ids[i..e], e == ids.len()); i = e; }
             return out;
         }
         for (i, &t) in ids.iter().enumerate() { out = self.forward_n(t, i + 1 == ids.len()); }

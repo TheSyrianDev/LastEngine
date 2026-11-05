@@ -3,7 +3,7 @@
 use super::*;
 use crate::cpu_ref::Cfg as Config;
 
-pub const TMAX: usize = 512;
+pub fn tmax() -> usize { static T: std::sync::OnceLock<usize> = std::sync::OnceLock::new(); *T.get_or_init(|| std::env::var("LE_TMAX").ok().and_then(|v| v.parse().ok()).unwrap_or(1024)) }
 pub const WV: usize = 32;
 
 pub struct Pf {
@@ -18,7 +18,7 @@ fn hostalloc<T>(n: usize) -> *mut T { let mut p: *mut std::ffi::c_void = std::pt
 
 impl Pf {
     pub fn new(c: &Config, ctx_len: usize) -> Pf {
-        let t = TMAX; let p = t * c.n_used;
+        let t = tmax(); let p = t * c.n_used;
         let a = |n: usize| dalloc(n * 4);
         let g = ((32usize << 20) / (c.n_head * ctx_len * 4)).clamp(1, t);
         let d_off = dup(&[0i32, t as i32]);
@@ -59,7 +59,7 @@ impl Gpu {
         self.mm(w.ty, w.cell, pf.d_dense_off, 0, 0, set, out, w.rows, w.cols, 1, t);
     }
     fn fmm(&self, w: W, x: Dp, out: Dp, t: usize) {
-        self.launch("mmf", (w.rows.div_ceil(8) as u32, t.div_ceil(32) as u32), 256, 0, &[P(w.raw), P(x), P(out), I(w.rows as i32), I(w.cols as i32), I(t as i32)]);
+        self.launch("mmf2", (w.rows.div_ceil(64) as u32, t.div_ceil(64) as u32), 256, 0, &[P(w.raw), P(x), P(out), I(w.rows as i32), I(w.cols as i32), I(t as i32)]);
     }
     fn prms(&self, x: Dp, w: Dp, o: Dp, t: usize) { self.launch("rmsnorm_b", (t as u32, 1), 256, 0, &[P(x), P(w), P(o), I(self.m.cfg.n_embd as i32), F(self.m.cfg.eps)]); }
 
@@ -67,7 +67,7 @@ impl Gpu {
     pub(super) fn prefill_chunk(&mut self, ids: &[u32], want: bool) -> Vec<f32> {
         let c = self.m.cfg.clone();
         let t = ids.len(); let pos0 = self.pos;
-        assert!(t <= TMAX && pos0 + t <= self.ctx_len, "context full");
+        assert!(t <= tmax() && pos0 + t <= self.ctx_len, "context full");
         let pf = &**self.pf.as_ref().unwrap() as *const Pf; let pf = unsafe { &*pf };
         let mut emb = vec![0f32; t * c.n_embd];
         for (i, &id) in ids.iter().enumerate() { emb[i * c.n_embd..(i + 1) * c.n_embd].copy_from_slice(&self.m.embed(id)); }
@@ -85,9 +85,9 @@ impl Gpu {
                 let mut tb = 0;
                 while tb < t {
                     let g = pf.g.min(t - tb); let pos_first = pos0 + tb; let nmax = pos_first + g;
-                    self.launch3("attn_scores_b", (nmax.div_ceil(8) as u32, nh as u32, g as u32), 256, 0, &[P(pf.y), P(self.kc[l]), P(pf.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
+                    self.launch3("attn_scores_b", (nmax.div_ceil(8) as u32, nkv as u32, g as u32), 256, 0, &[P(pf.y), P(self.kc[l]), P(pf.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
                     self.launch("attn_softmax_b", (nh as u32, g as u32), 256, 0, &[P(pf.scores), I(nh as i32), I(self.ctx_len as i32), I(pos_first as i32)]);
-                    self.launch("attn_pv_b", (nh as u32, g as u32), hd as u32, 0, &[P(pf.scores), P(self.vc[l]), P(pf.b3), P(pf.o), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
+                    self.launch("attn_pv_b", (nkv as u32, g as u32), hd as u32, 0, &[P(pf.scores), P(self.vc[l]), P(pf.b3), P(pf.o), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos_first as i32), I(self.ctx_len as i32), I(tb as i32)]);
                     tb += g;
                 }
                 self.pqx(pf.o, nu(nh * hd), 1, 0); self.dense(ly.o.unwrap(), 1, pf.b1, t);
