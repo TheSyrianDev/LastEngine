@@ -59,6 +59,7 @@ impl Model {
         let (t, b) = self.bytes("token_embd.weight"); let rb = quant::row_bytes(t.ty, n);
         quant::dequant_row(t.ty, &b[token as usize * rb..(token as usize + 1) * rb], &mut x); x
     }
+    pub fn has(&self, name: &str) -> bool { self.t.contains_key(name) }
     pub fn raw(&self, name: &str) -> &[u8] { self.bytes(name).1 }
     /// (ggml type, cols = dims[0], rows = dims[1] or 1)
     pub fn dims2(&self, name: &str) -> (u32, usize, usize) { let t = &self.t[name]; (t.ty, t.dims[0], *t.dims.get(1).unwrap_or(&1)) }

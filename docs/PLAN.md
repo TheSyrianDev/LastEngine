@@ -41,3 +41,23 @@ Next, in order:
 4. **Prefill GEMM pipelining** (cp.async double-buffer in mmq tiles).
 5. **Per-layer sync removal / CUDA graphs** for decode (about 16 of 35 ms/token is host gaps).
 6. Embedded library crate + Vulkan/Metal backends behind the Backend trait.
+
+## MTP result (implemented, off by default: `LE_MTP=1`, `lastengine gpu`)
+Loads the nextn head (eh_proj + layer 40 attn/MoE), drafts one token, verifies [cur, draft] as a 2-token batch, snapshots/restores DeltaNet state on reject. Greedy output is identical to plain decode.
+Measured on the RTX 3050 4 GB: 73% of drafts accepted, but 9.9 tok/s vs 28 tok/s plain. A 2-token batch needs the *union* of both tokens' experts, so PCIe traffic rises ~3x (15.1K vs 5.2K misses on 64 tokens) and the batch path has a high fixed cost. MTP pays off only when experts are VRAM-resident (bigger GPUs). Not wired into `serve`.
+Known gap: the MTP layer's KV is not filled for prompt positions (only for decoded ones).
+
+## Proposals for large decode/prefill gains
+Abstract view: decode here is a *data-movement* problem, not a compute one. Per token the model touches 8 experts x 40 layers (~1.3 MB each); VRAM holds ~25% of them, so ~80 expert fetches/token (~100 MB over PCIe, ~8-10 ms) plus ~16 ms of host/launch gaps plus ~19 ms of kernels. Prefill is the mirror image: each chunk must stream nearly all 12.9 GB through a 4 GB window (~1.1 s/chunk at PCIe speed), so chunk size x PCIe bandwidth caps it near ~1900 tok/s; we reach ~800.
+(Figures are estimates from profiles above, not new measurements.)
+
+1. **Move compute to the data (CPU runs missed experts).** A miss costs 1.3 MB of weights over PCIe; the activation is 8 KB. Run missed experts on CPU against the RAM copy (already pinned, already repacked in legacy) concurrently with the GPU hits and add the 8 KB result back. Cuts PCIe traffic ~150x for misses; the CPU only needs ~1-2 experts/layer on average. Expected: removes most of the ~8-10 ms miss wait and the cache-pressure problem; decode 28 -> ~40+. Biggest, most structural change. Needs an AVX2/VNNI IQ3_XXS/Q3_K/Q4_0 dot kernel.
+2. **Kill the launch gaps (CUDA graphs / persistent per-layer kernel).** ~16 of 35 ms/token is host latency (routing readback, per-layer sync, three memcpy-style steps). Make routing device-side: top-k writes expert pointers into device memory, the expert matvecs read pointers indirectly, so a full layer is capturable as a graph with no host round trip. Misses become a *device-signalled* slow path (graph exits to host only when it needs a fetch). Ceiling ~19 ms/token -> ~50 tok/s before misses.
+3. **Deeper, learned prefetch.** Today we prefetch layer l+1 from layer l. The residual stream changes slowly, so a tiny predictor (or just reusing router weights on the layer-l hidden state) can predict l+2..l+4, giving PCIe 3-4 layers of lead time instead of one and hiding the remaining misses behind compute.
+4. **Profile-guided resident set.** Offline (or during `tune`) record per-expert routing frequency on representative prompts; pin the hottest ~N experts permanently and use LRU only for the rest. Persist per model. Raises hit rate without any per-token cost; combines with 1 (CPU handles the cold tail).
+5. **Cache-aware routing (opt-in, lossy).** When expert k+1 is already resident and its router score is within epsilon of expert k's non-resident score, take the resident one. Tunable quality/speed knob exposed to `tune` with a perplexity guard.
+6. **Prefill: stop dequantizing in the inner loop.** At load, repack hot tile layouts so the int8 mma path loads weights without unpack/grid lookup (IQ3 grid lookups are ~half of GEMM time). Combine with a software-pipelined (cp.async double-buffered) GEMM and larger effective chunks via KV tcq3 (frees VRAM -> bigger chunk). Target 800 -> ~1200+ tok/s.
+7. **Prefill: overlap CPU as a second worker.** While the GPU streams wave w+1, the CPU can compute a share of experts for the chunk from RAM (proposal 1's kernel reused for batched rows), so effective bandwidth is PCIe + RAM compute rather than PCIe alone.
+8. **Speculation that does not multiply expert traffic.** Plain MTP fails here (union of experts). Only worth revisiting after 1-4 make misses cheap; then tree/batch-2 verification becomes compute-bound and MTP's 73% acceptance would yield ~1.7x.
+
+Recommended order: 2 (cheapest large win, no new kernels) -> 1 (structural) -> 4 -> 3 -> 6 -> 7 -> 5 -> 8.

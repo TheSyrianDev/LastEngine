@@ -63,6 +63,8 @@ impl Gpu {
     }
     fn prms(&self, x: Dp, w: Dp, o: Dp, t: usize) { self.launch("rmsnorm_b", (t as u32, 1), 256, 0, &[P(x), P(w), P(o), I(self.m.cfg.n_embd as i32), F(self.m.cfg.eps)]); }
 
+    pub(super) fn pf_x(&self) -> Dp { self.pf.as_ref().unwrap().x }
+    pub(super) fn prefill_chunk_pub(&mut self, ids: &[u32]) { self.bind(); self.prefill_chunk(ids, false); }
     /// Process `ids` (<= TMAX) as one batch; returns logits of the last token.
     pub(super) fn prefill_chunk(&mut self, ids: &[u32], want: bool) -> Vec<f32> {
         let c = self.m.cfg.clone();
@@ -190,7 +192,16 @@ impl Gpu {
             if self.dbg && self.dbg_pos >= pos0 && self.dbg_pos < pos0 + t { let r = self.dbg_pos - pos0; let mut v = vec![0f32; c.n_embd]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, pf.x + (r * c.n_embd * 4) as u64).unwrap() }; eprintln!("L{l} {:.4} {:.4}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
         }
         self.pos += t;
-        if !want { return vec![]; }
+        if self.want_rows {
+            self.rows_out.clear();
+            for r in 0..t {
+                unsafe { result::memcpy_dtod_async(self.x, pf.x + (r * c.n_embd * 4) as u64, c.n_embd * 4, self.st.cu_stream()).unwrap() };
+                let lg = self.head_logits(); self.rows_out.push(lg);
+            }
+            return vec![];
+        }
+        if !want { if self.mtp.is_some() { unsafe { result::memcpy_dtod_async(self.hprev, pf.x + ((t - 1) * c.n_embd * 4) as u64, c.n_embd * 4, self.st.cu_stream()).unwrap() }; } return vec![]; }
+        if self.mtp.is_some() { unsafe { result::memcpy_dtod_async(self.hprev, pf.x + ((t - 1) * c.n_embd * 4) as u64, c.n_embd * 4, self.st.cu_stream()).unwrap() }; }
         unsafe { result::memcpy_dtod_async(self.x, pf.x + ((t - 1) * c.n_embd * 4) as u64, c.n_embd * 4, self.st.cu_stream()).unwrap() };
         self.rms(self.x, self.out_norm, self.h, c.n_embd);
         self.qx(self.h, c.n_embd, 0); self.mv(self.out_w, self.h, 0, self.logits);

@@ -20,6 +20,7 @@ struct Lay {
     qkv: Option<W>, gate: Option<W>, beta: Option<W>, alpha: Option<W>, ssm_out: Option<W>, conv_w: Dp, a_log: Dp, dt_b: Dp, ssm_norm: Dp,
     ety: [u32; 3], ebytes: [usize; 3],
 }
+pub struct Mtp { eh: W, enorm: Dp, hnorm: Dp, shn: Dp }
 enum A { P(Dp), I(i32), F(f32) }
 use A::*;
 
@@ -33,7 +34,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -86,10 +87,12 @@ impl Gpu {
             let d = dup(m.raw(name));
             W { cell: dup(&[d]), ty, rows, cols, raw: d }
         };
+        let mtp_on = std::env::var("LE_MTP").map_or(false, |v| v != "0") && m.has(&format!("blk.{}.nextn.eh_proj.weight", c.n_layer)) && m.has(&format!("blk.{}.ffn_gate_exps.weight", c.n_layer));
+        let nall = c.n_layer + mtp_on as usize;
         let mut lay = Vec::new();
-        for l in 0..c.n_layer {
+        for l in 0..nall {
             let p = |s: &str| format!("blk.{l}.{s}");
-            let full = (l + 1) % c.interval == 0;
+            let full = (l + 1) % c.interval == 0 || l >= c.n_layer;
             let z = W { cell: 0, ty: 0, rows: 0, cols: 0, raw: 0 };
             let sg = { let (ty, cols, _) = m.dims2(&p("ffn_gate_inp_shexp.weight")); let mut o = vec![0f32; cols]; crate::quant::dequant_row(ty, m.raw(&p("ffn_gate_inp_shexp.weight")), &mut o); let d = dup(&o); W { cell: dup(&[d]), ty: 0, rows: 1, cols, raw: d } };
             let mut ly = Lay {
@@ -136,8 +139,8 @@ impl Gpu {
         let kvq: i32 = match std::env::var("LE_KV").unwrap_or_default().to_lowercase().as_str() { "" | "f16" | "fp16" => 0, s if s.contains("tcq3") || s == "tcq" => 3, s if s.contains('4') || s.starts_with("tcq") => 2, _ => 1 };
         let (mut ksc, mut vsc) = (vec![], vec![]);
         let (mut conv, mut sdelta, mut kc, mut vc) = (vec![], vec![], vec![], vec![]);
-        for l in 0..c.n_layer {
-            if (l + 1) % c.interval == 0 {
+        for l in 0..nall {
+            if (l + 1) % c.interval == 0 || l >= c.n_layer {
                 conv.push(0); sdelta.push(0);
                 let eb = match kvq { 0 => ctx_len * nkv * hd * 2, 1 => ctx_len * nkv * hd, 3 => ctx_len * nkv * (hd / 128) * 52, _ => ctx_len * nkv * hd / 2 };
                 let (a, b) = (dalloc(eb), dalloc(eb)); kc.push(a); vc.push(b);
@@ -149,7 +152,7 @@ impl Gpu {
             }
         }
         let mut slot_bytes = 0;
-        for l in 0..c.n_layer { slot_bytes = slot_bytes.max(m.expert_bytes(l).iter().sum::<usize>()); }
+        for l in 0..nall { slot_bytes = slot_bytes.max(m.expert_bytes(l).iter().sum::<usize>()); }
         slot_bytes = slot_bytes.div_ceil(256) * 256;
         let pf = prefill::Pf::new(c, ctx_len);
         let (free, _tot) = result::mem_get_info().expect("meminfo");
@@ -168,24 +171,28 @@ impl Gpu {
             sys::cuEventCreate(&mut ev, 2).result().unwrap();
             sys::cuMemHostAlloc(&mut stg, (c.n_used + pf_extra).max(1) * slot_bytes, 0).result().expect("pinned staging");
         }
-        let mut store_off = vec![0usize; c.n_layer + 1];
-        for l in 0..c.n_layer { store_off[l + 1] = store_off[l] + m.expert_bytes(l).iter().sum::<usize>() * c.n_expert; }
+        let mut store_off = vec![0usize; nall + 1];
+        for l in 0..nall { store_off[l + 1] = store_off[l] + m.expert_bytes(l).iter().sum::<usize>() * c.n_expert; }
         let mut store_p: *mut std::ffi::c_void = std::ptr::null_mut();
-        let store_ok = std::env::var("LE_NOSTORE").is_err() && unsafe { sys::cuMemHostAlloc(&mut store_p, store_off[c.n_layer], 0).result().is_ok() };
+        let store_ok = std::env::var("LE_NOSTORE").is_err() && unsafe { sys::cuMemHostAlloc(&mut store_p, store_off[nall], 0).result().is_ok() };
         if store_ok {
             let t0 = std::time::Instant::now();
             let sp = store_p as usize;
             use rayon::prelude::*;
-            (0..c.n_layer).into_par_iter().for_each(|l| {
+            (0..nall).into_par_iter().for_each(|l| {
                 let eb: usize = m.expert_bytes(l).iter().sum();
                 for e in 0..c.n_expert {
                     let mut o = sp + store_off[l] + e * eb;
                     for part in m.expert_parts(l, e) { unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), o as *mut u8, part.len()) }; o += part.len(); }
                 }
             });
-            eprintln!("pinned expert store {} MiB in {:.1}s", store_off[c.n_layer] >> 20, t0.elapsed().as_secs_f64());
+            eprintln!("pinned expert store {} MiB in {:.1}s", store_off[nall] >> 20, t0.elapsed().as_secs_f64());
         } else { store_p = std::ptr::null_mut(); }
+        let mtp = if mtp_on { Some(Mtp { eh: mat(&format!("blk.{}.nextn.eh_proj.weight", c.n_layer)), enorm: vec1(&format!("blk.{}.nextn.enorm.weight", c.n_layer)), hnorm: vec1(&format!("blk.{}.nextn.hnorm.weight", c.n_layer)), shn: vec1(&format!("blk.{}.nextn.shared_head_norm.weight", c.n_layer)) }) } else { None };
+        let snap: Vec<(Dp, Dp)> = if mtp_on { (0..c.n_layer).map(|l| if conv[l] != 0 { (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4)) } else { (0, 0) }).collect() } else { vec![] };
+        if mtp_on { let l = c.n_layer; let _ = l; dzero(kc[c.n_layer], if kvq == 0 { ctx_len * nkv * hd * 2 } else if kvq == 1 { ctx_len * nkv * hd } else if kvq == 3 { ctx_len * nkv * (hd / 128) * 52 } else { ctx_len * nkv * hd / 2 }); }
         Gpu {
+            nall, mtp, hprev: dalloc(c.n_embd * 4), mcat: dalloc(2 * c.n_embd * 4), snap, rows_out: vec![], want_rows: false,
             store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), mmq: std::env::var("LE_MMQ").map_or(true, |v| v != "0"), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
             cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: dalloc(64), prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
@@ -406,7 +413,72 @@ impl Gpu {
         let pos = self.pos;
         assert!(pos < self.ctx_len, "context full");
         unsafe { result::memcpy_htod_sync(self.x, &self.m.embed(token)).unwrap() };
-        for l in 0..c.n_layer {
+        self.run_layers(0, c.n_layer, pos);
+        self.pos += 1;
+        if self.mtp.is_some() { unsafe { result::memcpy_dtod_async(self.hprev, self.x, c.n_embd * 4, self.st.cu_stream()).unwrap() }; }
+        if !want { self.st.synchronize().unwrap(); return vec![]; }
+        self.head_logits()
+    }
+    fn head_logits(&mut self) -> Vec<f32> {
+        let c = self.m.cfg.clone();
+        self.rms(self.x, self.out_norm, self.h, c.n_embd);
+        self.qx(self.h, c.n_embd, 0); self.mv(self.out_w, self.h, 0, self.logits);
+        let mut out = vec![0f32; self.m.vocab];
+        unsafe { result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
+        out
+    }
+    pub fn mtp_enabled(&self) -> bool { self.mtp.is_some() }
+    /// Draft the token after `tok` with the MTP head; `hprev` holds the trunk hidden state of the position before `tok`.
+    pub fn mtp_draft(&mut self, tok: u32) -> u32 {
+        let c = self.m.cfg.clone();
+        let pos = self.pos;
+        let (enorm, hnorm, shn, eh) = { let m = self.mtp.as_ref().unwrap(); (m.enorm, m.hnorm, m.shn, m.eh) };
+        unsafe { result::memcpy_htod_sync(self.t0, &self.m.embed(tok)).unwrap() };
+        self.rms(self.t0, enorm, self.mcat, c.n_embd);
+        self.rms(self.hprev, hnorm, self.mcat + (c.n_embd * 4) as u64, c.n_embd);
+        self.qx(self.mcat, 2 * c.n_embd, 0); self.mv(eh, self.mcat, 0, self.x);
+        self.run_layers(c.n_layer, c.n_layer + 1, pos);
+        self.rms(self.x, shn, self.h, c.n_embd);
+        self.qx(self.h, c.n_embd, 0); self.mv(self.out_w, self.h, 0, self.logits);
+        let mut out = vec![0f32; self.m.vocab];
+        unsafe { result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
+        out.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32
+    }
+    fn snapshot(&self, restore: bool) {
+        let c = &self.m.cfg;
+        let (cb, sb) = (c.d_inner + 2 * c.n_group * c.d_state, c.n_vhead * c.d_state * c.d_state * 4);
+        let cb = cb * (c.conv_k - 1) * 4;
+        for l in 0..c.n_layer { if self.snap[l].0 != 0 {
+            let (a, b) = if restore { (self.conv[l], self.snap[l].0) } else { (self.snap[l].0, self.conv[l]) };
+            let (a2, b2) = if restore { (self.sdelta[l], self.snap[l].1) } else { (self.snap[l].1, self.sdelta[l]) };
+            unsafe { result::memcpy_dtod_async(a, b, cb, self.st.cu_stream()).unwrap(); result::memcpy_dtod_async(a2, b2, sb, self.st.cu_stream()).unwrap(); }
+        } }
+    }
+    /// One speculative step. `cur` is the next token to feed (not yet processed). Returns (tokens committed, next cur).
+    pub fn spec_step(&mut self, cur: u32) -> (Vec<u32>, u32) {
+        let argmax = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+        let d = self.mtp_draft(cur);
+        self.snapshot(false);
+        let p0 = self.pos;
+        self.want_rows = true;
+        self.prefill_chunk_pub(&[cur, d]);
+        self.want_rows = false;
+        let rows = std::mem::take(&mut self.rows_out);
+        let n0 = argmax(&rows[0]);
+        let (n_embd, pfx) = (self.m.cfg.n_embd, self.pf_x());
+        if n0 == d {
+            let n1 = argmax(&rows[1]);
+            unsafe { result::memcpy_dtod_async(self.hprev, pfx + (n_embd * 4) as u64, n_embd * 4, self.st.cu_stream()).unwrap() };
+            (vec![cur, d], n1)
+        } else {
+            self.snapshot(true); self.pos = p0;
+            self.forward_n(cur, false);
+            (vec![cur], n0)
+        }
+    }
+    fn run_layers(&mut self, lo: usize, hi: usize, pos: usize) {
+        let c = self.m.cfg.clone();
+        for l in lo..hi {
             let ly = &self.lay[l] as *const Lay; let ly = unsafe { &*ly };
             self.rms(self.x, ly.attn_norm, self.h, c.n_embd);
             if ly.full {
@@ -475,13 +547,6 @@ impl Gpu {
             self.launch("moe_combine", (c.n_embd.div_ceil(256) as u32, 1), 256, 0, &[P(self.x), P(self.ed), P(self.rw), I(k as i32), P(self.shd_t), P(self.shg), I(c.n_embd as i32)]);
             if self.dbg && pos == self.dbg_pos { let mut v = vec![0f32; c.n_embd]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, self.x).unwrap() }; eprintln!("L{l} {:.4} {:.4}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
         }
-        self.pos += 1;
-        if !want { self.st.synchronize().unwrap(); return vec![]; }
-        self.rms(self.x, self.out_norm, self.h, c.n_embd);
-        self.qx(self.h, c.n_embd, 0); self.mv(self.out_w, self.h, 0, self.logits);
-        let mut out = vec![0f32; self.m.vocab];
-        unsafe { result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
-        out
     }
 }
 

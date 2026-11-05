@@ -92,7 +92,14 @@ async fn main() {
             ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
             let nn: usize = std::env::var("LE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(32); let mut cur = ix[0] as u32; let t1 = std::time::Instant::now(); let mut out = vec![];
+            if gp.mtp_enabled() {
+                let (mut steps, mut acc) = (0, 0);
+                while out.len() < nn { let (t, n) = gp.spec_step(cur); steps += 1; acc += t.len() - 1; out.extend(t); cur = n; }
+                println!("mtp: {steps} steps, {acc} drafts accepted ({:.0}%)", 100.0 * acc as f32 / steps as f32);
+            } else {
             for _ in 0..nn { out.push(cur); logits = gp.forward(cur); cur = logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32; }
+            }
+            let nn = out.len();
             println!("decode {} tok in {:.2}s = {:.1} tok/s  hits {} misses {}", nn, t1.elapsed().as_secs_f32(), nn as f32 / t1.elapsed().as_secs_f32(), gp.hits, gp.misses);
             println!("{}", String::from_utf8_lossy(&tk.decode_bytes(&out)));
         }
