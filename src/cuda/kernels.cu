@@ -244,7 +244,7 @@ __device__ __forceinline__ float kv_ld(const void* c, const __half* sc, int kvq,
 // ---- full attention ----
 // split qf [nh][2*hd] -> q (rmsnorm*w, rope) and gate; k rmsnorm+rope; write k,v into f16 cache at pos. One block per head (nh q heads then nkv k heads).
 extern "C" __global__ void attn_prep(const float* qf, const float* kf, const float* vf, const float* qn, const float* kn,
-    float* q, float* gate, void* kc, void* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos, float eps, __half* ksc, __half* vsc, int kvq) {
+    float* q, float* gate, void* kc, void* vc, int nh, int nkv, int hd, int rope_dim, float mscale, int pos, float eps, __half* ksc, __half* vsc, int kvq, const float* invf) {
   __shared__ float buf[512]; __shared__ float red[32];
   int h = blockIdx.x; bool isq = h < nh; int hh = isq ? h : h - nh;
   const float* src = isq ? qf + (size_t)hh * 2 * hd : kf + (size_t)hh * hd;
@@ -260,8 +260,8 @@ extern "C" __global__ void attn_prep(const float* qf, const float* kf, const flo
   int half = rope_dim / 2;
   for (int i = threadIdx.x; i < hd; i += blockDim.x) {
     float v = buf[i];
-    if (i < half) { float th = pos * powf(base, -2.f * i / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[i] * cs - buf[i + half] * sn; }
-    else if (i < rope_dim) { int j = i - half; float th = pos * powf(base, -2.f * j / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[j] * sn + buf[i] * cs; }
+    if (i < half) { float th = pos * invf[i]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[i] * cs - buf[i + half] * sn; }
+    else if (i < rope_dim) { int j = i - half; float th = pos * invf[j]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[j] * sn + buf[i] * cs; }
     if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
     else { size_t vec = (size_t)pos * nkv + hh; kv_store(kc, ksc, kvq, vec, i, v, hd); kv_store(vc, vsc, kvq, vec, i, vf[(size_t)hh * hd + i], hd); }
   }
@@ -421,7 +421,7 @@ extern "C" __global__ void moe_combine_b(float* out, const float* down, const fl
 // ---- batched full attention ----
 // grid (nh + nkv, T). qf [T][nh*2hd], kf/vf [T][nkv*hd]; q/gate out [T][nh*hd]. position = pos0 + token.
 extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const float* vf, const float* qn, const float* kn,
-    float* q, float* gate, void* kc, void* vc, int nh, int nkv, int hd, int rope_dim, float base, int pos0, float eps, __half* ksc, __half* vsc, int kvq) {
+    float* q, float* gate, void* kc, void* vc, int nh, int nkv, int hd, int rope_dim, float mscale, int pos0, float eps, __half* ksc, __half* vsc, int kvq, const float* invf) {
   __shared__ float buf[512]; __shared__ float red[32];
   int t = blockIdx.y, pos = pos0 + t;
   qf += (size_t)t * nh * 2 * hd; kf += (size_t)t * nkv * hd; vf += (size_t)t * nkv * hd; q += (size_t)t * nh * hd; gate += (size_t)t * nh * hd;
@@ -439,8 +439,8 @@ extern "C" __global__ void attn_prep_b(const float* qf, const float* kf, const f
   int half = rope_dim / 2;
   for (int i = threadIdx.x; i < hd; i += blockDim.x) {
     float v = buf[i];
-    if (i < half) { float th = pos * powf(base, -2.f * i / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[i] * cs - buf[i + half] * sn; }
-    else if (i < rope_dim) { int j = i - half; float th = pos * powf(base, -2.f * j / rope_dim); float sn, cs; sincosf(th, &sn, &cs); v = buf[j] * sn + buf[i] * cs; }
+    if (i < half) { float th = pos * invf[i]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[i] * cs - buf[i + half] * sn; }
+    else if (i < rope_dim) { int j = i - half; float th = pos * invf[j]; float sn, cs; sincosf(th, &sn, &cs); sn *= mscale; cs *= mscale; v = buf[j] * sn + buf[i] * cs; }
     if (isq) { q[(size_t)hh * hd + i] = v; gate[(size_t)hh * hd + i] = qf[(size_t)hh * 2 * hd + hd + i]; }
     else { size_t vec = (size_t)pos * nkv + hh; kv_store(kc, ksc, kvq, vec, i, v, hd); kv_store(vc, vsc, kvq, vec, i, vf[(size_t)hh * hd + i], hd); }
   }

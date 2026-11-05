@@ -33,7 +33,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pub(crate) pheat: Vec<u32>, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -94,6 +94,23 @@ impl Gpu {
         let out_w = mat("output.weight");
         let (hd, nkv, nh) = (c.head_dim, c.n_kv, c.n_head);
         let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
+        let (rope_tab, rope_ms) = {
+            let half = c.rope_dim / 2;
+            let scale: f32 = std::env::var("LE_ROPE_SCALE").ok().and_then(|v| v.parse().ok()).unwrap_or(1.0);
+            let yarn = std::env::var("LE_ROPE").map_or(false, |v| v == "yarn") && scale > 1.0;
+            let orig: f32 = std::env::var("LE_YARN_ORIG").ok().and_then(|v| v.parse().ok()).unwrap_or(32768.0);
+            let corr = |nrot: f32| c.rope_dim as f32 * (orig / (nrot * 2.0 * std::f32::consts::PI)).ln() / (2.0 * c.rope_base.ln());
+            let (lo, hi) = ((corr(32.0)).floor().max(0.0), (corr(1.0)).ceil().min(c.rope_dim as f32 - 1.0));
+            let fs = 1.0 / scale;
+            let tab: Vec<f32> = (0..half).map(|i| {
+                let ex = c.rope_base.powf(-2.0 * i as f32 / c.rope_dim as f32);
+                if !yarn { return ex; }
+                let ramp = 1.0 - ((i as f32 - lo) / (hi - lo).max(0.001)).clamp(0.0, 1.0);
+                ex * (fs * (1.0 - ramp) + ramp)
+            }).collect();
+            (tab, if yarn { 1.0 + 0.1 * (1.0 / fs).ln() } else { 1.0 })
+        };
+        let rope_f = dup(&rope_tab);
         let kvq: i32 = match std::env::var("LE_KV").unwrap_or_default().to_lowercase().as_str() { "" | "f16" | "fp16" => 0, s if s.contains('4') || s.starts_with("tcq") => 2, _ => 1 };
         let (mut ksc, mut vsc) = (vec![], vec![]);
         let (mut conv, mut sdelta, mut kc, mut vc) = (vec![], vec![], vec![], vec![]);
@@ -156,7 +173,7 @@ impl Gpu {
             ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
-            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, pheat: vec![0; c.n_layer * c.n_expert], kvq, ksc, vsc,
+            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
             f, st, _ctx: ctx, m,
         }
     }
@@ -366,7 +383,7 @@ impl Gpu {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.q.unwrap(), self.h, 0, self.t0); self.mv(ly.k.unwrap(), self.h, 0, self.t1); self.mv(ly.v.unwrap(), self.h, 0, self.t2);
                 self.launch("attn_prep", ((nh + nkv) as u32, 1), 256, 0, &[P(self.t0), P(self.t1), P(self.t2), P(ly.qn), P(ly.kn), P(self.y), P(self.t3), P(self.kc[l]), P(self.vc[l]),
-                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(c.rope_base), I(pos as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq)]);
+                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
                 let n = pos + 1;
                 self.launch("attn_scores", (n.div_ceil(8) as u32, nh as u32), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.ksc[l]), I(self.kvq)]);
                 self.launch("attn_softmax", (nh as u32, 1), 256, 0, &[P(self.scores), I(n as i32), I(self.ctx_len as i32)]);

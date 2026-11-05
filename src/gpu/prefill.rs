@@ -81,7 +81,7 @@ impl Gpu {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
                 self.dense(ly.q.unwrap(), 0, pf.b0, t); self.dense(ly.k.unwrap(), 0, pf.b1, t); self.dense(ly.v.unwrap(), 0, pf.b2, t);
                 self.launch("attn_prep_b", ((nh + nkv) as u32, t as u32), 256, 0, &[P(pf.b0), P(pf.b1), P(pf.b2), P(ly.qn), P(ly.kn), P(pf.y), P(pf.b3), P(self.kc[l]), P(self.vc[l]),
-                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(c.rope_base), I(pos0 as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq)]);
+                    I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos0 as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
                 if hd == 256 && std::env::var("LE_FLASH").map_or(true, |v| v != "0") {
                     let smem = ((64 + 32) * (hd + 8) + hd * 40) * 2;
                     self.launch("attn_flash_256", (t.div_ceil(64) as u32, nh as u32), 128, smem as u32, &[P(pf.y), P(self.kc[l]), P(self.vc[l]), P(pf.b3), P(pf.o), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq)]);

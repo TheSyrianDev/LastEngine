@@ -20,6 +20,9 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         Arc::new(Stub)
     } else {
         let path = a.model.clone().unwrap();
+        if let Some(r) = &a.rope_scaling { std::env::set_var("LE_ROPE", r); }
+        if let Some(r) = a.rope_scale { std::env::set_var("LE_ROPE_SCALE", r.to_string()); }
+        if let Some(r) = a.yarn_orig_ctx { std::env::set_var("LE_YARN_ORIG", r.to_string()); }
         if let Some(k) = &a.kv { std::env::set_var("LE_KV", k); }
         let (ctx, margin) = (a.ctx.unwrap_or(8192), a.vram_margin.unwrap_or(128));
         let tf = a.chat_template_file.clone();
