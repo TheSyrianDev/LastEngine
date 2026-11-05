@@ -43,6 +43,14 @@ impl Gpu {
     pub fn new(m: Arc<Model>, ctx_len: usize, vram_margin_mib: usize) -> Gpu {
         let ctx = CudaContext::new(0).expect("cuda");
         let st = ctx.default_stream();
+        // Auto-tune the knobs the user left unset, from the free VRAM and the requested context.
+        {
+            let (free0, _) = result::mem_get_info().expect("meminfo");
+            let kv_auto = match std::env::var("LE_KV").ok().as_deref() { None | Some("") | Some("auto") => true, _ => false };
+            if kv_auto { std::env::set_var("LE_KV", if ctx_len <= 8192 { "f16" } else { "q8" }); }
+            if std::env::var("LE_TMAX").is_err() { std::env::set_var("LE_TMAX", if free0 >= (3200usize << 20) { "2048" } else { "1024" }); }
+            eprintln!("gpu: auto-tune free {} MiB ctx {} -> kv {} chunk {}", free0 >> 20, ctx_len, std::env::var("LE_KV").unwrap(), std::env::var("LE_TMAX").unwrap());
+        }
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
         let mut src = String::from("#include <cuda_fp16.h>\n__device__ const unsigned int IQ3_G32[256] = {");
         for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
