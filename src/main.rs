@@ -3,6 +3,7 @@ mod backend;
 mod cli;
 mod gguf;
 mod server;
+mod tokenizer;
 
 use clap::Parser;
 
@@ -19,6 +20,13 @@ async fn main() {
             }
             Err(e) => { eprintln!("lastengine: {path}: {e}"); std::process::exit(1); }
         },
+        cli::Cmd::Tokenize { path, text } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let t = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let ids = t.encode(&text);
+            println!("{ids:?}");
+            println!("{:?}", String::from_utf8_lossy(&t.decode_bytes(&ids)));
+        }
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {
                 eprintln!("lastengine: {e}");
