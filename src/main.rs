@@ -93,6 +93,7 @@ async fn main() {
             println!("decode 32 tok in {:.2}s = {:.1} tok/s  hits {} misses {}", t1.elapsed().as_secs_f32(), 32.0 / t1.elapsed().as_secs_f32(), gp.hits, gp.misses);
             println!("{}", String::from_utf8_lossy(&tk.decode_bytes(&out)));
         }
+        cli::Cmd::H2d { path } => gpu::h2d_bench(&path),
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {
                 eprintln!("lastengine: {e}");

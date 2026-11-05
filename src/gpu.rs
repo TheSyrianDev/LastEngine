@@ -1,6 +1,6 @@
 //! CUDA backend for qwen35moe: non-expert weights resident in VRAM, routed experts through a VRAM slot cache fed from host memory.
 use crate::cpu_ref::Model;
-use cudarc::driver::{result, sys::CUdeviceptr, CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
+use cudarc::driver::{result, sys, sys::CUdeviceptr, CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::{collections::HashMap, sync::Arc};
 
@@ -29,7 +29,8 @@ pub struct Gpu {
     ptr_g: Dp, ptr_u: Dp, ptr_d: Dp, xqb: [Dp; 2], xdb: [Dp; 2], xsb: [Dp; 2],
     conv: Vec<Dp>, sdelta: Vec<Dp>, kc: Vec<Dp>, vc: Vec<Dp>,
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
-    pub hits: u64, pub misses: u64, pub ctx_len: usize, pub pos: usize,
+    cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
+    pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 impl Gpu {
@@ -107,7 +108,34 @@ impl Gpu {
         let arena = dalloc(n_slots * slot_bytes);
         let big = c.n_embd.max(conv_ch).max(nh * hd * 2);
         let a = |n: usize| dalloc(n * 4);
+        let (mut cs, mut ev) = (std::ptr::null_mut(), std::ptr::null_mut());
+        let mut stg: *mut std::ffi::c_void = std::ptr::null_mut();
+        let pf_extra: usize = std::env::var("LE_PF_EXTRA").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+        unsafe {
+            sys::cuStreamCreate(&mut cs, 1).result().unwrap();
+            sys::cuEventCreate(&mut ev, 2).result().unwrap();
+            sys::cuMemHostAlloc(&mut stg, (c.n_used + pf_extra).max(1) * slot_bytes, 0).result().expect("pinned staging");
+        }
+        let mut store_off = vec![0usize; c.n_layer + 1];
+        for l in 0..c.n_layer { store_off[l + 1] = store_off[l] + m.expert_bytes(l).iter().sum::<usize>() * c.n_expert; }
+        let mut store_p: *mut std::ffi::c_void = std::ptr::null_mut();
+        let store_ok = std::env::var("LE_NOSTORE").is_err() && unsafe { sys::cuMemHostAlloc(&mut store_p, store_off[c.n_layer], 0).result().is_ok() };
+        if store_ok {
+            let t0 = std::time::Instant::now();
+            let sp = store_p as usize;
+            use rayon::prelude::*;
+            (0..c.n_layer).into_par_iter().for_each(|l| {
+                let eb: usize = m.expert_bytes(l).iter().sum();
+                for e in 0..c.n_expert {
+                    let mut o = sp + store_off[l] + e * eb;
+                    for part in m.expert_parts(l, e) { unsafe { std::ptr::copy_nonoverlapping(part.as_ptr(), o as *mut u8, part.len()) }; o += part.len(); }
+                }
+            });
+            eprintln!("pinned expert store {} MiB in {:.1}s", store_off[c.n_layer] >> 20, t0.elapsed().as_secs_f64());
+        } else { store_p = std::ptr::null_mut(); }
         Gpu {
+            store: store_p as *mut u8, store_off,
+            cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: dalloc(64), prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
             idx: dalloc(64), rw: a(16), shg: a(4),
             eg: a(c.n_used * c.ff_exp), eu: a(c.n_used * c.ff_exp), ea: a(c.n_used * c.ff_exp), ed: a(c.n_used * c.n_embd),
@@ -152,10 +180,10 @@ impl Gpu {
         self.pos = 0;
     }
 
-    fn slot_for(&mut self, layer: usize, e: usize, pinned: &[usize]) -> usize {
+    /// Claim a slot for (layer, e); returns (slot, needs_copy).
+    fn pick_slot(&mut self, layer: usize, e: usize, pinned: &[usize]) -> (usize, bool) {
         self.tick += 1;
-        if let Some(&s) = self.slot_of.get(&(layer, e)) { self.last_use[s] = self.tick; self.hits += 1; return s; }
-        self.misses += 1;
+        if let Some(&s) = self.slot_of.get(&(layer, e)) { self.last_use[s] = self.tick; return (s, false); }
         let (mut best, mut bt) = (usize::MAX, u64::MAX);
         for s in 0..self.n_slots {
             if pinned.contains(&s) { continue; }
@@ -163,13 +191,51 @@ impl Gpu {
             if t < bt { bt = t; best = s; }
         }
         if let Some(k) = self.key_of[best] { self.slot_of.remove(&k); }
-        let mut off = (best * self.slot_bytes) as u64;
+        self.key_of[best] = Some((layer, e)); self.slot_of.insert((layer, e), best); self.last_use[best] = self.tick;
+        (best, true)
+    }
+    fn slot_for(&mut self, layer: usize, e: usize, pinned: &[usize]) -> usize {
+        let (s, copy) = self.pick_slot(layer, e, pinned);
+        if !copy { self.hits += 1; return s; }
+        self.misses += 1;
+        let mut off = (s * self.slot_bytes) as u64;
+        if !self.store.is_null() {
+            let eb: usize = self.lay[layer].ebytes.iter().sum();
+            unsafe { sys::cuMemcpyHtoDAsync_v2(self.arena + off, self.store.add(self.store_off[layer] + e * eb) as *const _, eb, self.st.cu_stream()).result().unwrap() };
+            return s;
+        }
         for part in self.m.expert_parts(layer, e) {
             unsafe { result::memcpy_htod_sync(self.arena + off, part).unwrap() };
             off += part.len() as u64;
         }
-        self.key_of[best] = Some((layer, e)); self.slot_of.insert((layer, e), best); self.last_use[best] = self.tick;
-        best
+        s
+    }
+    /// Asynchronously stage predicted experts of `layer` on the copy stream through pinned memory.
+    fn prefetch(&mut self, layer: usize, idxs: &[i32], pinned: &[usize]) {
+        unsafe { sys::cuStreamSynchronize(self.cs).result().unwrap() };
+        let mut pin: Vec<usize> = pinned.to_vec();
+        let mut n = 0;
+        for &e in idxs {
+            let (s, copy) = self.pick_slot(layer, e as usize, &pin);
+            pin.push(s);
+            if !copy { continue; }
+            n += 1; self.pf_issued += 1;
+            if !self.store.is_null() {
+                let eb: usize = self.lay[layer].ebytes.iter().sum();
+                unsafe { sys::cuMemcpyHtoDAsync_v2(self.arena + (s * self.slot_bytes) as u64, self.store.add(self.store_off[layer] + e as usize * eb) as *const _, eb, self.cs).result().unwrap() };
+                continue;
+            }
+            let mut so = 0usize;
+            let base = self.stg as usize + (n - 1) * self.slot_bytes;
+            for part in self.m.expert_parts(layer, e as usize) {
+                unsafe {
+                    std::ptr::copy_nonoverlapping(part.as_ptr(), (base + so) as *mut u8, part.len());
+                    sys::cuMemcpyHtoDAsync_v2(self.arena + (s * self.slot_bytes + so) as u64, (base + so) as *const _, part.len(), self.cs).result().unwrap();
+                }
+                so += part.len();
+            }
+        }
+        if n > 0 { unsafe { sys::cuEventRecord(self.ev, self.cs).result().unwrap() }; self.pf_pending = true; }
     }
 
     /// Decode one token at self.pos; returns device pointer of logits (vocab f32) after synchronisation.
@@ -211,6 +277,17 @@ impl Gpu {
             unsafe { result::memcpy_dtoh_sync(&mut idx[..c.n_used], self.idx).unwrap() };
             let mut slots: Vec<usize> = Vec::new();
             for i in 0..c.n_used { let s = self.slot_for(l, idx[i] as usize, &slots); slots.push(s); }
+            if self.pf_pending { unsafe { sys::cuStreamWaitEvent(self.st.cu_stream(), self.ev, 0).result().unwrap() }; self.pf_pending = false; }
+            if l + 1 < c.n_layer {
+                let nl = &self.lay[l + 1] as *const Lay; let nl = unsafe { &*nl };
+                self.rms(self.x, nl.post_norm, self.ph, c.n_embd);
+                self.mv(nl.router, self.ph, 0, self.plog);
+                let kk = (c.n_used + self.pf_extra).min(16);
+                self.launch("router_topk", (1, 1), 32, 0, &[P(self.plog), I(c.n_expert as i32), I(kk as i32), P(self.pidx), P(self.prw)]);
+                let mut pi = [0i32; 16];
+                unsafe { result::memcpy_dtoh_sync(&mut pi[..kk], self.pidx).unwrap() };
+                self.prefetch(l + 1, &pi[..kk], &slots);
+            }
             let base = |s: usize, part: usize| self.arena + (s * self.slot_bytes) as u64 + ly.ebytes[..part].iter().sum::<usize>() as u64;
             let pg: Vec<u64> = slots.iter().map(|&s| base(s, 0)).collect();
             let pu: Vec<u64> = slots.iter().map(|&s| base(s, 1)).collect();
@@ -235,4 +312,30 @@ impl Gpu {
         self.pos += 1;
         out
     }
+}
+
+/// Diagnostic: H2D bandwidth from pageable, pinned, and registered-mmap sources.
+pub fn h2d_bench(path: &str) {
+    use cudarc::driver::sys;
+    let _ctx = CudaContext::new(0).unwrap();
+    let n = 256usize << 20;
+    let dev = dalloc(n);
+    let t = |label: &str, p: *const u8| {
+        let t0 = std::time::Instant::now();
+        for _ in 0..4 { unsafe { sys::cuMemcpyHtoD_v2(dev, p as *const _, n).result().unwrap() }; }
+        let dt = t0.elapsed().as_secs_f64() / 4.0;
+        println!("{label}: {:.2} GB/s", n as f64 / dt / 1e9);
+    };
+    let pageable = vec![1u8; n];
+    t("pageable", pageable.as_ptr());
+    let mut pp: *mut std::ffi::c_void = std::ptr::null_mut();
+    unsafe { sys::cuMemHostAlloc(&mut pp, n, 0).result().unwrap() };
+    unsafe { std::ptr::write_bytes(pp as *mut u8, 1, n) };
+    t("pinned", pp as *const u8);
+    let f = std::fs::File::open(path).unwrap();
+    let mm = unsafe { memmap2::Mmap::map(&f).unwrap() };
+    let off = 100usize << 20;
+    let r = unsafe { sys::cuMemHostRegister_v2(mm.as_ptr().add(off) as *mut _, n, 1 | 8).result() };
+    println!("register mmap (portable|readonly): {:?}", r.is_ok());
+    if r.is_ok() { t("registered mmap", unsafe { mm.as_ptr().add(off) }); }
 }
