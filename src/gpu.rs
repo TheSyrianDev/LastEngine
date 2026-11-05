@@ -132,6 +132,7 @@ impl Gpu {
             (tab, if yarn { 1.0 + 0.1 * (1.0 / fs).ln() } else { 1.0 })
         };
         let rope_f = dup(&rope_tab);
+        let pbase = dalloc(192);
         let kvq: i32 = match std::env::var("LE_KV").unwrap_or_default().to_lowercase().as_str() { "" | "f16" | "fp16" => 0, s if s.contains("tcq3") || s == "tcq" => 3, s if s.contains('4') || s.starts_with("tcq") => 2, _ => 1 };
         let (mut ksc, mut vsc) = (vec![], vec![]);
         let (mut conv, mut sdelta, mut kc, mut vc) = (vec![], vec![], vec![], vec![]);
@@ -191,7 +192,7 @@ impl Gpu {
             idx: dalloc(64), rw: a(16), shg: a(4),
             eg: a(c.n_used * c.ff_exp), eu: a(c.n_used * c.ff_exp), ea: a(c.n_used * c.ff_exp), ed: a(c.n_used * c.n_embd),
             shg_t: a(c.ff_shexp), shu_t: a(c.ff_shexp), sha_t: a(c.ff_shexp), shd_t: a(c.n_embd),
-            ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
+            ptr_g: pbase, ptr_u: pbase + 64, ptr_d: pbase + 128,
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
             arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, kscr: dalloc(prefill::tmax().max(1) * nkv * hd * 4), pv_part: dalloc((ctx_len / 256 + 2) * nh * hd * 4), pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
@@ -460,7 +461,7 @@ impl Gpu {
             let pg: Vec<u64> = slots.iter().map(|&s| base(s, 0)).collect();
             let pu: Vec<u64> = slots.iter().map(|&s| base(s, 1)).collect();
             let pd: Vec<u64> = slots.iter().map(|&s| base(s, 2)).collect();
-            unsafe { result::memcpy_htod_sync(self.ptr_g, &pg).unwrap(); result::memcpy_htod_sync(self.ptr_u, &pu).unwrap(); result::memcpy_htod_sync(self.ptr_d, &pd).unwrap(); }
+            { let mut all = [0u64; 24]; for (n, v) in pg.iter().enumerate() { all[n] = *v; all[8 + n] = pu[n]; all[16 + n] = pd[n]; } unsafe { result::memcpy_htod_sync(self.ptr_g, &all).unwrap() }; }
             let k = c.n_used;
             self.mv_ptrs(ly.ety[0], self.ptr_g, self.h, 0, self.eg, c.ff_exp, c.n_embd, 0, k);
             self.mv_ptrs(ly.ety[1], self.ptr_u, self.h, 0, self.eu, c.ff_exp, c.n_embd, 0, k);
