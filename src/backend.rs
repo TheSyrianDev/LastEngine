@@ -10,6 +10,8 @@ pub struct Usage {
     pub prompt_tokens: usize,
     pub completion_tokens: usize,
     pub cached_tokens: usize,
+    /// Time the backend spent on prompt processing before the first token (ms).
+    pub prefill_ms: f64,
 }
 
 pub trait Backend: Send + Sync {
@@ -33,7 +35,7 @@ impl Backend for Stub {
             if !emit(&format!("{w} ")) { break; }
             n += 1;
         }
-        Usage { prompt_tokens: words.len(), completion_tokens: n, cached_tokens: 0 }
+        Usage { prompt_tokens: words.len(), completion_tokens: n, cached_tokens: 0, prefill_ms: 0.0 }
     }
 }
 
