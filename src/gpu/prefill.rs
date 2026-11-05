@@ -127,6 +127,7 @@ impl Gpu {
             // group pairs by expert
             let mut lists: Vec<Vec<(i32, i32)>> = vec![vec![]; c.n_expert];
             for tk in 0..t { for s in 0..k { lists[idx[tk * k + s] as usize].push((tk as i32, (tk * k + s) as i32)); } }
+            for e in 0..c.n_expert { self.pheat[l * c.n_expert + e] += lists[e].len() as u32; }
             let active: Vec<usize> = (0..c.n_expert).filter(|&e| !lists[e].is_empty()).collect();
             let mut ins: Vec<i32> = Vec::with_capacity(t * k); let mut outs: Vec<i32> = Vec::with_capacity(t * k);
             let mut starts: Vec<i32> = vec![];

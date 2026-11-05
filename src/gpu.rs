@@ -33,7 +33,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pub(crate) pheat: Vec<u32>, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -156,7 +156,7 @@ impl Gpu {
             ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
-            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, kvq, ksc, vsc,
+            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, pheat: vec![0; c.n_layer * c.n_expert], kvq, ksc, vsc,
             f, st, _ctx: ctx, m,
         }
     }
@@ -229,6 +229,27 @@ impl Gpu {
             else { rd(self.conv[l], conv_ch * (c.conv_k - 1) * 4, &mut out); rd(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4, &mut out); }
         }
         out
+    }
+    /// After a long prefill, fill the expert arena with the experts the prompt routed to most (all layers), so decode starts warm.
+    pub fn warm_cache(&mut self) {
+        if self.store.is_null() { return; }
+        let ne = self.m.cfg.n_expert;
+        let mut order: Vec<usize> = (0..self.pheat.len()).filter(|&i| self.pheat[i] > 0).collect();
+        order.sort_by(|&a, &b| self.pheat[b].cmp(&self.pheat[a]));
+        order.truncate(self.n_slots);
+        let want: std::collections::HashSet<(usize, usize)> = order.iter().map(|&i| (i / ne, i % ne)).collect();
+        let mut free: Vec<usize> = (0..self.n_slots).filter(|&s| match self.key_of[s] { None => true, Some(k) => !want.contains(&k) }).collect();
+        unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
+        for &(l, e) in order.iter().map(|&i| (i / ne, i % ne)).collect::<Vec<_>>().iter() {
+            if self.slot_of.contains_key(&(l, e)) { continue; }
+            let Some(s) = free.pop() else { break };
+            if let Some(k) = self.key_of[s] { self.slot_of.remove(&k); }
+            self.key_of[s] = Some((l, e)); self.slot_of.insert((l, e), s); self.tick += 1; self.last_use[s] = self.tick;
+            let eb: usize = self.lay[l].ebytes.iter().sum();
+            unsafe { sys::cuMemcpyHtoDAsync_v2(self.arena + (s * self.slot_bytes) as u64, self.store.add(self.store_off[l] + e * eb) as *const _, eb, self.st.cu_stream()).result().unwrap() };
+        }
+        unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
+        self.pheat.iter_mut().for_each(|h| *h = 0);
     }
     /// (data bytes per K or V buffer, scale bytes per buffer) for `pos` cached positions.
     fn kv_bytes(&self, pos: usize) -> (usize, usize) {
@@ -326,6 +347,7 @@ impl Gpu {
         if self.pf.is_some() && ids.len() >= 8 && std::env::var("LE_BATCH").map_or(true, |v| v != "0") {
             let mut i = 0;
             while i < ids.len() { let e = (i + prefill::tmax()).min(ids.len()); out = self.prefill_chunk(&ids[i..e], e == ids.len()); i = e; }
+            if ids.len() >= 256 && std::env::var("LE_WARM").map_or(true, |v| v != "0") { self.warm_cache(); } else { self.pheat.iter_mut().for_each(|h| *h = 0); }
             return out;
         }
         for (i, &t) in ids.iter().enumerate() { out = self.forward_n(t, i + 1 == ids.len()); }
