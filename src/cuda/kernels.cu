@@ -1,5 +1,5 @@
 // LastEngine CUDA kernels (clean-room, written from the GGML block-format descriptions).
-// A `__constant__ unsigned char IQ3_GRID[1024]` definition is prepended at runtime.
+// Host prepends: <cuda_fp16.h>, `__constant__ unsigned int IQ3_G32[256]` (IQ3_XXS grid as 4 packed bytes).
 typedef unsigned char u8; typedef unsigned short u16; typedef unsigned int u32; typedef signed char i8;
 #define FULL 0xffffffffu
 
@@ -7,82 +7,87 @@ __device__ __forceinline__ float h2f(const u8* p) { return __half2float(*(const 
 __device__ __forceinline__ float warp_sum(float v) { for (int o = 16; o; o >>= 1) v += __shfl_xor_sync(FULL, v, o); return v; }
 __device__ __forceinline__ float silu_f(float x) { return x / (1.f + __expf(-x)); }
 __device__ __forceinline__ float sigm_f(float x) { return 1.f / (1.f + __expf(-x)); }
+__device__ __forceinline__ int ld32(const u8* p) { return (int)*(const u16*)p | ((int)*(const u16*)(p + 2) << 16); }
+__device__ __forceinline__ int ld32a(const u8* p) { return *(const int*)p; }
+#define DP(a, b, c) __dp4a((int)(a), (int)(b), (int)(c))
 
-// ---- 32-value unit dot products: x points at the unit's 32 activations ----
+// x -> int8 units of 32 (scale xd, int sum xs). One warp per unit.
+extern "C" __global__ void quant_x(const float* x, signed char* xq, float* xd, int* xs, int n_units) {
+  int u = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5), lane = threadIdx.x & 31;
+  if (u >= n_units) return;
+  float v = x[u * 32 + lane], a = fabsf(v);
+  for (int o = 16; o; o >>= 1) a = fmaxf(a, __shfl_xor_sync(FULL, a, o));
+  float d = a / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+  int q = __float2int_rn(v * id);
+  xq[u * 32 + lane] = (signed char)q;
+  int s = q; for (int o = 16; o; o >>= 1) s += __shfl_xor_sync(FULL, s, o);
+  if (lane == 0) { xd[u] = d; xs[u] = s; }
+}
+
 __device__ __forceinline__ void sm_k4(int j, const u8* s, int& sc, int& m) {
   if (j < 4) { sc = s[j] & 63; m = s[j + 4] & 63; }
   else { sc = (s[j + 4] & 15) | ((s[j - 4] >> 6) << 4); m = (s[j + 4] >> 4) | ((s[j] >> 6) << 4); }
 }
-template <int TY> __device__ float unit_dot(const u8* b, int j, const float* x);
-
-// Q4_0 (2): 18B / 32 values, one unit per block
-template <> __device__ float unit_dot<2>(const u8* b, int, const float* x) {
-  float d = h2f(b), a = 0.f;
-  for (int l = 0; l < 16; l++) { a += ((b[2 + l] & 15) - 8) * x[l] + ((b[2 + l] >> 4) - 8) * x[l + 16]; }
-  return a * d;
+// Contribution of one 32-value unit (unit j of block b) dotted with int8 activations xq[8 ints], scale dx, int sum sx.
+template <int TY> __device__ float udot(const u8* b, int j, const int* xq, float dx, int sx);
+template <> __device__ float udot<2>(const u8* b, int, const int* xq, float dx, int sx) {
+  int a = 0;
+  for (int i = 0; i < 4; i++) { int v = ld32(b + 2 + 4 * i); a = DP(v & 0x0F0F0F0F, xq[i], a); a = DP((v >> 4) & 0x0F0F0F0F, xq[4 + i], a); }
+  return h2f(b) * dx * (float)(a - 8 * sx);
 }
-// Q8_0 (8): 34B / 32 values
-template <> __device__ float unit_dot<8>(const u8* b, int, const float* x) {
-  float d = h2f(b), a = 0.f;
-  for (int l = 0; l < 32; l++) a += (float)(i8)b[2 + l] * x[l];
-  return a * d;
+template <> __device__ float udot<8>(const u8* b, int, const int* xq, float dx, int) {
+  int a = 0; for (int i = 0; i < 8; i++) a = DP(ld32(b + 2 + 4 * i), xq[i], a);
+  return h2f(b) * dx * (float)a;
 }
-// Q4_K (12): 144B / 256
-template <> __device__ float unit_dot<12>(const u8* b, int j, const float* x) {
+template <> __device__ float udot<12>(const u8* b, int j, const int* xq, float dx, int sx) {
   float d = h2f(b), dm = h2f(b + 2); int sc, m; sm_k4(j, b + 4, sc, m);
-  const u8* qs = b + 16 + (j >> 1) * 32; int hi = j & 1;
-  float a = 0.f, sx = 0.f;
-  for (int l = 0; l < 32; l++) { int q = hi ? (qs[l] >> 4) : (qs[l] & 15); a += q * x[l]; sx += x[l]; }
-  return d * sc * a - dm * m * sx;
+  const u8* qs = b + 16 + (j >> 1) * 32; int sh = (j & 1) * 4, a = 0;
+  for (int i = 0; i < 8; i++) a = DP((ld32a(qs + 4 * i) >> sh) & 0x0F0F0F0F, xq[i], a);
+  return dx * (d * sc * (float)a - dm * m * (float)sx);
 }
-// Q5_K (13): 176B / 256
-template <> __device__ float unit_dot<13>(const u8* b, int j, const float* x) {
+template <> __device__ float udot<13>(const u8* b, int j, const int* xq, float dx, int sx) {
   float d = h2f(b), dm = h2f(b + 2); int sc, m; sm_k4(j, b + 4, sc, m);
-  const u8* qh = b + 16; const u8* qs = b + 48 + (j >> 1) * 32; int hi = j & 1;
-  float a = 0.f, sx = 0.f;
-  for (int l = 0; l < 32; l++) { int q = (hi ? (qs[l] >> 4) : (qs[l] & 15)) + (((qh[l] >> j) & 1) << 4); a += q * x[l]; sx += x[l]; }
-  return d * sc * a - dm * m * sx;
+  const u8* qh = b + 16; const u8* qs = b + 48 + (j >> 1) * 32; int sh = (j & 1) * 4, a = 0;
+  for (int i = 0; i < 8; i++) a = DP(((ld32a(qs + 4 * i) >> sh) & 0x0F0F0F0F) | (((ld32a(qh + 4 * i) >> j) & 0x01010101) << 4), xq[i], a);
+  return dx * (d * sc * (float)a - dm * m * (float)sx);
 }
-// Q6_K (14): 210B / 256
-template <> __device__ float unit_dot<14>(const u8* b, int j, const float* x) {
-  const u8* ql = b + (j >> 2) * 64; const u8* qh = b + 128 + (j >> 2) * 32; const i8* sc = (const i8*)(b + 192) + (j >> 2) * 8;
-  int s = j & 3; float d = h2f(b + 208), a0 = 0.f, a1 = 0.f;
-  for (int l = 0; l < 32; l++) {
-    int lo = (s & 1) ? ql[32 + l] : ql[l]; lo = (s & 2) ? (lo >> 4) : (lo & 15);
-    int q = (lo | (((qh[l] >> (2 * s)) & 3) << 4)) - 32;
-    if (l < 16) a0 += q * x[l]; else a1 += q * x[l];
-  }
-  return d * (sc[(s * 2)] * a0 + sc[s * 2 + 1] * a1);
-}
-// Q3_K (11): 110B / 256
-template <> __device__ float unit_dot<11>(const u8* b, int j, const float* x) {
-  const u8* hm = b; const u8* qs = b + 32 + (j >> 2) * 32; const u8* sc = b + 96; float d = h2f(b + 108);
-  int s = j & 3; float a[2] = {0.f, 0.f};
-  for (int l = 0; l < 32; l++) {
-    int q = ((qs[l] >> (2 * s)) & 3) - (((hm[l] >> j) & 1) ? 0 : 4);
-    a[l >> 4] += q * x[l];
+template <> __device__ float udot<11>(const u8* b, int j, const int* xq, float dx, int) {
+  const u8* hm = b; const u8* qs = b + 32 + (j >> 2) * 32; const u8* sc = b + 96; int s2 = 2 * (j & 3), a0 = 0, a1 = 0;
+  for (int i = 0; i < 8; i++) {
+    int v = (ld32(qs + 4 * i) >> s2) & 0x03030303, h = (~ld32(hm + 4 * i) >> j) & 0x01010101;
+    int q = __vsubss4(v, h << 2);
+    if (i < 4) a0 = DP(q, xq[i], a0); else a1 = DP(q, xq[i], a1);
   }
   float r = 0.f;
   for (int h = 0; h < 2; h++) {
     int i = 2 * j + h; int lo = i < 8 ? (sc[i] & 15) : (sc[i - 8] >> 4); int hi = (sc[8 + (i & 3)] >> (2 * (i >> 2))) & 3;
-    r += ((lo | (hi << 4)) - 32) * a[h];
+    r += (float)(((lo | (hi << 4)) - 32) * (h ? a1 : a0));
   }
-  return d * r;
+  return h2f(b + 108) * dx * r;
 }
-// IQ3_XXS (18): 98B / 256
-template <> __device__ float unit_dot<18>(const u8* b, int j, const float* x) {
-  float d = h2f(b); const u8* qs = b + 2 + j * 8; u32 aux = (u32)*(const u16*)(b + 66 + j * 4) | ((u32)*(const u16*)(b + 68 + j * 4) << 16);
-  float db = d * (0.5f + (aux >> 28)) * 0.5f, a = 0.f;
+template <> __device__ float udot<14>(const u8* b, int j, const int* xq, float dx, int) {
+  int half = j >> 2, s = j & 3; const u8* ql = b + half * 64 + (s & 1) * 32; const u8* qh = b + 128 + half * 32;
+  const i8* sc = (const i8*)(b + 192) + half * 8 + s * 2; int a0 = 0, a1 = 0, sh = (s >> 1) * 4;
+  for (int i = 0; i < 8; i++) {
+    int q = __vsubss4(((ld32(ql + 4 * i) >> sh) & 0x0F0F0F0F) | (((ld32(qh + 4 * i) >> (2 * s)) & 0x03030303) << 4), 0x20202020);
+    if (i < 4) a0 = DP(q, xq[i], a0); else a1 = DP(q, xq[i], a1);
+  }
+  return h2f(b + 208) * dx * (float)(sc[0] * a0 + sc[1] * a1);
+}
+template <> __device__ float udot<18>(const u8* b, int j, const int* xq, float dx, int) {
+  const u8* qs = b + 2 + j * 8; u32 aux = (u32)*(const u16*)(b + 66 + j * 4) | ((u32)*(const u16*)(b + 68 + j * 4) << 16);
+  int a = 0;
   for (int l = 0; l < 4; l++) {
     u32 si = (aux >> (7 * l)) & 127; u32 sg = si | ((__popc(si) & 1) << 7);
     for (int h = 0; h < 2; h++) {
-      const u8* g = &IQ3_GRID[qs[2 * l + h] * 4];
-      for (int k = 0; k < 4; k++) { float v = g[k] * ((sg >> (4 * h + k)) & 1 ? -1.f : 1.f); a += v * x[l * 8 + h * 4 + k]; }
+      u32 nib = (sg >> (4 * h)) & 15;
+      u32 m = (nib & 1 ? 0xFFu : 0) | (nib & 2 ? 0xFF00u : 0) | (nib & 4 ? 0xFF0000u : 0) | (nib & 8 ? 0xFF000000u : 0);
+      int g = (int)__vsub4(IQ3_G32[qs[2 * l + h]] ^ m, m);
+      a = DP(g, xq[2 * l + h], a);
     }
   }
-  return a * db;
+  return h2f(b) * (0.5f + (float)(aux >> 28)) * 0.5f * dx * (float)a;
 }
-
 template <int TY> struct Q { static const int UB = 8, BYTES = 0; };
 template <> struct Q<2>  { static const int UB = 1, BYTES = 18; };
 template <> struct Q<8>  { static const int UB = 1, BYTES = 34; };
@@ -92,29 +97,33 @@ template <> struct Q<13> { static const int UB = 8, BYTES = 176; };
 template <> struct Q<14> { static const int UB = 8, BYTES = 210; };
 template <> struct Q<18> { static const int UB = 8, BYTES = 98; };
 
-// out[slot*rows + r] = W[slot][r,:] . x[slot or 0]. One warp per row, 4 rows per block.
-// ptrs: per-slot weight base. xstride: 0 = shared x, else per-slot stride (floats).
+// out[slot*rows + r] = W[slot][r,:] . x[slot]. Quantised activations: xq bytes, xd scales, xs sums, slot stride xstride elements.
+// 256 threads = 8 warps; a warp covers 32/lpr rows, lpr = min(32, cols/32) lanes per row.
 template <int TY>
-__device__ void matvec_impl(const u8* const* ptrs, const float* x, float* out, int rows, int cols, int xstride) {
-  extern __shared__ float xs[];
-  int slot = blockIdx.y; const float* xp = x + (size_t)slot * xstride;
-  for (int i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = xp[i];
+__device__ void mv_impl(const u8* const* ptrs, const signed char* xq, const float* xd, const int* xs, float* out, int rows, int cols, int xstride) {
+  extern __shared__ int sm[];
+  int units = cols >> 5, slot = blockIdx.y;
+  int* sxq = sm; float* sxd = (float*)(sm + units * 9); int* sxs = (int*)(sxd + units);
+  const int* gq = (const int*)(xq + (size_t)slot * xstride);
+  for (int i = threadIdx.x; i < units * 8; i += 256) sxq[(i >> 3) * 9 + (i & 7)] = gq[i];
+  for (int i = threadIdx.x; i < units; i += 256) { sxd[i] = xd[(size_t)slot * (xstride >> 5) + i]; sxs[i] = xs[(size_t)slot * (xstride >> 5) + i]; }
   __syncthreads();
-  int r = blockIdx.x * 4 + (threadIdx.x >> 5), lane = threadIdx.x & 31;
-  if (r >= rows) return;
-  const int UB = Q<TY>::UB, BY = Q<TY>::BYTES, UV = 256 / UB > 32 ? 32 : 256 / UB;
-  int nunits = cols / UV;
-  const u8* row = ptrs[slot] + (size_t)r * (cols / (UB * UV)) * BY;
+  const int UB = Q<TY>::UB, BY = Q<TY>::BYTES;
+  int lpr = units < 32 ? units : 32, rpw = 32 / lpr;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int r = (blockIdx.x * 8 + warp) * rpw + lane / lpr, li = lane % lpr;
+  bool ok = r < rows;
+  const u8* row = ptrs[slot] + (size_t)(ok ? r : 0) * (cols / (UB * 32)) * BY;
   float acc = 0.f;
-  for (int u = lane; u < nunits; u += 32) acc += unit_dot<TY>(row + (u / UB) * BY, u % UB, xs + u * UV);
-  acc = warp_sum(acc);
-  if (lane == 0) out[(size_t)slot * rows + r] = acc;
+  if (ok) for (int u = li; u < units; u += lpr) acc += udot<TY>(row + (u / UB) * BY, u % UB, sxq + u * 9, sxd[u], sxs[u]);
+  for (int o = lpr >> 1; o; o >>= 1) acc += __shfl_xor_sync(FULL, acc, o);
+  if (ok && li == 0) out[(size_t)slot * rows + r] = acc;
 }
-#define MV(TY) extern "C" __global__ void matvec_##TY(const u8* const* p, const float* x, float* o, int rows, int cols, int xs) { matvec_impl<TY>(p, x, o, rows, cols, xs); }
+#define MV(TY) extern "C" __global__ void matvec_##TY(const u8* const* p, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols, int xstride) { mv_impl<TY>(p, xq, xd, xs, o, rows, cols, xstride); }
 MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(18)
 
 // F32 matvec (router, tiny projections): same shape
-extern "C" __global__ void matvec_0(const u8* const* p, const float* x, float* o, int rows, int cols, int xstride) {
+extern "C" __global__ void matvecf(const u8* const* p, const float* x, float* o, int rows, int cols, int xstride) {
   extern __shared__ float xs[];
   int slot = blockIdx.y; const float* xp = x + (size_t)slot * xstride;
   for (int i = threadIdx.x; i < cols; i += blockDim.x) xs[i] = xp[i];

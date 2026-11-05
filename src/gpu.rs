@@ -26,7 +26,7 @@ pub struct Gpu {
     lay: Vec<Lay>, out_norm: Dp, out_w: W,
     x: Dp, h: Dp, t0: Dp, t1: Dp, t2: Dp, t3: Dp, y: Dp, logits: Dp, scores: Dp,
     idx: Dp, rw: Dp, shg: Dp, eg: Dp, eu: Dp, ea: Dp, ed: Dp, shg_t: Dp, shu_t: Dp, sha_t: Dp, shd_t: Dp,
-    ptr_g: Dp, ptr_u: Dp, ptr_d: Dp,
+    ptr_g: Dp, ptr_u: Dp, ptr_d: Dp, xqb: [Dp; 2], xdb: [Dp; 2], xsb: [Dp; 2],
     conv: Vec<Dp>, sdelta: Vec<Dp>, kc: Vec<Dp>, vc: Vec<Dp>,
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     pub hits: u64, pub misses: u64, pub ctx_len: usize, pub pos: usize,
@@ -37,15 +37,15 @@ impl Gpu {
         let ctx = CudaContext::new(0).expect("cuda");
         let st = ctx.default_stream();
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
-        let mut src = String::from("#include <cuda_fp16.h>\n__constant__ unsigned char IQ3_GRID[1024] = {");
-        for g in crate::quant::iq3_grid().iter() { for v in g { src.push_str(&format!("{v},")); } }
+        let mut src = String::from("#include <cuda_fp16.h>\n__constant__ unsigned int IQ3_G32[256] = {");
+        for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
         src.push_str("};\n");
         src.push_str(include_str!("cuda/kernels.cu"));
         let opts = CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() };
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["matvec_0", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "rmsnorm", "add_inplace", "swiglu",
+        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "delta_conv", "delta_step"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
@@ -113,6 +113,7 @@ impl Gpu {
             eg: a(c.n_used * c.ff_exp), eu: a(c.n_used * c.ff_exp), ea: a(c.n_used * c.ff_exp), ed: a(c.n_used * c.n_embd),
             shg_t: a(c.ff_shexp), shu_t: a(c.ff_shexp), sha_t: a(c.ff_shexp), shd_t: a(c.n_embd),
             ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
+            xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
             arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0,
             f, st, _ctx: ctx, m,
@@ -124,11 +125,22 @@ impl Gpu {
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
         unsafe { b.launch(LaunchConfig { grid_dim: (grid.0, grid.1, 1), block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
     }
-    fn mv_ptrs(&self, ty: u32, ptrs: Dp, x: Dp, out: Dp, rows: usize, cols: usize, xstride: usize, slots: usize) {
-        let name = match ty { 0 => "matvec_0", 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 18 => "matvec_18", t => panic!("no kernel for type {t}") };
-        self.launch(name, (rows.div_ceil(4) as u32, slots as u32), 128, (cols * 4) as u32, &[P(ptrs), P(x), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
+    fn qx(&self, x: Dp, n: usize, set: usize) {
+        let units = n / 32;
+        self.launch("quant_x", (units.div_ceil(8) as u32, 1), 256, 0, &[P(x), P(self.xqb[set]), P(self.xdb[set]), P(self.xsb[set]), I(units as i32)]);
     }
-    pub fn mv(&self, w: W, x: Dp, out: Dp) { self.mv_ptrs(w.ty, w.cell, x, out, w.rows, w.cols, 0, 1); }
+    /// Quantised matvec (activations already quantised into `set`), or F32 matvec reading `x` directly when ty == 0.
+    fn mv_ptrs(&self, ty: u32, ptrs: Dp, x: Dp, set: usize, out: Dp, rows: usize, cols: usize, xstride: usize, slots: usize) {
+        if ty == 0 {
+            self.launch("matvecf", (rows.div_ceil(4) as u32, slots as u32), 128, (cols * 4) as u32, &[P(ptrs), P(x), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
+            return;
+        }
+        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 18 => "matvec_18", t => panic!("no kernel for type {t}") };
+        let units = cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
+        self.launch(name, (rows.div_ceil(rpb) as u32, slots as u32), 256, (units * 36 + units * 8) as u32,
+            &[P(ptrs), P(self.xqb[set]), P(self.xdb[set]), P(self.xsb[set]), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
+    }
+    pub fn mv(&self, w: W, x: Dp, set: usize, out: Dp) { self.mv_ptrs(w.ty, w.cell, x, set, out, w.rows, w.cols, 0, 1); }
     fn rms(&self, x: Dp, w: Dp, o: Dp, n: usize) { self.launch("rmsnorm", (1, 1), 256, 0, &[P(x), P(w), P(o), I(n as i32), F(self.m.cfg.eps)]); }
     fn add(&self, x: Dp, y: Dp, n: usize) { self.launch("add_inplace", (n.div_ceil(256) as u32, 1), 256, 0, &[P(x), P(y), I(n as i32)]); }
     fn swiglu(&self, g: Dp, u: Dp, o: Dp, n: usize) { self.launch("swiglu", (n.div_ceil(256) as u32, 1), 256, 0, &[P(g), P(u), P(o), I(n as i32)]); }
@@ -171,28 +183,29 @@ impl Gpu {
             self.rms(self.x, ly.attn_norm, self.h, c.n_embd);
             if ly.full {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
-                self.mv(ly.q.unwrap(), self.h, self.t0); self.mv(ly.k.unwrap(), self.h, self.t1); self.mv(ly.v.unwrap(), self.h, self.t2);
+                self.qx(self.h, c.n_embd, 0); self.mv(ly.q.unwrap(), self.h, 0, self.t0); self.mv(ly.k.unwrap(), self.h, 0, self.t1); self.mv(ly.v.unwrap(), self.h, 0, self.t2);
                 self.launch("attn_prep", ((nh + nkv) as u32, 1), 256, 0, &[P(self.t0), P(self.t1), P(self.t2), P(ly.qn), P(ly.kn), P(self.y), P(self.t3), P(self.kc[l]), P(self.vc[l]),
                     I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(c.rope_base), I(pos as i32), F(c.eps)]);
                 let n = pos + 1;
                 self.launch("attn_scores", (n.div_ceil(8) as u32, nh as u32), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32)]);
                 self.launch("attn_softmax", (nh as u32, 1), 256, 0, &[P(self.scores), I(n as i32), I(self.ctx_len as i32)]);
                 self.launch("attn_pv", (nh as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.t3), P(self.t0), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32)]);
-                self.mv(ly.o.unwrap(), self.t0, self.t1);
+                self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             } else {
                 let ch = c.d_inner * 2 + 2 * c.n_group * c.d_state;
-                self.mv(ly.qkv.unwrap(), self.h, self.t0); self.mv(ly.gate.unwrap(), self.h, self.t1);
-                self.mv(ly.beta.unwrap(), self.h, self.t2); self.mv(ly.alpha.unwrap(), self.h, self.t3);
+                self.qx(self.h, c.n_embd, 0); self.mv(ly.qkv.unwrap(), self.h, 0, self.t0); self.mv(ly.gate.unwrap(), self.h, 0, self.t1);
+                self.mv(ly.beta.unwrap(), self.h, 0, self.t2); self.mv(ly.alpha.unwrap(), self.h, 0, self.t3);
                 self.launch("delta_conv", (ch.div_ceil(256) as u32, 1), 256, 0, &[P(self.t0), P(ly.conv_w), P(self.conv[l]), P(self.y), I(ch as i32), I(c.conv_k as i32)]);
                 self.launch("delta_step", (c.n_vhead as u32, 1), 128, 0, &[P(self.y), P(self.t3), P(self.t2), P(ly.a_log), P(ly.dt_b), P(self.t1), P(ly.ssm_norm), P(self.sdelta[l]), P(self.t0),
                     I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps)]);
-                self.mv(ly.ssm_out.unwrap(), self.t0, self.t1);
+                self.qx(self.t0, c.d_inner, 1); self.mv(ly.ssm_out.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             }
             // MoE
             self.rms(self.x, ly.post_norm, self.h, c.n_embd);
-            self.mv(ly.router, self.h, self.logits);
+            self.mv(ly.router, self.h, 0, self.logits);
+            self.qx(self.h, c.n_embd, 0);
             self.launch("router_topk", (1, 1), 32, 0, &[P(self.logits), I(c.n_expert as i32), I(c.n_used as i32), P(self.idx), P(self.rw)]);
             let mut idx = [0i32; 8];
             unsafe { result::memcpy_dtoh_sync(&mut idx[..c.n_used], self.idx).unwrap() };
@@ -204,18 +217,19 @@ impl Gpu {
             let pd: Vec<u64> = slots.iter().map(|&s| base(s, 2)).collect();
             unsafe { result::memcpy_htod_sync(self.ptr_g, &pg).unwrap(); result::memcpy_htod_sync(self.ptr_u, &pu).unwrap(); result::memcpy_htod_sync(self.ptr_d, &pd).unwrap(); }
             let k = c.n_used;
-            self.mv_ptrs(ly.ety[0], self.ptr_g, self.h, self.eg, c.ff_exp, c.n_embd, 0, k);
-            self.mv_ptrs(ly.ety[1], self.ptr_u, self.h, self.eu, c.ff_exp, c.n_embd, 0, k);
+            self.mv_ptrs(ly.ety[0], self.ptr_g, self.h, 0, self.eg, c.ff_exp, c.n_embd, 0, k);
+            self.mv_ptrs(ly.ety[1], self.ptr_u, self.h, 0, self.eu, c.ff_exp, c.n_embd, 0, k);
             self.swiglu(self.eg, self.eu, self.ea, k * c.ff_exp);
-            self.mv_ptrs(ly.ety[2], self.ptr_d, self.ea, self.ed, c.n_embd, c.ff_exp, c.ff_exp, k);
-            self.mv(ly.sh_gate, self.h, self.shg_t); self.mv(ly.sh_up, self.h, self.shu_t);
+            self.qx(self.ea, k * c.ff_exp, 1);
+            self.mv_ptrs(ly.ety[2], self.ptr_d, self.ea, 1, self.ed, c.n_embd, c.ff_exp, c.ff_exp, k);
+            self.mv(ly.sh_gate, self.h, 0, self.shg_t); self.mv(ly.sh_up, self.h, 0, self.shu_t);
             self.swiglu(self.shg_t, self.shu_t, self.sha_t, c.ff_shexp);
-            self.mv(ly.sh_down, self.sha_t, self.shd_t);
-            self.mv(ly.shg_in, self.h, self.shg);
+            self.qx(self.sha_t, c.ff_shexp, 1); self.mv(ly.sh_down, self.sha_t, 1, self.shd_t);
+            self.mv(ly.shg_in, self.h, 0, self.shg);
             self.launch("moe_combine", (c.n_embd.div_ceil(256) as u32, 1), 256, 0, &[P(self.x), P(self.ed), P(self.rw), I(k as i32), P(self.shd_t), P(self.shg), I(c.n_embd as i32)]);
         }
         self.rms(self.x, self.out_norm, self.h, c.n_embd);
-        self.mv(self.out_w, self.h, self.logits);
+        self.qx(self.h, c.n_embd, 0); self.mv(self.out_w, self.h, 0, self.logits);
         let mut out = vec![0f32; self.m.vocab];
         unsafe { result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
         self.pos += 1;
