@@ -33,7 +33,10 @@ pub struct Gpu {
     pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
+unsafe impl Send for Gpu {}
+
 impl Gpu {
+    pub fn bind(&self) { self._ctx.bind_to_thread().expect("bind"); }
     pub fn new(m: Arc<Model>, ctx_len: usize, vram_margin_mib: usize) -> Gpu {
         let ctx = CudaContext::new(0).expect("cuda");
         let st = ctx.default_stream();
@@ -174,6 +177,7 @@ impl Gpu {
     fn swiglu(&self, g: Dp, u: Dp, o: Dp, n: usize) { self.launch("swiglu", (n.div_ceil(256) as u32, 1), 256, 0, &[P(g), P(u), P(o), I(n as i32)]); }
 
     pub fn reset(&mut self) {
+        self.bind();
         let c = &self.m.cfg;
         let conv_ch = c.d_inner * 2 + 2 * c.n_group * c.d_state;
         for l in 0..c.n_layer { if !self.lay[l].full { dzero(self.conv[l], conv_ch * (c.conv_k - 1) * 4); dzero(self.sdelta[l], c.n_vhead * c.d_state * c.d_state * 4); } }
@@ -239,7 +243,14 @@ impl Gpu {
     }
 
     /// Decode one token at self.pos; returns device pointer of logits (vocab f32) after synchronisation.
-    pub fn forward(&mut self, token: u32) -> Vec<f32> {
+    pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
+        self.bind();
+        let mut out = vec![];
+        for (i, &t) in ids.iter().enumerate() { out = self.forward_n(t, i + 1 == ids.len()); }
+        out
+    }
+    pub fn forward(&mut self, token: u32) -> Vec<f32> { self.bind(); self.forward_n(token, true) }
+    fn forward_n(&mut self, token: u32, want: bool) -> Vec<f32> {
         let c = self.m.cfg.clone();
         let pos = self.pos;
         assert!(pos < self.ctx_len, "context full");
@@ -305,11 +316,12 @@ impl Gpu {
             self.mv(ly.shg_in, self.h, 0, self.shg);
             self.launch("moe_combine", (c.n_embd.div_ceil(256) as u32, 1), 256, 0, &[P(self.x), P(self.ed), P(self.rw), I(k as i32), P(self.shd_t), P(self.shg), I(c.n_embd as i32)]);
         }
+        self.pos += 1;
+        if !want { self.st.synchronize().unwrap(); return vec![]; }
         self.rms(self.x, self.out_norm, self.h, c.n_embd);
         self.qx(self.h, c.n_embd, 0); self.mv(self.out_w, self.h, 0, self.logits);
         let mut out = vec![0f32; self.m.vocab];
         unsafe { result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
-        self.pos += 1;
         out
     }
 }

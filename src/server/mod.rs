@@ -1,5 +1,5 @@
 //! OpenAI-compatible HTTP surface (contract taken from what LastHarness/llama-swap use).
-use crate::backend::{GenRequest, Shared, Stub};
+use crate::backend::{Delta, GenRequest, Sampling, Shared, Stub};
 mod stats;
 use stats::{ReqStat, Stats};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -19,7 +19,11 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     let be: Shared = if a.stub || a.model.is_none() {
         Arc::new(Stub)
     } else {
-        return Err("real backends are not implemented yet; use --stub".into());
+        let path = a.model.clone().unwrap();
+        let (ctx, margin) = (a.ctx.unwrap_or(8192), a.vram_margin.unwrap_or(128));
+        let tf = a.chat_template_file.clone();
+        let l = tokio::task::spawn_blocking(move || crate::local::Local::load(&path, ctx, margin, tf.as_deref())).await.map_err(|e| e.to_string())??;
+        Arc::new(l)
     };
     let st = Arc::new(App { be, stats: Stats::new() });
     let app = Router::new()
@@ -62,22 +66,29 @@ async fn props(State(a): State<Arc<App>>) -> Json<Value> {
     let be = &a.be;
     Json(json!({
         "default_generation_settings": {"n_ctx": be.n_ctx()},
-        "chat_template_caps": {"supports_tools": false, "supports_reasoning_effort": false},
+        "chat_template_caps": {"supports_tools": a.be.supports_tools(), "supports_reasoning_effort": false},
         "modalities": {"vision": false}
     }))
 }
 
-fn prompt_of(body: &Value) -> String {
-    body["messages"].as_array().map(|m| {
-        m.iter().filter_map(|x| x["content"].as_str()).collect::<Vec<_>>().join("\n")
-    }).unwrap_or_default()
+fn sampling_of(b: &Value) -> Sampling {
+    let f = |k: &str, d: f32| b[k].as_f64().map(|v| v as f32).unwrap_or(d);
+    Sampling { temperature: f("temperature", 0.7), top_p: f("top_p", 0.95), top_k: b["top_k"].as_u64().unwrap_or(40) as usize, min_p: f("min_p", 0.0),
+               presence_penalty: f("presence_penalty", 0.0), repeat_penalty: f("repeat_penalty", 1.0), seed: b["seed"].as_u64() }
+}
+
+fn tool_calls_json(u: &crate::backend::Usage) -> Value {
+    Value::Array(u.tool_calls.iter().enumerate().map(|(i, c)| json!({"index":i,"id":format!("call_{i}"),"type":"function","function":{"name":c.name,"arguments":c.arguments}})).collect())
 }
 
 async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::response::Response {
     use axum::response::IntoResponse;
     let req = GenRequest {
-        prompt: prompt_of(&body),
-        max_tokens: body["max_tokens"].as_u64().unwrap_or(256) as usize,
+        messages: body["messages"].as_array().cloned().unwrap_or_default(),
+        tools: body.get("tools").filter(|t| t.as_array().map_or(false, |a| !a.is_empty())).cloned(),
+        max_tokens: body["max_tokens"].as_u64().or(body["max_completion_tokens"].as_u64()).unwrap_or(4096) as usize,
+        sampling: sampling_of(&body),
+        enable_thinking: body["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(true),
     };
     let stream = body["stream"].as_bool().unwrap_or(false);
     let include_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
@@ -90,17 +101,17 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
     if !stream {
         let app2 = app.clone();
         let h = tokio::task::spawn_blocking(move || {
-            let mut text = String::new();
+            let (mut text, mut reasoning) = (String::new(), String::new());
             let mut ttft = None;
-            let u = be.generate(&req, &mut |s| { ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0); text.push_str(s); true });
+            let u = be.generate(&req, &mut |d| { ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0); match d { Delta::Content(s) => text.push_str(&s), Delta::Reasoning(s) => reasoning.push_str(&s) } true });
             let st = record(rid, started_unix_ms, t0, ttft, &u, true);
             app2.stats.finish(st.clone());
-            (text, u, st)
+            (text, reasoning, u, st)
         });
-        let (text, u, st) = h.await.unwrap();
+        let (text, reasoning, u, st) = h.await.unwrap();
         return Json(json!({
             "id": id, "object": "chat.completion", "model": model,
-            "choices": [{"index":0,"message":{"role":"assistant","content":text},"finish_reason":"stop"}],
+            "choices": [{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":tool_calls_json(&u)},"finish_reason":u.finish_reason}],
             "usage": {"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,
                       "prompt_tokens_details":{"cached_tokens":u.cached_tokens}},
             "timings": timings(&st)
@@ -115,14 +126,16 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
         // emit returns false when the receiver is dropped (client closed the socket): generation stops.
         let mut ttft = None;
         let mut alive = true;
-        let u = be.generate(&req, &mut |s| {
+        let u = be.generate(&req, &mut |d| {
             ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
-            alive = tx.blocking_send(ev(chunk(json!({"content":s}), Value::Null))).is_ok();
+            let delta = match d { Delta::Content(s) => json!({"content":s}), Delta::Reasoning(s) => json!({"reasoning_content":s}) };
+            alive = tx.blocking_send(ev(chunk(delta, Value::Null))).is_ok();
             alive
         });
+        if !u.tool_calls.is_empty() { let _ = tx.blocking_send(ev(chunk(json!({"tool_calls":tool_calls_json(&u)}), Value::Null))); }
         let st = record(rid, started_unix_ms, t0, ttft, &u, alive);
         app.stats.finish(st.clone());
-        let _ = tx.blocking_send(ev(chunk(json!({}), json!("stop"))));
+        let _ = tx.blocking_send(ev(chunk(json!({}), json!(u.finish_reason))));
         if include_usage {
             let _ = tx.blocking_send(ev(json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[],
                 "usage":{"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,

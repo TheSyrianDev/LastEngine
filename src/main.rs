@@ -4,6 +4,7 @@ mod cli;
 mod cpu_ref;
 mod gguf;
 mod gpu;
+mod local;
 mod server;
 mod quant;
 mod template;
