@@ -1,1 +1,4 @@
 Required Notice: Copyright (c) 2026 Omar Baroud (https://github.com/TheSyrianDev)
+
+The IQ3_XXS lattice table in src/quant_iq3xxs_grid.rs is a format constant extracted
+(via tools/gen_iq3xxs_grid.py) from gguf-py of llama.cpp (MIT, Copyright (c) 2023-2026 The ggml authors).

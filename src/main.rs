@@ -3,6 +3,7 @@ mod backend;
 mod cli;
 mod gguf;
 mod server;
+mod quant;
 mod template;
 mod tokenizer;
 
@@ -40,6 +41,21 @@ async fn main() {
             let t = g.kv.get("tokenizer.chat_template").and_then(|v| v.as_str()).expect("no template");
             let msgs: Vec<serde_json::Value> = serde_json::from_str(r#"[{"role":"system","content":"Be brief."},{"role":"user","content":"Hi"},{"role":"assistant","content":"Hello!"},{"role":"user","content":"Bye"}]"#).unwrap();
             println!("{}", template::render(t, &msgs, None, true, "", "").unwrap_or_else(|e| e));
+        }
+        cli::Cmd::Dequant { path, name, n, out } => {
+            use std::io::{Read, Seek, Write};
+            let g = gguf::Gguf::open(&path).expect("open");
+            let t = g.tensors.iter().find(|t| t.name == name).expect("tensor");
+            let (vb, bb) = quant::block_info(t.ggml_type).unwrap();
+            let nb = n / vb;
+            let mut f = std::fs::File::open(&path).unwrap();
+            f.seek(std::io::SeekFrom::Start(g.data_start + t.offset)).unwrap();
+            let mut buf = vec![0u8; nb * bb];
+            f.read_exact(&mut buf).unwrap();
+            let mut v = vec![0f32; nb * vb];
+            quant::dequant_row(t.ggml_type, &buf, &mut v);
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            std::fs::File::create(out).unwrap().write_all(&bytes).unwrap();
         }
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {
