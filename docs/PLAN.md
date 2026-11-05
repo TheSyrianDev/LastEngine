@@ -61,3 +61,6 @@ Abstract view: decode here is a *data-movement* problem, not a compute one. Per 
 8. **Speculation that does not multiply expert traffic.** Plain MTP fails here (union of experts). Only worth revisiting after 1-4 make misses cheap; then tree/batch-2 verification becomes compute-bound and MTP's 73% acceptance would yield ~1.7x.
 
 Recommended order: 2 (cheapest large win, no new kernels) -> 1 (structural) -> 4 -> 3 -> 6 -> 7 -> 5 -> 8.
+
+## Update (after MTP)
+Decode 28 -> 34.7 tok/s via: one routing readback per layer, warp-parallel top-k, fused gate+up expert matvec. Fusing add+rmsnorm gave no measurable change: small-kernel launch count is NOT the bottleneck (kernels ~21 ms of ~29 ms/token; the rest is the per-layer host sync + miss waits). Remaining levers are structural: device-side routing (graph capture), CPU execution of missed experts, learned multi-layer prefetch. 28K tcq3: prefill 54.6 s (513 tok/s), decode 27.2 tok/s.

@@ -194,6 +194,15 @@ extern "C" __global__ void rmsnorm(const float* x, const float* w, float* o, int
   float r = rsqrtf(red[0] / n + eps);
   for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = x[i] * r * w[i];
 }
+extern "C" __global__ void add_rmsnorm(float* x, const float* y, const float* w, float* o, int n, float eps) {
+  __shared__ float red[32];
+  float s = 0.f; for (int i = threadIdx.x; i < n; i += blockDim.x) { float v = x[i] + y[i]; x[i] = v; s += v * v; }
+  s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; v = warp_sum(v); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads();
+  float r = rsqrtf(red[0] / n + eps);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = x[i] * r * w[i];
+}
 extern "C" __global__ void add_inplace(float* x, const float* y, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] += y[i]; }
 extern "C" __global__ void swiglu(const float* g, const float* u, float* o, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) o[i] = silu_f(g[i]) * u[i]; }
 

@@ -74,7 +74,7 @@ impl Gpu {
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "rmsnorm", "add_inplace", "swiglu",
+        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "add_rmsnorm", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
                   "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
@@ -497,7 +497,6 @@ impl Gpu {
                 self.launch("attn_pv_reduce", (nh as u32, 1), hd as u32, 0, &[P(self.pv_part), P(self.t3), P(self.t0), I(nh as i32), I(hd as i32), I(nsp as i32), I(self.kvq)]);
                 if self.kvq == 3 { self.launch("tcq_rot", ((nh * hd / 128) as u32, 1), 128, 0, &[P(self.t0), P(self.t3), I(1)]); }
                 self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
-                self.add(self.x, self.t1, c.n_embd);
             } else {
                 let ch = c.d_inner + 2 * c.n_group * c.d_state;
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.qkv.unwrap(), self.h, 0, self.t0); self.mv(ly.gate.unwrap(), self.h, 0, self.t1);
@@ -508,11 +507,10 @@ impl Gpu {
                     I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps)]);
                 if self.dbg && pos == self.dbg_pos && l == 0 { self.dump("conv", self.y, ch); self.dump("dout", self.t0, 4096); }
                 self.qx(self.t0, c.d_inner, 1); self.mv(ly.ssm_out.unwrap(), self.t0, 1, self.t1);
-                self.add(self.x, self.t1, c.n_embd);
             }
             // MoE
             if self.dbg && pos == self.dbg_pos { self.dump("mix", self.x, c.n_embd); }
-            self.rms(self.x, ly.post_norm, self.h, c.n_embd);
+            self.launch("add_rmsnorm", (1, 1), 256, 0, &[P(self.x), P(self.t1), P(ly.post_norm), P(self.h), I(c.n_embd as i32), F(c.eps)]);
             self.mv(ly.router, self.h, 0, self.logits);
             self.qx(self.h, c.n_embd, 0);
             self.launch("router_topk", (1, 1), 32, 0, &[P(self.logits), I(c.n_expert as i32), I(c.n_used as i32), P(self.idx), P(self.rw)]);
