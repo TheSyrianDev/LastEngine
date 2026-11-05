@@ -484,6 +484,24 @@ extern "C" __global__ void attn_pv_b(const float* scores, const void* vc, const 
   }
   for (int hh = 0; hh < hpk; hh++) { size_t oi = ((size_t)(tb + g) * nh + kvh * hpk + hh) * hd + d; o[oi] = a[hh] * sigm_f(gate[oi]); }
 }
+// Decode PV, split over positions. grid (nkv, nsplit), block hd. part[(split*nh + h)*hd + d] = sum over the split's positions.
+extern "C" __global__ void attn_pv_split(const float* scores, const void* vc, float* part, int nkv, int nh, int hd, int n, int stride, const __half* vsc, int kvq, int chunk) {
+  int kvh = blockIdx.x, sp = blockIdx.y, hpk = nh / nkv, d = threadIdx.x; float a[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+  int t0 = sp * chunk, t1 = min(n, t0 + chunk);
+  const float* sc = scores + (size_t)(kvh * hpk) * stride;
+  for (int t = t0; t < t1; t++) {
+    float v = kv_ld(vc, vsc, kvq, (size_t)t * nkv + kvh, d, hd);
+    #pragma unroll
+    for (int hh = 0; hh < 8; hh++) if (hh < hpk) a[hh] += sc[(size_t)hh * stride + t] * v;
+  }
+  for (int hh = 0; hh < hpk; hh++) part[((size_t)sp * nh + kvh * hpk + hh) * hd + d] = a[hh];
+}
+// grid nh, block hd: o[h][d] = sigmoid(gate) * sum_split part.
+extern "C" __global__ void attn_pv_reduce(const float* part, const float* gate, float* o, int nh, int hd, int nsplit) {
+  int h = blockIdx.x, d = threadIdx.x; float a = 0.f;
+  for (int s = 0; s < nsplit; s++) a += part[((size_t)s * nh + h) * hd + d];
+  o[h * hd + d] = a * sigm_f(gate[h * hd + d]);
+}
 // ---- batched DeltaNet ----
 // conv over T tokens sequentially per channel. qkv [T][ch] -> y [T][ch].
 extern "C" __global__ void delta_conv_b(const float* qkv, const float* w, float* state, float* y, int ch, int K, int T) {

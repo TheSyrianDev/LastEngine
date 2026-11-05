@@ -33,7 +33,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pv_part: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -53,7 +53,7 @@ impl Gpu {
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
         for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "rmsnorm", "add_inplace", "swiglu",
-                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "delta_conv", "delta_step",
+                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "delta_conv", "delta_step",
                   "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
@@ -173,7 +173,7 @@ impl Gpu {
             ptr_g: dalloc(64), ptr_u: dalloc(64), ptr_d: dalloc(64),
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
             conv, sdelta, kc, vc, lay, out_norm, out_w,
-            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
+            arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, pv_part: dalloc((ctx_len / 256 + 2) * nh * hd * 4), pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
             f, st, _ctx: ctx, m,
         }
     }
@@ -385,9 +385,11 @@ impl Gpu {
                 self.launch("attn_prep", ((nh + nkv) as u32, 1), 256, 0, &[P(self.t0), P(self.t1), P(self.t2), P(ly.qn), P(ly.kn), P(self.y), P(self.t3), P(self.kc[l]), P(self.vc[l]),
                     I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos as i32), F(c.eps), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
                 let n = pos + 1;
-                self.launch("attn_scores", (n.div_ceil(8) as u32, nh as u32), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.ksc[l]), I(self.kvq)]);
-                self.launch("attn_softmax", (nh as u32, 1), 256, 0, &[P(self.scores), I(n as i32), I(self.ctx_len as i32)]);
-                self.launch("attn_pv", (nh as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.t3), P(self.t0), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.vsc[l]), I(self.kvq)]);
+                self.launch3("attn_scores_b", (n.div_ceil(8) as u32, nkv as u32, 1), 256, 0, &[P(self.y), P(self.kc[l]), P(self.scores), I(nkv as i32), I(nh as i32), I(hd as i32), I(pos as i32), I(self.ctx_len as i32), I(0), P(self.ksc[l]), I(self.kvq)]);
+                self.launch("attn_softmax_b", (nh as u32, 1), 256, 0, &[P(self.scores), I(nh as i32), I(self.ctx_len as i32), I(pos as i32)]);
+                let nsp = n.div_ceil(256);
+                self.launch3("attn_pv_split", (nkv as u32, nsp as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.pv_part), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.vsc[l]), I(self.kvq), I(256)]);
+                self.launch("attn_pv_reduce", (nh as u32, 1), hd as u32, 0, &[P(self.pv_part), P(self.t3), P(self.t0), I(nh as i32), I(hd as i32), I(nsp as i32)]);
                 self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
                 self.add(self.x, self.t1, c.n_embd);
             } else {
