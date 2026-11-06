@@ -76,3 +76,6 @@ Blocker found in `src/gpu.rs` (`slot_for`/`pick_slot`/`prefetch`): the expert ca
 
 ## Hot-expert pinning (tried, rejected)
 `LE_PIN=f` makes the top fraction f of prefill-hot experts non-evictable. 1200-token prompt, 128 decoded: f=0 -> 35.3 tok/s (10.5K misses), f=0.3 -> 34.9 (10.9K), f=0.6 -> 32.7 (12.1K). Pinning raises misses: routing during decode is not well predicted by prefill heat, and pinned slots shrink the LRU pool. Default stays 0 (off); kept as an experiment knob. Hit rate therefore cannot be bought cheaply, which further weakens the case for the device-side cache rewrite.
+
+## Device-side expert pointer build (built, neutral)
+`build_ptrs` kernel + a mapped host/device slot table (`tab_h`/`tab_d`, mirrored in `pick_slot`/`warm_cache`) now build the expert pointer arrays on the GPU, replacing a `memcpy_htod_sync` per layer. Output unchanged (same hits/misses, sensible text). Throughput with the user's background build running: 28.2/30.5/31.4 tok/s vs baseline 31.0/31.0/31.3 -- no measurable gain. The remaining host sync is the idx readback needed for miss fetches, so graph capture still needs a hit-only path (flag already written at idx+128 for that).

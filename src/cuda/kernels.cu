@@ -227,6 +227,18 @@ extern "C" __global__ void router_topk(const float* logits, int n, int k, int* i
   }
   if (lane == 0) for (int t = 0; t < k; t++) { idx_out[t] = sel[t]; w_out[t] = selw[t] / tot; }
 }
+// Device-side expert pointer build: ptrs[t], ptrs[8+t], ptrs[16+t] from the slot table; flag = 1 if any expert is not resident.
+extern "C" __global__ void build_ptrs(const int* idx, const int* tab, int base, int k, unsigned long long arena, unsigned long long slot_bytes,
+                                      unsigned long long off1, unsigned long long off2, unsigned long long* ptrs, int* flag) {
+  __shared__ int m; int t = threadIdx.x;
+  if (t == 0) m = 0; __syncthreads();
+  if (t < k) {
+    int sl = tab[base + idx[t]]; if (sl < 0) { atomicOr(&m, 1); sl = 0; }
+    unsigned long long b = arena + (unsigned long long)sl * slot_bytes;
+    ptrs[t] = b; ptrs[8 + t] = b + off1; ptrs[16 + t] = b + off2;
+  }
+  __syncthreads(); if (t == 0) *flag = m;
+}
 // moe combine: out[i] += sum_s w[s]*down[s*n+i] + sigmoid(gate)*sh[i]
 extern "C" __global__ void moe_combine(float* out, const float* down, const float* w, int k, const float* sh, const float* shgate, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
