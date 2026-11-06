@@ -31,6 +31,15 @@ fn rms(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
 fn silu(x: f32) -> f32 { x / (1.0 + (-x).exp()) }
 fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 
+/// Clear error for architectures no engine here implements (e.g. `dflash` draft models are speculative drafters, not standalone LMs).
+pub fn check_arch(g: &Gguf) -> Result<(), String> {
+    match g.arch() {
+        Some("qwen35moe" | "clover_moe" | "llama" | "lfm3") => Ok(()),
+        Some(a) => Err(format!("unsupported model architecture '{a}' (supported: qwen35moe, clover_moe, llama, lfm3){}", if a == "dflash" { "; dflash is a draft model for speculative decoding, not a standalone model" } else { "" })),
+        None => Err("GGUF has no general.architecture".into()),
+    }
+}
+
 impl Dense {
     pub fn supports(g: &Gguf) -> Option<Kind> {
         match g.arch()? { "llama" => Some(Kind::Llama), "lfm3" => Some(Kind::Lfm3), _ => None }

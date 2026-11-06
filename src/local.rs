@@ -30,6 +30,7 @@ impl Local {
         let tmpl = tmpl.replace("{%- generation -%}", "").replace("{%- endgeneration -%}", "").replace("{% generation %}", "").replace("{% endgeneration %}", "");
         let name = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let n_params = g.tensors.iter().map(|t| t.dims.iter().product::<u64>()).sum();
+        crate::dense::check_arch(&g)?;
         let gpu = if crate::dense::Dense::supports(&g).is_some() { Eng::Dense(crate::dense::DenseEng::new(crate::dense::Dense::load(path, &g), ctx)) }
                   else { Eng::Gpu(Gpu::new(Arc::new(Model::load(path, &g)), ctx, margin)) };
         let s = |id: Option<u32>| id.map(|i| tok.tokens[i as usize].clone()).unwrap_or_default();

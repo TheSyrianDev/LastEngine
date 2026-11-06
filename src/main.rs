@@ -159,6 +159,7 @@ async fn main() {
         cli::Cmd::TfDump { path, prompt, n } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            if let Err(e) = dense::check_arch(&g) { eprintln!("lastengine: {e}"); std::process::exit(1); }
             let ids = tk.encode(&prompt);
             let dense_kind = dense::Dense::supports(&g).is_some();
             let mut step: Box<dyn FnMut(Option<u32>) -> Vec<f32>> = if dense_kind {
