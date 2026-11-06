@@ -888,6 +888,60 @@ extern "C" __global__ void delta_step_b(const float* y, const float* alpha, cons
   for (int i = 0; i < 128; i++) Sh[i * 128 + j] = s[i];
 }
 
+
+// ---- Clover block-diffusion preview (read-only recurrent state) ----
+extern "C" __global__ void delta_conv_pv(const float* qkv, const float* w, const float* wr, const float* state, float* y, int ch, int K, int T) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x; if (c >= ch) return;
+  for (int t = 0; t < T; t++) {
+    float a = 0.f;
+    for (int k = 0; k < K; k++) { int p = t - (K - 1) + k; float x = p < 0 ? state[(size_t)c * (K - 1) + p + K - 1] : qkv[(size_t)p * ch + c]; a += w[c * K + k] * x; }
+    for (int d = 1; d < K; d++) if (t + d < T) a += qkv[(size_t)(t + d) * ch + c] * wr[c * (K - 1) + d - 1];
+    y[(size_t)t * ch + c] = silu_f(a);
+  }
+}
+extern "C" __global__ void delta_pv(const float* y, const float* alpha, const float* a_log, const float* dtb, const float* z, const float* nw,
+    const float* S, const float* lscale, const float* hbias, const float* hc, float* o, int ng, int nv, int dk, float eps, int T, int ych) {
+  __shared__ float qn[32][128], kn[32][128];
+  __shared__ float lg[32][33], red[4], egs[32];
+  int vh = blockIdx.x, j = threadIdx.x, kh = vh % ng;
+  for (int t = 0; t < T; t++) {
+    const float* yt = y + (size_t)t * ych;
+    float q = yt[kh * dk + j], k = yt[ng * dk + kh * dk + j];
+    float sq = warp_sum(q * q); if ((j & 31) == 0) red[j >> 5] = sq; __syncthreads();
+    float rq = rsqrtf(red[0] + red[1] + red[2] + red[3] + 1e-6f); __syncthreads();
+    float sk = warp_sum(k * k); if ((j & 31) == 0) red[j >> 5] = sk; __syncthreads();
+    float rk = rsqrtf(red[0] + red[1] + red[2] + red[3] + 1e-6f); __syncthreads();
+    qn[t][j] = q * rq; kn[t][j] = k * rk;
+    if (j == 0) { float a = alpha[(size_t)t * nv + vh] + dtb[vh]; float sp = a > 20.f ? a : logf(1.f + __expf(a)); egs[t] = __expf(a_log[vh] * sp); }
+  }
+  __syncthreads();
+  const float* Sh = S + (size_t)vh * dk * dk;
+  float h[32];
+  #pragma unroll
+  for (int t = 0; t < 32; t++) h[t] = 0.f;
+  for (int i = 0; i < dk; i++) { float sv = Sh[i * 128 + j];
+    #pragma unroll
+    for (int t = 0; t < 32; t++) h[t] += qn[t < T ? t : 0][i] * sv; }
+  float sc = rsqrtf((float)dk), ls = lscale[vh];
+  for (int p = j; p < T * T; p += 128) { int t = p / T, u = p % T; float a = 0.f; for (int i = 0; i < dk; i++) a += qn[t][i] * kn[u][i]; lg[t][u] = a * ls; }
+  __syncthreads();
+  if (j < T) {
+    lg[j][T] = hbias[vh] + hc[vh] * logf((float)T / 32.f);
+    float m = -1e30f; for (int u = 0; u <= T; u++) m = fmaxf(m, lg[j][u]);
+    float s = 0.f; for (int u = 0; u <= T; u++) { lg[j][u] = __expf(lg[j][u] - m); s += lg[j][u]; }
+    for (int u = 0; u <= T; u++) lg[j][u] /= s;
+  }
+  __syncthreads();
+  for (int t = 0; t < T; t++) {
+    float oo = lg[t][T] * h[t] * sc * egs[t];
+    for (int u = 0; u < T; u++) oo += lg[t][u] * y[(size_t)u * ych + 2 * ng * dk + vh * dk + j];
+    float s2 = warp_sum(oo * oo); if ((j & 31) == 0) red[j >> 5] = s2; __syncthreads();
+    float rr = rsqrtf((red[0] + red[1] + red[2] + red[3]) / dk + eps);
+    o[((size_t)t * nv + vh) * dk + j] = oo * rr * nw[j] * silu_f(z[((size_t)t * nv + vh) * dk + j]);
+    __syncthreads();
+  }
+}
+
 // =================== tensor-core (int8 mma) grouped GEMM for prefill ===================
 // Tile: 64 weight rows x 64 tokens, 4 units (128 columns) per step, 8 warps (4 along rows x 2 along tokens, each 16 x 32).
 // Weights are unpacked to int8 in shared memory; per-unit int32 products are scaled in f32.
@@ -1022,7 +1076,7 @@ __device__ __forceinline__ void mma16816h(float* c, unsigned a0, unsigned a1, un
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 template <int HD>
-__device__ void flash_impl(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq) {
+__device__ void flash_impl(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq, int nc) {
   constexpr int PQ = HD + 8, VT = 40;
   extern __shared__ __align__(16) __half fsm[];
   __half* qs = fsm; __half* ks = qs + 64 * PQ; __half* vt = ks + 32 * PQ;
@@ -1034,8 +1088,8 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
     float4 v = q0 + r < T ? *(const float4*)(q + (size_t)(q0 + r) * nh * HD + h * HD + c) : make_float4(0.f, 0.f, 0.f, 0.f);
     *(uint2*)(qs + r * PQ + c) = make_uint2(pack2h(v.x * scale, v.y * scale), pack2h(v.z * scale, v.w * scale));
   }
-  const int last = pos0 + min(q0 + 64, T) - 1;
-  const int qp0 = pos0 + q0 + warp * 16 + g, qp1 = qp0 + 8;
+  const int last = nc ? pos0 + T - 1 : pos0 + min(q0 + 64, T) - 1;
+  const int qp0 = nc ? pos0 + T - 1 : pos0 + q0 + warp * 16 + g, qp1 = nc ? qp0 : qp0 + 8;
   float o[HD / 8][4];
   #pragma unroll
   for (int d = 0; d < HD / 8; d++) { o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f; }
@@ -1137,5 +1191,9 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
   }
 }
 extern "C" __global__ void __launch_bounds__(128) attn_flash_256(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq) {
-  flash_impl<256>(q, kc, vc, gate, out, pos0, T, nh, nkv, ksc, vsc, kvq);
+  flash_impl<256>(q, kc, vc, gate, out, pos0, T, nh, nkv, ksc, vsc, kvq, 0);
+}
+// block-diffusion preview: every query sees the whole prefix and the whole block
+extern "C" __global__ void __launch_bounds__(128) attn_flash_256_nc(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq) {
+  flash_impl<256>(q, kc, vc, gate, out, pos0, T, nh, nkv, ksc, vsc, kvq, 1);
 }

@@ -87,7 +87,7 @@ impl Gpu {
                 if self.kvq == 3 { self.tcq_after_prep(l, t, pos0, pf.b2, pf.y); }
                 if hd == 256 && std::env::var("LE_FLASH").map_or(true, |v| v != "0") {
                     let smem = ((64 + 32) * (hd + 8) + hd * 40) * 2;
-                    self.launch("attn_flash_256", (t.div_ceil(64) as u32, nh as u32), 128, smem as u32, &[P(pf.y), P(self.kc[l]), P(self.vc[l]), P(pf.b3), P(pf.o), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq)]);
+                    self.launch(if self.preview { "attn_flash_256_nc" } else { "attn_flash_256" }, (t.div_ceil(64) as u32, nh as u32), 128, smem as u32, &[P(pf.y), P(self.kc[l]), P(self.vc[l]), P(pf.b3), P(pf.o), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), P(self.ksc[l]), P(self.vsc[l]), I(self.kvq)]);
                 } else {
                 let mut tb = 0;
                     while tb < t {
@@ -107,9 +107,15 @@ impl Gpu {
                 self.fmm(ly.beta.unwrap(), pf.h, pf.b2, t); self.fmm(ly.alpha.unwrap(), pf.h, pf.b3, t);
                 let dr = |s: &Gpu, nm: &str, p: Dp, w: usize| if s.dbg && l == 0 && s.dbg_pos >= pos0 && s.dbg_pos < pos0 + t { s.dump(nm, p + ((s.dbg_pos - pos0) * w * 4) as u64, w) };
                 dr(self, "qkv", pf.b0, ch); dr(self, "gate", pf.b1, 4096); dr(self, "beta", pf.b2, 32); dr(self, "alpha", pf.b3, 32);
+                if self.preview {
+                    self.launch("delta_conv_pv", (ch.div_ceil(256) as u32, 1), 256, 0, &[P(pf.b0), P(ly.conv_w), P(ly.wr), P(self.conv[l]), P(pf.y), I(ch as i32), I(c.conv_k as i32), I(t as i32)]);
+                    self.launch("delta_pv", (c.n_vhead as u32, 1), 128, 0, &[P(pf.y), P(pf.b3), P(ly.a_log), P(ly.dt_b), P(pf.b1), P(ly.ssm_norm), P(self.sdelta[l]), P(ly.bd_ls), P(ly.bd_hb), P(ly.bd_hc), P(pf.o),
+                        I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps), I(t as i32), I(ch as i32)]);
+                } else {
                 self.launch("delta_conv_b", (ch.div_ceil(256) as u32, 1), 256, 0, &[P(pf.b0), P(ly.conv_w), P(self.conv[l]), P(pf.y), I(ch as i32), I(c.conv_k as i32), I(t as i32)]);
                 self.launch("delta_step_b", (c.n_vhead as u32, 1), 128, 0, &[P(pf.y), P(pf.b3), P(pf.b2), P(ly.a_log), P(ly.dt_b), P(pf.b1), P(ly.ssm_norm), P(self.sdelta[l]), P(pf.o),
                     I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps), I(t as i32), I(ch as i32)]);
+                }
                 dr(self, "conv", pf.y, ch); dr(self, "dout", pf.o, 4096);
                 self.pqx(pf.o, nu(c.d_inner), 1, 0); self.dense(ly.ssm_out.unwrap(), 1, pf.b1, t);
                 self.launch("add_inplace", ((t * c.n_embd).div_ceil(256) as u32, 1), 256, 0, &[P(pf.x), P(pf.b1), I((t * c.n_embd) as i32)]);
@@ -118,6 +124,24 @@ impl Gpu {
             if self.dbg && self.dbg_pos >= pos0 && self.dbg_pos < pos0 + t { self.dump("mix", pf.x + ((self.dbg_pos - pos0) * c.n_embd * 4) as u64, c.n_embd); }
             self.prms(pf.x, ly.post_norm, pf.h, t);
             self.fmm(ly.router, pf.h, pf.lg, t);
+            if self.preview {
+                // block coreset: every token of the block may only route to the experts the block as a whole prefers
+                let ne = c.n_expert; let mut lg = vec![0f32; t * ne];
+                unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut lg, pf.lg).unwrap(); }
+                let mut totals = vec![0f32; ne];
+                for r in 0..t {
+                    let row = &lg[r * ne..(r + 1) * ne];
+                    let m = row.iter().cloned().fold(f32::MIN, f32::max); let ex: Vec<f32> = row.iter().map(|a| (a - m).exp()).collect(); let sm: f32 = ex.iter().sum();
+                    let mut ord: Vec<usize> = (0..ne).collect(); ord.sort_by(|a, b| ex[*b].partial_cmp(&ex[*a]).unwrap().then(a.cmp(b)));
+                    for &e in ord.iter().take(c.n_used) { totals[e] += ex[e] / sm; }
+                }
+                let sum: f32 = totals.iter().sum::<f32>().max(1e-9);
+                let mut ord: Vec<usize> = (0..ne).collect(); ord.sort_by(|a, b| totals[*b].partial_cmp(&totals[*a]).unwrap().then(a.cmp(b)));
+                let mut allowed = vec![false; ne]; let mut cum = 0f32;
+                for (i, &e) in ord.iter().enumerate() { let p = totals[e] / sum; if i == 0 || cum < 0.9 { allowed[e] = true; } cum += p; }
+                for r in 0..t { for e in 0..ne { if !allowed[e] { lg[r * ne + e] = -1e30; } } }
+                unsafe { result::memcpy_htod_sync(pf.lg, &lg).unwrap(); }
+            }
             self.pqx(pf.h, nu(c.n_embd), 0, 0);
             let k = c.n_used;
             self.launch("router_topk_b", (t as u32, 1), 256, 0, &[P(pf.lg), I(c.n_expert as i32), I(k as i32), P(pf.idx), P(pf.rw)]);
@@ -191,7 +215,7 @@ impl Gpu {
             self.launch3("moe_combine_b", ((c.n_embd.div_ceil(256)) as u32, t as u32, 1), 256, 0, &[P(pf.x), P(pf.ed), P(pf.rw), I(k as i32), P(pf.sd), P(pf.shg), I(c.n_embd as i32)]);
             if self.dbg && self.dbg_pos >= pos0 && self.dbg_pos < pos0 + t { let r = self.dbg_pos - pos0; let mut v = vec![0f32; c.n_embd]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, pf.x + (r * c.n_embd * 4) as u64).unwrap() }; eprintln!("L{l} {:.4} {:.4}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
         }
-        self.pos += t;
+        if !self.preview { self.pos += t; }
         if self.want_rows {
             self.rows_out.clear();
             for r in 0..t {

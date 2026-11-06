@@ -18,7 +18,7 @@ struct Lay {
     attn_norm: Dp, post_norm: Dp, router: W, shg_in: W,
     sh_gate: W, sh_up: W, sh_down: W,
     full: bool, q: Option<W>, k: Option<W>, v: Option<W>, o: Option<W>, qn: Dp, kn: Dp,
-    qkv: Option<W>, gate: Option<W>, beta: Option<W>, alpha: Option<W>, ssm_out: Option<W>, conv_w: Dp, a_log: Dp, dt_b: Dp, ssm_norm: Dp,
+    qkv: Option<W>, gate: Option<W>, beta: Option<W>, alpha: Option<W>, ssm_out: Option<W>, conv_w: Dp, a_log: Dp, dt_b: Dp, ssm_norm: Dp, wr: Dp, bd_ls: Dp, bd_hb: Dp, bd_hc: Dp,
     ety: [u32; 3], ebytes: [usize; 3],
 }
 pub struct Mtp { eh: W, enorm: Dp, hnorm: Dp, shn: Dp }
@@ -35,7 +35,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, tab_h: *mut i32, tab_d: Dp, prot: Vec<bool>, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, tab_h: *mut i32, tab_d: Dp, prot: Vec<bool>, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, pub preview: bool, pub draft_on: bool, pub drafts_iters: u64, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -68,10 +68,10 @@ impl Gpu {
         let mut f = HashMap::new();
         for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_17", "matvec_18", "matvec_19", "matvec_20", "matvec_21", "matvec_22", "matvec_23", "matvec_29", "matvec_134", "matvec_135", "matvec_137", "matvec_138", "matvec_139", "matvec_140", "matvec_141", "matvec_144", "matvec_145", "matvec_146", "matvec_152", "matvec_153", "matvec_154", "matvec_155", "matvec_156", "matvec_157", "matvec_158", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_17", "mmq_18", "mmq_19", "mmq_20", "mmq_21", "mmq_22", "mmq_23", "mmq_29", "mmq_134", "mmq_135", "mmq_137", "mmq_138", "mmq_139", "mmq_140", "mmq_141", "mmq_144", "mmq_145", "mmq_146", "mmq_152", "mmq_153", "mmq_154", "mmq_155", "mmq_156", "mmq_157", "mmq_158", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
-                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_17", "mm_18", "mm_19", "mm_20", "mm_21", "mm_22", "mm_23", "mm_29", "mm_134", "mm_135", "mm_137", "mm_138", "mm_139", "mm_140", "mm_141", "mm_144", "mm_145", "mm_146", "mm_152", "mm_153", "mm_154", "mm_155", "mm_156", "mm_157", "mm_158", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
+                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_17", "mm_18", "mm_19", "mm_20", "mm_21", "mm_22", "mm_23", "mm_29", "mm_134", "mm_135", "mm_137", "mm_138", "mm_139", "mm_140", "mm_141", "mm_144", "mm_145", "mm_146", "mm_152", "mm_153", "mm_154", "mm_155", "mm_156", "mm_157", "mm_158", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "attn_flash_256_nc", "delta_conv_pv", "delta_pv", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
-        { use cudarc::driver::sys::CUfunction_attribute as A; f.get("attn_flash_256").unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 72 * 1024).unwrap(); }
+        { use cudarc::driver::sys::CUfunction_attribute as A; f.get("attn_flash_256").unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 72 * 1024).unwrap(); f.get("attn_flash_256_nc").unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 72 * 1024).unwrap(); }
         let c = &m.cfg;
         let vec1 = |name: &str| -> Dp { let (ty, cols, rows) = m.dims2(name); let mut o = vec![0f32; cols * rows]; crate::quant::dequant_row(ty, m.raw(name), &mut o); dup(&o) };
         let mat = |name: &str| -> W {
@@ -80,6 +80,7 @@ impl Gpu {
             W { cell: dup(&[d]), ty, rows, cols, raw: d }
         };
         let mtp_on = std::env::var("LE_MTP").map_or(false, |v| v != "0") && m.has(&format!("blk.{}.nextn.eh_proj.weight", c.n_layer)) && m.has(&format!("blk.{}.ffn_gate_exps.weight", c.n_layer));
+        let draft_on = std::env::var("LE_CLOVER_DRAFT").map_or(false, |v| v != "0") && m.has("blk.0.ssm_conv1d.weight_right");
         let nall = c.n_layer + mtp_on as usize;
         let mut lay = Vec::new();
         for l in 0..nall {
@@ -90,7 +91,7 @@ impl Gpu {
             let mut ly = Lay {
                 attn_norm: vec1(&p("attn_norm.weight")), post_norm: vec1(&p("post_attention_norm.weight")), router: { let d = vec1(&p("ffn_gate_inp.weight")); W { cell: dup(&[d]), ty: 0, rows: c.n_expert, cols: c.n_embd, raw: d } }, shg_in: sg,
                 sh_gate: mat(&p("ffn_gate_shexp.weight")), sh_up: mat(&p("ffn_up_shexp.weight")), sh_down: mat(&p("ffn_down_shexp.weight")),
-                full, q: None, k: None, v: None, o: None, qn: 0, kn: 0, qkv: None, gate: None, beta: None, alpha: None, ssm_out: None, conv_w: 0, a_log: 0, dt_b: 0, ssm_norm: 0,
+                full, q: None, k: None, v: None, o: None, qn: 0, kn: 0, qkv: None, gate: None, beta: None, alpha: None, ssm_out: None, conv_w: 0, a_log: 0, dt_b: 0, ssm_norm: 0, wr: 0, bd_ls: 0, bd_hb: 0, bd_hc: 0,
                 ety: m.expert_types(l), ebytes: m.expert_bytes(l),
             };
             let _ = z;
@@ -103,6 +104,7 @@ impl Gpu {
                 ly.beta = Some(f32mat(&p("ssm_beta.weight"))); ly.alpha = Some(f32mat(&p("ssm_alpha.weight")));
                 ly.ssm_out = Some(mat(&p("ssm_out.weight")));
                 ly.conv_w = vec1(&p("ssm_conv1d.weight")); ly.a_log = { let mut a = vec![0f32; c.n_vhead]; crate::quant::dequant_row(m.dims2(&p("ssm_a")).0, m.raw(&p("ssm_a")), &mut a); if m.ssm_a_raw { for v in a.iter_mut() { *v = -v.exp(); } } dup(&a) }; ly.dt_b = vec1(&p("ssm_dt.bias")); ly.ssm_norm = vec1(&p("ssm_norm.weight"));
+                if draft_on { ly.wr = vec1(&p("ssm_conv1d.weight_right")); ly.bd_ls = vec1(&p("ssm_bd_logit_scale.weight")); ly.bd_hb = vec1(&p("ssm_bd_history.bias")); ly.bd_hc = vec1(&p("ssm_bd_history.weight")); }
             }
             lay.push(ly);
         }
@@ -181,7 +183,7 @@ impl Gpu {
             eprintln!("pinned expert store {} MiB in {:.1}s", store_off[nall] >> 20, t0.elapsed().as_secs_f64());
         } else { store_p = std::ptr::null_mut(); }
         let mtp = if mtp_on { Some(Mtp { eh: mat(&format!("blk.{}.nextn.eh_proj.weight", c.n_layer)), enorm: vec1(&format!("blk.{}.nextn.enorm.weight", c.n_layer)), hnorm: vec1(&format!("blk.{}.nextn.hnorm.weight", c.n_layer)), shn: vec1(&format!("blk.{}.nextn.shared_head_norm.weight", c.n_layer)) }) } else { None };
-        let snap: Vec<(Dp, Dp)> = if mtp_on { (0..c.n_layer).map(|l| if conv[l] != 0 { (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4)) } else { (0, 0) }).collect() } else { vec![] };
+        let snap: Vec<(Dp, Dp)> = if mtp_on || draft_on { (0..c.n_layer).map(|l| if conv[l] != 0 { (dalloc(conv_ch * (c.conv_k - 1) * 4), dalloc(c.n_vhead * c.d_state * c.d_state * 4)) } else { (0, 0) }).collect() } else { vec![] };
         if mtp_on { let l = c.n_layer; let _ = l; dzero(kc[c.n_layer], if kvq == 0 { ctx_len * nkv * hd * 2 } else if kvq == 1 { ctx_len * nkv * hd } else if kvq == 3 { ctx_len * nkv * (hd / 128) * 52 } else { ctx_len * nkv * hd / 2 }); }
         let ib = dalloc(256);
         let (tab_h, tab_d) = unsafe {
@@ -195,7 +197,7 @@ impl Gpu {
         Gpu {
             tab_h, tab_d,
             prot: vec![false; n_slots],
-            nall, mtp, hprev: dalloc(c.n_embd * 4), mcat: dalloc(2 * c.n_embd * 4), snap, rows_out: vec![], want_rows: false,
+            nall, mtp, hprev: dalloc(c.n_embd * 4), mcat: dalloc(2 * c.n_embd * 4), snap, rows_out: vec![], want_rows: false, preview: false, draft_on, drafts_iters: 0,
             store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), mmq: std::env::var("LE_MMQ").map_or(true, |v| v != "0"), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
             cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: ib + 64, prw: a(16), pf_extra, pf_issued: 0,
             x: a(c.n_embd), h: a(c.n_embd), t0: a(big), t1: a(big), t2: a(big), t3: a(big), y: a(big), logits: a(m.vocab.max(c.n_expert)), scores: a(nh * ctx_len),
@@ -452,6 +454,45 @@ impl Gpu {
         unsafe { result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
         out.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32
     }
+    // ---- Clover block-diffusion self-speculation ----
+    pub const BLOCK: usize = 32;
+    /// Draft the 31 tokens after `cur` by iteratively denoising a block of mask tokens (read-only against the committed state).
+    pub fn clover_draft(&mut self, cur: u32, thr: f32) -> Vec<u32> {
+        const MASK: u32 = 151669;
+        let n = Self::BLOCK.min(self.ctx_len - self.pos);
+        let mut blk = vec![MASK; n]; blk[0] = cur;
+        let mut pending: Vec<usize> = (1..n).collect();
+        let mut iters = 0;
+        while !pending.is_empty() && iters < n {
+            iters += 1;
+            self.bind(); self.preview = true; self.want_rows = true;
+            self.prefill_chunk(&blk, false);
+            self.preview = false; self.want_rows = false;
+            let rows = std::mem::take(&mut self.rows_out);
+            let mut cand: Vec<(usize, u32, f32)> = vec![];
+            for &i in &pending {
+                let r = &rows[i];
+                let (mut bi, mut bv) = (0usize, f32::MIN);
+                for (j, v) in r.iter().enumerate() { if j as u32 != MASK && *v > bv { bv = *v; bi = j; } }
+                let z: f32 = r.iter().enumerate().filter(|(j, _)| *j as u32 != MASK).map(|(_, v)| (v - bv).exp()).sum();
+                cand.push((i, bi as u32, 1.0 / z));
+            }
+            let mut take: Vec<(usize, u32)> = cand.iter().filter(|c| c.2 > thr).map(|c| (c.0, c.1)).collect();
+            if take.is_empty() { let b = cand.iter().max_by(|a, b| a.2.partial_cmp(&b.2).unwrap()).unwrap(); take.push((b.0, b.1)); }
+            for (i, t) in take { blk[i] = t; pending.retain(|p| *p != i); }
+        }
+        self.drafts_iters += iters as u64;
+        blk[1..].to_vec()
+    }
+    pub fn snapshot_state(&self, restore: bool) { self.snapshot(restore) }
+    /// Feed `toks` causally and return the logits after each one.
+    pub fn feed_rows(&mut self, toks: &[u32]) -> Vec<Vec<f32>> {
+        self.bind(); self.want_rows = true;
+        self.prefill_chunk(toks, false);
+        self.want_rows = false;
+        std::mem::take(&mut self.rows_out)
+    }
+    pub fn feed(&mut self, toks: &[u32]) { self.bind(); self.prefill_chunk(toks, false); }
     fn snapshot(&self, restore: bool) {
         let c = &self.m.cfg;
         let (cb, sb) = (c.d_inner + 2 * c.n_group * c.d_state, c.n_vhead * c.d_state * c.d_state * 4);

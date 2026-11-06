@@ -165,7 +165,22 @@ async fn main() {
             ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
             let nn: usize = std::env::var("LE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(32); let mut cur = ix[0] as u32; let t1 = std::time::Instant::now(); let mut out = vec![];
-            if gp.mtp_enabled() {
+            if gp.draft_on {
+                let (mut blocks, mut acc) = (0, 0);
+                let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+                while out.len() < nn {
+                    let d = gp.clover_draft(cur, 0.95);
+                    gp.snapshot_state(false); let p0 = gp.pos;
+                    let mut toks = vec![cur]; toks.extend_from_slice(&d);
+                    let rows = gp.feed_rows(&toks);
+                    let mut m = 0; let mut next = am(&rows[0]);
+                    while m < d.len() && next == d[m] { m += 1; next = am(&rows[m]); }
+                    out.extend_from_slice(&toks[..=m]);
+                    if m + 1 < toks.len() { gp.snapshot_state(true); gp.pos = p0; gp.feed(&toks[..=m]); }
+                    blocks += 1; acc += m; cur = next;
+                }
+                println!("draft-self: {blocks} blocks, {} denoise passes, {acc} drafted tokens accepted ({:.1}/block)", gp.drafts_iters, acc as f32 / blocks as f32);
+            } else if gp.mtp_enabled() {
                 let (mut steps, mut acc) = (0, 0);
                 while out.len() < nn { let (t, n) = gp.spec_step(cur); steps += 1; acc += t.len() - 1; out.extend(t); cur = n; }
                 println!("mtp: {steps} steps, {acc} drafts accepted ({:.0}%)", 100.0 * acc as f32 / steps as f32);
