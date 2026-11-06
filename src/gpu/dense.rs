@@ -21,10 +21,11 @@ const CH: usize = 512;
 
 impl DenseGpu {
     pub fn new(m: Dense, ctx_len: usize) -> DenseGpu {
-        let ctx = CudaContext::new(0).expect("cuda");
+        let ctx = CudaContext::new(0).unwrap_or_else(|e| { eprintln!("lastengine: no usable CUDA device: {e:?}"); std::process::exit(1) });
+        let arch = cuda_arch(&ctx).unwrap_or_else(|e| { eprintln!("lastengine: {e}"); std::process::exit(1) });
         let st = ctx.default_stream();
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
-        let opts = CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() };
+        let opts = CompileOptions { arch: Some(arch), include_paths: inc.into_iter().collect(), ..Default::default() };
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();

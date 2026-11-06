@@ -44,7 +44,8 @@ unsafe impl Send for Gpu {}
 impl Gpu {
     pub fn bind(&self) { self._ctx.bind_to_thread().expect("bind"); }
     pub fn new(m: Arc<Model>, ctx_len: usize, vram_margin_mib: usize) -> Gpu {
-        let ctx = CudaContext::new(0).expect("cuda");
+        let ctx = CudaContext::new(0).unwrap_or_else(|e| { eprintln!("lastengine: no usable CUDA device: {e:?}"); std::process::exit(1) });
+        let arch = cuda_arch(&ctx).unwrap_or_else(|e| { eprintln!("lastengine: {e}"); std::process::exit(1) });
         let st = ctx.default_stream();
         // Auto-tune the knobs the user left unset, from the free VRAM and the requested context.
         {
@@ -63,7 +64,7 @@ impl Gpu {
         }
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
         let src = kernel_source();
-        let opts = CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() };
+        let opts = CompileOptions { arch: Some(arch), include_paths: inc.into_iter().collect(), ..Default::default() };
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
@@ -599,6 +600,34 @@ impl Gpu {
     }
 }
 
+/// Minimum CUDA compute capability: the prefill kernels use int8 and f16 tensor-core `mma.sync` (Ampere, sm_80).
+pub const MIN_CC: (i32, i32) = (8, 0);
+/// NVRTC target for the device behind `ctx`, or a plain-language error when the GPU is below the minimum.
+pub fn cuda_arch(ctx: &CudaContext) -> Result<&'static str, String> {
+    let (maj, min) = ctx.compute_capability().map_err(|e| format!("cannot query the GPU compute capability: {e:?}"))?;
+    arch_for(&ctx.name().unwrap_or_else(|_| "this GPU".into()), maj, min)
+}
+fn arch_for(name: &str, maj: i32, min: i32) -> Result<&'static str, String> {
+    if (maj, min) < MIN_CC {
+        return Err(format!("{name} has compute capability {maj}.{min}, but LastEngine needs {}.{} or newer (NVIDIA Ampere or later). Use a newer GPU, or run the model with llama.cpp.", MIN_CC.0, MIN_CC.1));
+    }
+    Ok(Box::leak(format!("sm_{maj}{min}").into_boxed_str()))
+}
+#[cfg(test)]
+mod arch_tests {
+    #[test]
+    fn arch_selection() {
+        assert_eq!(super::arch_for("x", 8, 6).unwrap(), "sm_86");
+        assert_eq!(super::arch_for("x", 12, 0).unwrap(), "sm_120");
+        let e = super::arch_for("GTX 1060", 6, 1).unwrap_err();
+        assert!(e.contains("GTX 1060") && e.contains("6.1") && e.contains("8.0"));
+    }
+}
+/// True when device 0 exists and meets `MIN_CC` (used to pick GPU or CPU without panicking).
+pub fn cuda_usable() -> bool {
+    std::panic::catch_unwind(|| CudaContext::new(0).ok().map_or(false, |c| cuda_arch(&c).is_ok())).unwrap_or(false)
+}
+
 /// Diagnostic: H2D bandwidth from pageable, pinned, and registered-mmap sources.
 pub fn h2d_bench(path: &str) {
     use cudarc::driver::sys;
@@ -669,7 +698,7 @@ mod quant_tests {
         let Ok(dir) = std::env::var("ORACLE_DIR") else { return };
         let ctx = CudaContext::new(0).expect("cuda"); let st = ctx.default_stream();
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
-        let ptx = compile_ptx_with_opts(kernel_source(), CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() }).expect("nvrtc");
+        let ptx = compile_ptx_with_opts(kernel_source(), CompileOptions { arch: Some(cuda_arch(&ctx).unwrap()), include_paths: inc.into_iter().collect(), ..Default::default() }).expect("nvrtc");
         let module = ctx.load_module(ptx).expect("module");
         let cols = 1024usize; let rows = 8usize;
         let x: Vec<f32> = (0..cols).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.8).collect();

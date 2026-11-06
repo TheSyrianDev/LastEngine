@@ -18,9 +18,9 @@ pub fn probe_json() -> Value {
     let mut backends = vec![];
     let g = match &gpu {
         Some(v) if v.len() == 5 => {
-            backends.push("cuda");
             let cc = v[3].clone();
             let ok = cc.split('.').next().and_then(|m| m.parse::<u32>().ok()).map_or(false, |m| m >= 8);
+            if ok { backends.push("cuda"); }
             json!({"name": v[0], "vram_total_mib": v[1].parse::<u64>().ok(), "vram_free_mib": v[2].parse::<u64>().ok(), "compute_capability": cc, "cuda_driver_version": v[4], "supported": ok})
         }
         _ => Value::Null,

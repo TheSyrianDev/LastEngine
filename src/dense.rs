@@ -201,7 +201,7 @@ impl Dense {
 pub enum DenseEng { Cpu { m: Dense, st: State, pos: usize, snap: Option<State>, ctx: usize }, Cuda(Box<crate::gpu::dense::DenseGpu>) }
 impl DenseEng {
     pub fn new(m: Dense, ctx: usize) -> DenseEng {
-        if std::env::var("LE_CPU").is_err() && std::panic::catch_unwind(|| cudarc::driver::CudaContext::new(0).is_ok()).unwrap_or(false) {
+        if std::env::var("LE_CPU").is_err() && crate::gpu::cuda_usable() {
             return DenseEng::Cuda(Box::new(crate::gpu::dense::DenseGpu::new(m, ctx)));
         }
         let st = m.new_state(); DenseEng::Cpu { m, st, pos: 0, snap: None, ctx }
