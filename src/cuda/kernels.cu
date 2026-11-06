@@ -182,6 +182,56 @@ template <> struct Q<18> { static const int UB = 8, BYTES = 98; };
 template <> struct Q<16> { static const int UB = 8, BYTES = 66; };
 template <> struct Q<22> { static const int UB = 8, BYTES = 82; };
 
+// ---- IQ formats translated from ik_llama.cpp / ggml (MIT; see NOTICE): unpack one 32-value unit ----
+__device__ const signed char KVN[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+__device__ __forceinline__ int kv4(u32 nib4) { // four nibbles (one per byte) -> four iq4_nl values packed as int8x4
+  return (int)((u32)(u8)KVN[nib4 & 15] | ((u32)(u8)KVN[(nib4 >> 8) & 15] << 8) | ((u32)(u8)KVN[(nib4 >> 16) & 15] << 16) | ((u32)(u8)KVN[(nib4 >> 24) & 15] << 24));
+}
+__device__ __forceinline__ void nl_unit(const u8* q, int* w) {
+  for (int i = 0; i < 4; i++) { u32 v = (u32)ld32(q + 4 * i); w[i] = kv4(v & 0x0F0F0F0F); w[4 + i] = kv4((v >> 4) & 0x0F0F0F0F); }
+}
+template <> __device__ void uload<20>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) { nl_unit(b + 2, w); s0 = s1 = h2f(b); mn = 0.f; }
+template <> __device__ void uload<23>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  int sh = (int)*(const u16*)(b + 2); int ls = ((b[4 + (j >> 1)] >> (4 * (j & 1))) & 15) | (((sh >> (2 * j)) & 3) << 4);
+  nl_unit(b + 8 + 16 * j, w); s0 = s1 = h2f(b) * (float)(ls - 32); mn = 0.f;
+}
+template <> __device__ void uload<17>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  for (int l = 0; l < 4; l++) {
+    u32 q = *(const u16*)(b + 2 + 2 * (4 * j + l)); u32 si = q >> 9; u32 sg = si | ((__popc(si) & 1) << 7);
+    for (int h = 0; h < 2; h++) { u32 m = sgmask4((sg >> (4 * h)) & 15); w[2 * l + h] = (int)__vsub4(IQ2XS_G[(q & 511) * 2 + h] ^ m, m); }
+  }
+  u32 sc = b[66 + j]; float d = h2f(b) * 0.25f; s0 = d * (0.5f + (float)(sc & 15)); s1 = d * (0.5f + (float)(sc >> 4)); mn = 0.f;
+}
+template <> __device__ void uload<21>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  int p = j >> 1, half = j & 1; const u8* qs = b + 2 + p * 16 + half * 8; u32 qh = b[66 + p * 2 + half]; const u8* sg = b + 74 + p * 8 + half * 4; u32 sc = b[106 + p];
+  for (int l = 0; l < 4; l++) {
+    u32 g1 = qs[2 * l] | ((qh << (8 - 2 * l)) & 256), g2 = qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256); u32 sb = sg[l];
+    w[2 * l] = (int)__vsub4(IQ3S_G[g1] ^ sgmask4(sb & 15), sgmask4(sb & 15));
+    w[2 * l + 1] = (int)__vsub4(IQ3S_G[g2] ^ sgmask4(sb >> 4), sgmask4(sb >> 4));
+  }
+  s0 = s1 = h2f(b) * (float)(1 + 2 * (half ? (sc >> 4) : (sc & 15))); mn = 0.f;
+}
+template <> __device__ void uload<19>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  u32 qh = *(const u16*)(b + 34 + 2 * j);
+  for (int l = 0; l < 4; l++) { u32 gi = b[2 + 4 * j + l] | (((qh >> (3 * l)) & 7) << 8); w[2 * l] = (int)IQ1S_G[gi * 2]; w[2 * l + 1] = (int)IQ1S_G[gi * 2 + 1]; }
+  float dl = h2f(b) * (float)(2 * ((qh >> 12) & 7) + 1); s0 = s1 = dl; mn = -dl * ((qh & 0x8000) ? -0.125f : 0.125f);
+}
+template <int TY> __device__ float udot_gen(const u8* b, int j, const int* xq, float dx, int sx) {
+  int w[8]; float s0, s1, mn; uload<TY>(b, j, w, s0, s1, mn); int a0 = 0, a1 = 0;
+  for (int i = 0; i < 4; i++) { a0 = DP(w[i], xq[i], a0); a1 = DP(w[4 + i], xq[4 + i], a1); }
+  return dx * (s0 * (float)a0 + s1 * (float)a1 - mn * (float)sx);
+}
+template <> __device__ float udot<17>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<17>(b, j, xq, dx, sx); }
+template <> __device__ float udot<19>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<19>(b, j, xq, dx, sx); }
+template <> __device__ float udot<20>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<20>(b, j, xq, dx, sx); }
+template <> __device__ float udot<21>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<21>(b, j, xq, dx, sx); }
+template <> __device__ float udot<23>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<23>(b, j, xq, dx, sx); }
+template <> struct Q<17> { static const int UB = 8, BYTES = 74; };
+template <> struct Q<19> { static const int UB = 8, BYTES = 50; };
+template <> struct Q<20> { static const int UB = 1, BYTES = 18; };
+template <> struct Q<21> { static const int UB = 8, BYTES = 110; };
+template <> struct Q<23> { static const int UB = 8, BYTES = 136; };
+
 // out[slot*rows + r] = W[slot][r,:] . x[slot]. Quantised activations: xq bytes, xd scales, xs sums, slot stride xstride elements.
 // 256 threads = 8 warps; a warp covers 32/lpr rows, lpr = min(32, cols/32) lanes per row.
 template <int TY>
@@ -205,7 +255,7 @@ __device__ void mv_impl(const u8* const* ptrs, const signed char* xq, const floa
   if (ok && li == 0) out[(size_t)slot * rows + r] = acc;
 }
 #define MV(TY) extern "C" __global__ void matvec_##TY(const u8* const* p, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols, int xstride) { mv_impl<TY>(p, xq, xd, xs, o, rows, cols, xstride); }
-MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(16) MV(18) MV(22)
+MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(16) MV(17) MV(18) MV(19) MV(20) MV(21) MV(22) MV(23)
 
 // F32 matvec (router, tiny projections): same shape
 extern "C" __global__ void matvecf(const u8* const* p, const float* x, float* o, int rows, int cols, int xstride) {
@@ -526,7 +576,7 @@ __device__ void mm_impl(const u8* const* ptrs, const int* off, const int* in_idx
   if (ok && li == 0) for (int j = 0; j < nt; j++) { int orow = out_idx ? out_idx[base + j] : base + j; out[(size_t)orow * rows + r] = acc[j]; }
 }
 #define MM(TY) extern "C" __global__ void mm_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mm_impl<TY>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
-MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(16) MM(18) MM(22)
+MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(16) MM(17) MM(18) MM(19) MM(20) MM(21) MM(22) MM(23)
 
 // F32 matmul O[t][r] = W[r].X[t] for T tokens. grid (ceil(rows/8), ceil(T/32)), 256 threads.
 extern "C" __global__ void mmf(const float* W, const float* X, float* O, int rows, int cols, int T) {
@@ -797,7 +847,7 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
     }
 }
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
-MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(16, false) MMQ(18, false) MMQ(22, true)
+MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(16, false) MMQ(17, true) MMQ(18, false) MMQ(19, false) MMQ(20, false) MMQ(21, false) MMQ(22, true) MMQ(23, false)
 
 // F32 tiled matmul O[t][r] = W[r].X[t]; block 16x16, each thread 4x4 outputs; tile 64 rows x 64 tokens, K step 16. grid (ceil(rows/64), ceil(T/64)).
 extern "C" __global__ void mmf2(const float* W, const float* X, float* O, int rows, int cols, int T) {

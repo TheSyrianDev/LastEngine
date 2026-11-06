@@ -1,5 +1,6 @@
 //! CUDA backend for qwen35moe: non-expert weights resident in VRAM, routed experts through a VRAM slot cache fed from host memory.
 use crate::cpu_ref::Model;
+use crate::quant_ik_tables::{IQ1S_GRID, IQ2XS_GRID, IQ3S_GRID};
 use cudarc::driver::{result, sys, sys::CUdeviceptr, CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::{collections::HashMap, sync::Arc};
@@ -60,28 +61,14 @@ impl Gpu {
             eprintln!("gpu: auto-tune free {} MiB ctx {} -> kv {} chunk {}", free0 >> 20, ctx_len, std::env::var("LE_KV").unwrap(), std::env::var("LE_TMAX").unwrap());
         }
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
-        let mut src = String::from("#include <cuda_fp16.h>\n__device__ const unsigned int IQ3_G32[256] = {");
-        for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
-        src.push_str("};\n");
-        for (nm, g2) in [("IQ2XXS_G", crate::quant::iq2xxs_grid().iter().map(|g| *g).collect::<Vec<_>>()), ("IQ2S_G", crate::quant::iq2s_grid().iter().map(|g| *g).collect::<Vec<_>>())] {
-            src.push_str(&format!("__device__ const unsigned int {nm}[{}] = {{", g2.len() * 2));
-            for g in g2 { src.push_str(&format!("{}u,{}u,", u32::from_le_bytes(g[0..4].try_into().unwrap()), u32::from_le_bytes(g[4..8].try_into().unwrap()))); }
-            src.push_str("};\n");
-        }
-        for (nm, bytes, n) in [("TCQ_CB_K", &include_bytes!("../assets/tcq3_cb_k.bin")[..], 512), ("TCQ_CB_V", &include_bytes!("../assets/tcq3_cb_v.bin")[..], 512),
-                               ("TCQ_S1", &include_bytes!("../assets/tcq3_signs1.bin")[..], 128), ("TCQ_S2", &include_bytes!("../assets/tcq3_signs2.bin")[..], 128)] {
-            src.push_str(&format!("__device__ const float {nm}[{n}] = {{"));
-            for ch in bytes.chunks(4) { src.push_str(&format!("{:e}f,", f32::from_le_bytes(ch.try_into().unwrap()))); }
-            src.push_str("};\n");
-        }
-        src.push_str(include_str!("cuda/kernels.cu"));
+        let src = kernel_source();
         let opts = CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() };
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_18", "matvec_22", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_18", "mmq_22", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
+        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_17", "matvec_18", "matvec_19", "matvec_20", "matvec_21", "matvec_22", "matvec_23", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_17", "mmq_18", "mmq_19", "mmq_20", "mmq_21", "mmq_22", "mmq_23", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
-                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_18", "mm_22", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
+                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_17", "mm_18", "mm_19", "mm_20", "mm_21", "mm_22", "mm_23", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         { use cudarc::driver::sys::CUfunction_attribute as A; f.get("attn_flash_256").unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 72 * 1024).unwrap(); }
@@ -239,7 +226,7 @@ impl Gpu {
             self.launch("matvecf", (rows.div_ceil(4) as u32, slots as u32), 128, (cols * 4) as u32, &[P(ptrs), P(x), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
             return;
         }
-        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 16 => "matvec_16", 18 => "matvec_18", 22 => "matvec_22", t => panic!("no kernel for type {t}") };
+        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 16 => "matvec_16", 17 => "matvec_17", 19 => "matvec_19", 20 => "matvec_20", 21 => "matvec_21", 23 => "matvec_23", 18 => "matvec_18", 22 => "matvec_22", t => panic!("no kernel for type {t}") };
         let units = cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
         self.launch(name, (rows.div_ceil(rpb) as u32, slots as u32), 256, (units * 36 + units * 8) as u32,
             &[P(ptrs), P(self.xqb[set]), P(self.xdb[set]), P(self.xsb[set]), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
@@ -594,4 +581,79 @@ pub fn h2d_bench(path: &str) {
     let r = unsafe { sys::cuMemHostRegister_v2(mm.as_ptr().add(off) as *mut _, n, 1 | 8).result() };
     println!("register mmap (portable|readonly): {:?}", r.is_ok());
     if r.is_ok() { t("registered mmap", unsafe { mm.as_ptr().add(off) }); }
+}
+
+/// NVRTC source: lookup tables followed by src/cuda/kernels.cu.
+pub fn kernel_source() -> String {
+        let mut src = String::from("#include <cuda_fp16.h>\n__device__ const unsigned int IQ3_G32[256] = {");
+        for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
+        src.push_str("};\n");
+        for (nm, g2) in [("IQ2XXS_G", crate::quant::iq2xxs_grid().iter().map(|g| *g).collect::<Vec<_>>()), ("IQ2S_G", crate::quant::iq2s_grid().iter().map(|g| *g).collect::<Vec<_>>())] {
+            src.push_str(&format!("__device__ const unsigned int {nm}[{}] = {{", g2.len() * 2));
+            for g in g2 { src.push_str(&format!("{}u,{}u,", u32::from_le_bytes(g[0..4].try_into().unwrap()), u32::from_le_bytes(g[4..8].try_into().unwrap()))); }
+            src.push_str("};\n");
+        }
+        src.push_str("__device__ const unsigned int IQ2XS_G[1024] = {");
+        for g in IQ2XS_GRID.iter() { src.push_str(&format!("{}u,{}u,", u32::from_le_bytes(g[0..4].try_into().unwrap()), u32::from_le_bytes(g[4..8].try_into().unwrap()))); }
+        src.push_str("};\n__device__ const unsigned int IQ3S_G[512] = {");
+        for g in IQ3S_GRID.iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
+        src.push_str("};\n__device__ const unsigned int IQ1S_G[4096] = {");
+        for g in IQ1S_GRID.iter() { let u: Vec<u8> = g.iter().map(|&x| x as u8).collect(); src.push_str(&format!("{}u,{}u,", u32::from_le_bytes(u[0..4].try_into().unwrap()), u32::from_le_bytes(u[4..8].try_into().unwrap()))); }
+        src.push_str("};\n");
+        for (nm, bytes, n) in [("TCQ_CB_K", &include_bytes!("../assets/tcq3_cb_k.bin")[..], 512), ("TCQ_CB_V", &include_bytes!("../assets/tcq3_cb_v.bin")[..], 512),
+                               ("TCQ_S1", &include_bytes!("../assets/tcq3_signs1.bin")[..], 128), ("TCQ_S2", &include_bytes!("../assets/tcq3_signs2.bin")[..], 128)] {
+            src.push_str(&format!("__device__ const float {nm}[{n}] = {{"));
+            for ch in bytes.chunks(4) { src.push_str(&format!("{:e}f,", f32::from_le_bytes(ch.try_into().unwrap()))); }
+            src.push_str("};\n");
+        }
+        src.push_str(include_str!("cuda/kernels.cu"));
+    src
+}
+
+#[cfg(test)]
+mod quant_tests {
+    use super::*;
+    /// For every type listed in GPU_TYPES, runs the CUDA matvec on the oracle rows (ORACLE_DIR/or_<id>.q, 8 rows x 1024) and compares with the CPU dequant dot product.
+    #[test]
+    fn gpu_matvec_matches_cpu_dequant() {
+        let Ok(dir) = std::env::var("ORACLE_DIR") else { return };
+        let ctx = CudaContext::new(0).expect("cuda"); let st = ctx.default_stream();
+        let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
+        let ptx = compile_ptx_with_opts(kernel_source(), CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() }).expect("nvrtc");
+        let module = ctx.load_module(ptx).expect("module");
+        let cols = 1024usize; let rows = 8usize;
+        let x: Vec<f32> = (0..cols).map(|i| ((i * 7919 % 1000) as f32 / 500.0 - 1.0) * 0.8).collect();
+        let xd = st.memcpy_stod(&x).unwrap();
+        let units = cols / 32;
+        let (xq, xdv, xs) = (st.alloc_zeros::<i8>(cols).unwrap(), st.alloc_zeros::<f32>(units).unwrap(), st.alloc_zeros::<i32>(units).unwrap());
+        let fq = module.load_function("quant_x").unwrap(); let mut b = st.launch_builder(&fq);
+        let nu = units as i32;
+        unsafe { b.arg(&xd).arg(&xq).arg(&xdv).arg(&xs).arg(&nu).launch(LaunchConfig { grid_dim: (units.div_ceil(8) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap(); }
+        let mut bad = vec![];
+        for ty in [11u32, 16, 17, 18, 19, 20, 21, 22, 23] {
+            let Ok(q) = std::fs::read(format!("{dir}/or_{ty}.q")) else { continue };
+            if ty == 11 { continue; }
+            let rb = crate::quant::row_bytes(ty, cols);
+            let w = st.memcpy_stod(&q).unwrap();
+            let (wp, _g) = { use cudarc::driver::DevicePtr; let (p, g) = w.device_ptr(&st); (p, g) };
+            let ptrs = st.memcpy_stod(&[wp]).unwrap();
+            let out = st.alloc_zeros::<f32>(rows).unwrap();
+            let lpr = units.min(32); let rpb = 8 * (32 / lpr);
+            let name = format!("matvec_{ty}");
+            let fm = module.load_function(&name).unwrap(); let mut b = st.launch_builder(&fm);
+            let (r_, c_, xs_) = (rows as i32, cols as i32, 0i32);
+            unsafe { b.arg(&ptrs).arg(&xq).arg(&xdv).arg(&xs).arg(&out).arg(&r_).arg(&c_).arg(&xs_).launch(LaunchConfig { grid_dim: (rows.div_ceil(rpb) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: (units * 36 + units * 8) as u32 }).unwrap(); }
+            let got = st.memcpy_dtov(&out).unwrap();
+            let mut worst = 0f32;
+            for r in 0..rows {
+                let mut wv = vec![0f32; cols]; crate::quant::dequant_row(ty, &q[r * rb..(r + 1) * rb], &mut wv);
+                let want: f32 = wv.iter().zip(&x).map(|(a, b)| a * b).sum();
+                let scale: f32 = wv.iter().zip(&x).map(|(a, b)| (a * b).abs()).sum();
+                worst = worst.max((got[r] - want).abs() / (scale * 0.05 + 1e-4));
+            }
+            if worst > 1.0 { bad.push(format!("{ty}: err {worst}")); }
+            eprintln!("type {ty}: worst err {worst:.3} of tolerance");
+        }
+        assert!(bad.is_empty(), "GPU mismatch: {bad:?}");
+    }
 }

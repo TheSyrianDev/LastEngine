@@ -8,3 +8,7 @@ Walsh-Hadamard sign arrays (assets/tcq3_signs*.bin) are adapted from spiritbuun'
 The ggml authors; TCQ work by spiritbuun). The CUDA kernels in src/cuda/kernels.cu (tcq_encode, tcq_rot, tcq_dec) are a Rust/NVRTC re-adaptation.
 
 assets/webui/ — web UI taken from the llama.cpp project (https://github.com/ggml-org/llama.cpp), MIT License, Copyright (c) 2023-2026 The ggml authors. Rebranded: product name strings replaced, logo/icon replaced, PWA assets removed.
+
+IQ quantization formats (src/quant_ik.rs, src/quant_ik_tables.rs, GPU kernels for them in src/cuda/kernels.cu): dequantization routines and lattice tables are
+translated to Rust/CUDA from ik_llama.cpp (https://github.com/ikawrakow/ik_llama.cpp) and ggml, MIT License, Copyright (c) 2023-2024 The ggml authors and Iwan Kawrakow.
+Verified bit-for-bit against ik_llama's libggml with tools/oracle.
