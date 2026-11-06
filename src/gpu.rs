@@ -102,7 +102,7 @@ impl Gpu {
                 let f32mat = |name: &str| -> W { let (ty, cols, rows) = m.dims2(name); let mut o = vec![0f32; cols * rows]; crate::quant::dequant_row(ty, m.raw(name), &mut o); let d = dup(&o); W { cell: dup(&[d]), ty: 0, rows, cols, raw: d } };
                 ly.beta = Some(f32mat(&p("ssm_beta.weight"))); ly.alpha = Some(f32mat(&p("ssm_alpha.weight")));
                 ly.ssm_out = Some(mat(&p("ssm_out.weight")));
-                ly.conv_w = vec1(&p("ssm_conv1d.weight")); ly.a_log = vec1(&p("ssm_a")); ly.dt_b = vec1(&p("ssm_dt.bias")); ly.ssm_norm = vec1(&p("ssm_norm.weight"));
+                ly.conv_w = vec1(&p("ssm_conv1d.weight")); ly.a_log = { let mut a = vec![0f32; c.n_vhead]; crate::quant::dequant_row(m.dims2(&p("ssm_a")).0, m.raw(&p("ssm_a")), &mut a); if m.ssm_a_raw { for v in a.iter_mut() { *v = -v.exp(); } } dup(&a) }; ly.dt_b = vec1(&p("ssm_dt.bias")); ly.ssm_norm = vec1(&p("ssm_norm.weight"));
             }
             lay.push(ly);
         }

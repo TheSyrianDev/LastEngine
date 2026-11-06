@@ -18,6 +18,8 @@ struct T { ty: u32, off: usize, dims: Vec<usize> }
 pub struct Model {
     pub cfg: Cfg, mmap: Mmap, t: HashMap<String, T>, pub vocab: usize,
     pub kv_repeat_interleave: bool,
+    /// clover_moe GGUFs store the raw A_log in `ssm_a`; the decay rate is `-exp(A_log)`.
+    pub ssm_a_raw: bool,
 }
 
 pub struct State {
@@ -52,7 +54,7 @@ impl Model {
         let t = g.tensors.iter().map(|t| (t.name.clone(), T { ty: t.ggml_type, off: (g.data_start + t.offset) as usize,
             dims: t.dims.iter().map(|d| *d as usize).collect() })).collect();
         let vocab = g.tensors.iter().find(|t| t.name == "token_embd.weight").unwrap().dims[1] as usize;
-        Model { cfg, mmap, t, vocab, kv_repeat_interleave: std::env::var("KV_INTERLEAVE").is_ok() }
+        Model { cfg, mmap, t, vocab, ssm_a_raw: arch == "clover_moe", kv_repeat_interleave: std::env::var("KV_INTERLEAVE").is_ok() }
     }
 
     pub fn embed(&self, token: u32) -> Vec<f32> {
@@ -99,6 +101,7 @@ impl Model {
         let (t, b) = self.bytes(name);
         let mut o = vec![0.0; t.dims.iter().product()];
         quant::dequant_row(t.ty, b, &mut o);
+        if self.ssm_a_raw && name.ends_with(".ssm_a") { for v in o.iter_mut() { *v = -v.exp(); } }
         o
     }
     /// y[r] = W[r,:]·x for rows [r0, r0+rows) of a 2D tensor (row length = dims[0]); `expert` selects a slab of a 3D tensor.
