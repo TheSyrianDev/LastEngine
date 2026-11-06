@@ -16,6 +16,11 @@ use tokio::sync::mpsc;
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
 pub async fn run(a: ServeArgs) -> Result<(), String> {
+    // Bind first so clients get 503 (not connection refused) while the model loads.
+    let l = tokio::net::TcpListener::bind(&a.addr).await.map_err(|e| format!("bind {}: {e}", a.addr))?;
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let loading = Router::new().fallback(|| async { (axum::http::StatusCode::SERVICE_UNAVAILABLE, Json(json!({"status":"loading model"}))) });
+    let h = tokio::spawn(async move { let _ = axum::serve(l, loading).with_graceful_shutdown(async { let _ = rx.await; }).await; });
     let be: Shared = if a.stub || a.model.is_none() {
         Arc::new(Stub)
     } else {
@@ -40,6 +45,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         .route("/v1/chat/completions", post(chat))
         .route("/slots/{id}", post(slot_action))
         .with_state(st);
+    let _ = tx.send(());
+    let _ = h.await;
     let l = tokio::net::TcpListener::bind(&a.addr).await.map_err(|e| format!("bind {}: {e}", a.addr))?;
     eprintln!("lastengine listening on {}", a.addr);
     axum::serve(l, app).await.map_err(|e| e.to_string())

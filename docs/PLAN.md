@@ -64,3 +64,6 @@ Recommended order: 2 (cheapest large win, no new kernels) -> 1 (structural) -> 4
 
 ## Update (after MTP)
 Decode 28 -> 34.7 tok/s via: one routing readback per layer, warp-parallel top-k, fused gate+up expert matvec. Fusing add+rmsnorm gave no measurable change: small-kernel launch count is NOT the bottleneck (kernels ~21 ms of ~29 ms/token; the rest is the per-layer host sync + miss waits). Remaining levers are structural: device-side routing (graph capture), CPU execution of missed experts, learned multi-layer prefetch. 28K tcq3: prefill 54.6 s (513 tok/s), decode 27.2 tok/s.
+
+## Correction to proposal 1 (CPU runs missed experts)
+Re-costed before building: an expert is ~1.3 MB; at ~12 GB/s PCIe a miss is ~0.1 ms, so ~68 misses/token is ~7 ms, partly overlapped. The CPU would need ~3M multiply-adds per expert; even with a vectorised int8 kernel at ~20 GMAC/s/core that is ~0.15 ms/core/expert, i.e. no better than the PCIe copy, and the existing `dequant_row` path is far slower. So CPU-side experts are NOT a clear win on this machine; dropped to low priority. Remaining credible decode levers: device-side routing + graph capture (removes host syncs), deeper prefetch, a profile-guided resident set.
