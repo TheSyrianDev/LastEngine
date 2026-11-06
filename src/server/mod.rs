@@ -37,7 +37,12 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     };
     let st = Arc::new(App { be, slot_dir: a.slot_save_path.clone().map(std::path::PathBuf::from), stats: Stats::new() });
     let app = Router::new()
-        .route("/", get(|| async { axum::response::Html(include_str!("ui.html")) }))
+        .route("/", get(web_index))
+        .route("/index.html", get(web_index))
+        .route("/favicon.svg", get(|| async { ([("content-type","image/svg+xml")], include_str!("../../assets/webui/favicon.svg")) }))
+        .route("/_app/version.json", get(|| async { ([("content-type","application/json")], include_str!("../../assets/webui/_app/version.json")) }))
+        .route("/_app/immutable/bundle.B83VQjAo.js", get(|| async { ([("content-type","text/javascript"),("cache-control","max-age=3600")], include_str!("../../assets/webui/_app/immutable/bundle.B83VQjAo.js")) }))
+        .route("/_app/immutable/assets/bundle.DN2gXIUA.css", get(|| async { ([("content-type","text/css"),("cache-control","max-age=3600")], include_str!("../../assets/webui/_app/immutable/assets/bundle.DN2gXIUA.css")) }))
         .route("/stats", get(stats_summary))
         .route("/stats/requests", get(stats_requests))
         .route("/v1/models", get(models))
@@ -52,6 +57,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     eprintln!("lastengine listening on {}", a.addr);
     axum::serve(l, app).await.map_err(|e| e.to_string())
 }
+
+async fn web_index() -> axum::response::Html<&'static str> { axum::response::Html(include_str!("../../assets/webui/index.html")) }
 
 pub struct App {
     be: Shared,
