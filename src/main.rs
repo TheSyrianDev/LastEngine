@@ -4,6 +4,7 @@ mod cli;
 mod probe;
 mod tune;
 mod cpu_ref;
+mod dense;
 mod gguf;
 mod gpu;
 mod local;
@@ -64,6 +65,23 @@ async fn main() {
             quant::dequant_row(t.ggml_type, &buf, &mut v);
             let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
             std::fs::File::create(out).unwrap().write_all(&bytes).unwrap();
+        }
+        cli::Cmd::Ref { path, prompt, top } if gguf::Gguf::open(&path).ok().and_then(|g| dense::Dense::supports(&g)).is_some() => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let m = dense::Dense::load(&path, &g);
+            let mut ids = tk.encode(&prompt);
+            if g.kv.get("tokenizer.ggml.add_bos_token").map_or(false, |v| matches!(v, gguf::Value::Bool(true))) { if let Some(b) = tk.bos { ids.insert(0, b); } }
+            let mut st = m.new_state();
+            let t0 = std::time::Instant::now();
+            let mut logits = vec![];
+            for (i, id) in ids.iter().enumerate() { logits = m.forward(&mut st, *id, i); }
+            eprintln!("{} tok in {:.2}s", ids.len(), t0.elapsed().as_secs_f32());
+            let mx = logits.iter().cloned().fold(f32::MIN, f32::max);
+            let lse = mx + logits.iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
+            let mut ix: Vec<usize> = (0..logits.len()).collect();
+            ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
+            for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
         }
         cli::Cmd::Ref { path, prompt, top } => {
             let g = gguf::Gguf::open(&path).expect("open");
