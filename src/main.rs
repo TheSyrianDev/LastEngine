@@ -156,6 +156,30 @@ async fn main() {
             }
             println!("{agree}/{n} argmax agree, mean |dlogprob| {:.4}, max {:.4}", sumd / n as f32, maxd);
         }
+        cli::Cmd::TfDump { path, prompt, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let ids = tk.encode(&prompt);
+            let dense_kind = dense::Dense::supports(&g).is_some();
+            let mut step: Box<dyn FnMut(Option<u32>) -> Vec<f32>> = if dense_kind {
+                let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
+                let ids2 = ids.clone(); let mut first = true;
+                Box::new(move |t| if first { first = false; gp.prefill(&ids2) } else { gp.forward(t.unwrap()) })
+            } else {
+                let m = std::sync::Arc::new(cpu_ref::Model::load(&path, &g));
+                let mut gp = gpu::Gpu::new(m, 4096, 128);
+                let ids2 = ids.clone(); let mut first = true;
+                Box::new(move |t| if first { first = false; gp.prefill(&ids2) } else { gp.forward(t.unwrap()) })
+            };
+            let mut lg = step(None); let mut gen = vec![]; let mut top = vec![];
+            for _ in 0..n {
+                let mx = lg.iter().cloned().fold(f32::MIN, f32::max); let lse = mx + lg.iter().map(|v| (v - mx).exp()).sum::<f32>().ln();
+                let mut ix: Vec<usize> = (0..lg.len()).collect(); ix.sort_by(|a, b| lg[*b].partial_cmp(&lg[*a]).unwrap());
+                top.push(ix.iter().take(5).map(|i| (*i, lg[*i] - lse)).collect::<Vec<_>>());
+                gen.push(ix[0] as u32); lg = step(Some(ix[0] as u32));
+            }
+            println!("{}", serde_json::json!({"prompt_ids": ids, "gen_ids": gen, "top": top}));
+        }
         cli::Cmd::Ref { path, prompt, top } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");

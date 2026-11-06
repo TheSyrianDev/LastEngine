@@ -13,6 +13,7 @@ impl Value {
     pub fn as_u64(&self) -> Option<u64> {
         Some(match self {
             Value::U8(v) => *v as u64, Value::U16(v) => *v as u64, Value::U32(v) => *v as u64, Value::U64(v) => *v,
+            Value::Bool(b) => *b as u64,
             Value::I8(v) if *v >= 0 => *v as u64, Value::I16(v) if *v >= 0 => *v as u64,
             Value::I32(v) if *v >= 0 => *v as u64, Value::I64(v) if *v >= 0 => *v as u64,
             _ => return None,

@@ -25,6 +25,8 @@ pub enum Cmd {
     CloverDraft { path: String, prompt: String, #[arg(default_value_t = 1)] blocks: usize },
     /// Dense model: CPU greedy for N tokens, GPU teacher-forced on the same tokens; report first logit/argmax divergences
     DenseCmp { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
+    /// Greedy-decode N tokens on the GPU and print JSON {prompt_ids,gen_ids,top} (top = per step top-5 [id,logprob]) for teacher-forced comparison with another engine
+    TfDump { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },
     Dequant { path: String, name: String, n: usize, out: String },
     Template { path: String },
