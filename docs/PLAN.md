@@ -73,3 +73,6 @@ Blocker found in `src/gpu.rs` (`slot_for`/`pick_slot`/`prefetch`): the expert ca
 1. Device-resident table `slot_of[layer*n_expert+e] -> slot|-1` and device LRU stamps; `router_topk` also emits slot pointers (gather from the table) into the pointer buffer the matvecs already read.
 2. Hit-only fast path inside a captured per-layer graph; a miss flag written by the kernel. Host checks one flag per layer (still a sync, but only for fetch decisions) or per token, falling back to the current path on a miss.
 3. Because ~25-30% of lookups miss at 4 GB VRAM, most layers would still take the slow path; expected gain is bounded by hit rate (~70%) times the ~8 ms/token of host gap, i.e. maybe 3-5 ms/token (34 -> ~38-40 tok/s). Real win needs a higher hit rate first (bigger VRAM budget, or resident-set pinning), so this is deferred until that lever exists.
+
+## Hot-expert pinning (tried, rejected)
+`LE_PIN=f` makes the top fraction f of prefill-hot experts non-evictable. 1200-token prompt, 128 decoded: f=0 -> 35.3 tok/s (10.5K misses), f=0.3 -> 34.9 (10.9K), f=0.6 -> 32.7 (12.1K). Pinning raises misses: routing during decode is not well predicted by prefill heat, and pinned slots shrink the LRU pool. Default stays 0 (off); kept as an experiment knob. Hit rate therefore cannot be bought cheaply, which further weakens the case for the device-side cache rewrite.

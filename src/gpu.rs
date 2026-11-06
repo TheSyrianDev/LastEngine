@@ -34,7 +34,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, prot: Vec<bool>, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -194,6 +194,7 @@ impl Gpu {
         let ib = dalloc(128);
         let egb = a(16 * c.ff_exp);
         Gpu {
+            prot: vec![false; n_slots],
             nall, mtp, hprev: dalloc(c.n_embd * 4), mcat: dalloc(2 * c.n_embd * 4), snap, rows_out: vec![], want_rows: false,
             store: store_p as *mut u8, store_off, pf: Some(Box::new(pf)), mmq: std::env::var("LE_MMQ").map_or(true, |v| v != "0"), dbg: std::env::var("LE_DBG").is_ok(), dbg_pos: std::env::var("LE_DBG").ok().and_then(|v| v.parse().ok()).unwrap_or(0), wave: 0, comp_ev: mk_events(), cp_ev: mk_events(),
             cs, ev, stg: stg as *mut u8, pf_pending: false, ph: a(c.n_embd), plog: a(c.n_expert), pidx: ib + 64, prw: a(16), pf_extra, pf_issued: 0,
@@ -285,6 +286,8 @@ impl Gpu {
         let mut order: Vec<usize> = (0..self.pheat.len()).filter(|&i| self.pheat[i] > 0).collect();
         order.sort_by(|&a, &b| self.pheat[b].cmp(&self.pheat[a]));
         order.truncate(self.n_slots);
+        let pin_frac: f32 = std::env::var("LE_PIN").ok().and_then(|v| v.parse().ok()).unwrap_or(0.0);
+        let npin = (order.len() as f32 * pin_frac) as usize;
         let want: std::collections::HashSet<(usize, usize)> = order.iter().map(|&i| (i / ne, i % ne)).collect();
         let mut free: Vec<usize> = (0..self.n_slots).filter(|&s| match self.key_of[s] { None => true, Some(k) => !want.contains(&k) }).collect();
         unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
@@ -297,6 +300,8 @@ impl Gpu {
             unsafe { sys::cuMemcpyHtoDAsync_v2(self.arena + (s * self.slot_bytes) as u64, self.store.add(self.store_off[l] + e * eb) as *const _, eb, self.st.cu_stream()).result().unwrap() };
         }
         unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
+        self.prot.iter_mut().for_each(|p| *p = false);
+        for &i in order.iter().take(npin) { if let Some(&sl) = self.slot_of.get(&(i / ne, i % ne)) { self.prot[sl] = true; } }
         self.pheat.iter_mut().for_each(|h| *h = 0);
     }
     /// TCQ: encode this step's K (post-rope, in kscr) and V (raw) for `t` tokens at pos0, then rotate the queries `q` the same way.
@@ -344,7 +349,7 @@ impl Gpu {
         if let Some(&s) = self.slot_of.get(&(layer, e)) { self.last_use[s] = self.tick; return (s, false); }
         let (mut best, mut bt) = (usize::MAX, u64::MAX);
         for s in 0..self.n_slots {
-            if pinned.contains(&s) { continue; }
+            if pinned.contains(&s) || self.prot[s] { continue; }
             let t = if self.key_of[s].is_none() { 0 } else { self.last_use[s] };
             if t < bt { bt = t; best = s; }
         }
