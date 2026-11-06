@@ -36,12 +36,13 @@ fn sigmoid(x: f32) -> f32 { 1.0 / (1.0 + (-x).exp()) }
 
 impl Model {
     pub fn load(path: &str, g: &Gguf) -> Model {
+        let arch = g.arch().unwrap_or("qwen35moe").to_string();
         let f = std::fs::File::open(path).unwrap();
         let mmap = unsafe { Mmap::map(&f).unwrap() };
-        let u = |k: &str| g.kv.get(&format!("qwen35moe.{k}")).and_then(Value::as_u64).unwrap_or_else(|| panic!("{k}")) as usize;
-        let fl = |k: &str| g.kv.get(&format!("qwen35moe.{k}")).and_then(Value::as_f32).unwrap();
+        let u = |k: &str| g.kv.get(&format!("{arch}.{k}")).and_then(Value::as_u64).unwrap_or_else(|| panic!("{k}")) as usize;
+        let fl = |k: &str| g.kv.get(&format!("{arch}.{k}")).and_then(Value::as_f32).unwrap();
         let cfg = Cfg {
-            n_layer: u("block_count") - g.kv.get("qwen35moe.nextn_predict_layers").and_then(Value::as_u64).unwrap_or(0) as usize, n_embd: u("embedding_length"), n_head: u("attention.head_count"),
+            n_layer: u("block_count") - g.kv.get(&format!("{arch}.nextn_predict_layers")).and_then(Value::as_u64).unwrap_or(0) as usize, n_embd: u("embedding_length"), n_head: u("attention.head_count"),
             n_kv: u("attention.head_count_kv"), head_dim: u("attention.key_length"), rope_dim: u("rope.dimension_count"),
             rope_base: fl("rope.freq_base"), eps: fl("attention.layer_norm_rms_epsilon"), n_expert: u("expert_count"),
             n_used: u("expert_used_count"), ff_exp: u("expert_feed_forward_length"), ff_shexp: u("expert_shared_feed_forward_length"),
