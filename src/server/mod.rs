@@ -37,6 +37,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
     };
     let st = Arc::new(App { be, slot_dir: a.slot_save_path.clone().map(std::path::PathBuf::from), stats: Stats::new() });
     let app = Router::new()
+        .route("/", get(|| async { axum::response::Html(include_str!("ui.html")) }))
         .route("/stats", get(stats_summary))
         .route("/stats/requests", get(stats_requests))
         .route("/v1/models", get(models))
