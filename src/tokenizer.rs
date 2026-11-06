@@ -15,6 +15,7 @@ pub struct Tokenizer {
     pub eos: Option<u32>,
 }
 
+const LLAMA3_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN_PRE: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 fn byte_tables() -> ([char; 256], HashMap<char, u8>) {
@@ -54,7 +55,7 @@ impl Tokenizer {
         let (byte_enc, byte_dec) = byte_tables();
         let id = |k: &str| g.kv.get(k).and_then(Value::as_u64).map(|v| v as u32);
         Ok(Tokenizer {
-            tokens, ids, ranks, specials, re: Regex::new(QWEN_PRE).map_err(|e| e.to_string())?,
+            tokens, ids, ranks, specials, re: Regex::new(match g.kv.get("tokenizer.ggml.pre").and_then(Value::as_str) { Some("lfm2") | Some("minicpm5") | Some("llama3") | Some("llama-bpe") => LLAMA3_PRE, _ => QWEN_PRE }).map_err(|e| e.to_string())?,
             byte_enc, byte_dec,
             bos: id("tokenizer.ggml.bos_token_id"), eos: id("tokenizer.ggml.eos_token_id"),
         })

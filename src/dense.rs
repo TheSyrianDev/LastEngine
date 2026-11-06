@@ -90,10 +90,10 @@ impl Dense {
             buf.iter().zip(x).map(|(a, b)| a * b).sum::<f32>()
         }).collect()
     }
-    fn rope(&self, v: &mut [f32], pos: usize, base: f32) {
+    fn rope(&self, v: &mut [f32], pos: usize, base: f32, ff: Option<&[f32]>) {
         let half = self.rope_dim / 2;
         for i in 0..half {
-            let th = pos as f32 * base.powf(-(2.0 * i as f32) / self.rope_dim as f32);
+            let th = pos as f32 * base.powf(-(2.0 * i as f32) / self.rope_dim as f32) / ff.map_or(1.0, |f| f[i]);
             let (s, c) = th.sin_cos();
             let (ia, ib) = if self.neox { (i, i + half) } else { (2 * i, 2 * i + 1) };
             let (a, b) = (v[ia], v[ib]);
@@ -112,8 +112,9 @@ impl Dense {
             for i in 0..nkv { let r = rms(&k[i * hd..(i + 1) * hd], &kn, self.eps); k[i * hd..(i + 1) * hd].copy_from_slice(&r); }
         }
         let base = if swa { self.rope_base_swa } else { self.rope_base };
-        for i in 0..nh { self.rope(&mut q[i * hd..(i + 1) * hd], pos, base); }
-        for i in 0..nkv { self.rope(&mut k[i * hd..(i + 1) * hd], pos, base); }
+        let ffv = if !swa && self.t.contains_key("rope_freqs.weight") { Some(self.vec_f32("rope_freqs.weight")) } else { None };
+        for i in 0..nh { self.rope(&mut q[i * hd..(i + 1) * hd], pos, base, ffv.as_deref()); }
+        for i in 0..nkv { self.rope(&mut k[i * hd..(i + 1) * hd], pos, base, ffv.as_deref()); }
         st.kc[l].extend_from_slice(&k); st.vc[l].extend_from_slice(&v);
         let n = st.kc[l].len() / (nkv * hd);
         let t0 = if swa && self.window > 0 && n > self.window { n - self.window } else { 0 };
