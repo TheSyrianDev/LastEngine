@@ -8,6 +8,19 @@ fn u16le(b: &[u8], o: usize) -> u16 { u16::from_le_bytes([b[o], b[o + 1]]) }
 const KV_IQ4NL: [i8; 16] = [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113];
 const K_MULT: [u8; 5] = [81, 27, 9, 3, 1];
 
+
+/// Trellis generator shared by the *_KT formats: `n` values from a 16-bit code (is_int variant, ik_llama QuantizerIQKT::set_values).
+fn kt_values(code: u32, offset: u32, scale: f32, abs: bool, out: &mut [f32]) {
+    let mut x = code.wrapping_add(offset);
+    for v in out.iter_mut() {
+        x = 0xCBAC1FEDu32.wrapping_mul(x);
+        let s = x & 0x3f3f3f3f;
+        let t = (s & 0xff) as i8 as i32 + ((s >> 8) & 0xff) as i8 as i32 + ((s >> 16) & 0xff) as i8 as i32 + ((s >> 24) & 0xff) as i8 as i32;
+        let f = t as f32 - 126.0;
+        *v = scale * if abs { f.abs() } else { f };
+    }
+}
+
 /// (values per block, bytes per block, bytes of per-row header)
 pub fn info(ty: u32) -> Option<(usize, usize, usize)> {
     Some(match ty {
@@ -16,6 +29,7 @@ pub fn info(ty: u32) -> Option<(usize, usize, usize)> {
         137 => (256, 76, 0), 138 => (256, 110, 0), 139 => (256, 144, 0), 140 => (256, 176, 0), 141 => (256, 212, 0),
         144 => (256, 136, 4), 145 => (256, 70, 2), 146 => (256, 128, 4), 152 => (256, 168, 4),
         156 => (256, 102, 2), 157 => (256, 86, 2),
+        153 => (256, 68, 4), 154 => (256, 100, 4), 155 => (256, 128, 4), 158 => (256, 56, 4),
         _ => return None,
     })
 }
@@ -247,6 +261,58 @@ pub fn dequant(ty: u32, src: &[u8], out: &mut [f32]) -> bool {
                     let vo = ((ls & 1) as usize) << 4; let dl = rd * ((ls & 254) - 127) as f32;
                     let mut aux8 = [0u8; 16]; for k in 0..8 { aux8[2 * k] = a[k] as u8; aux8[2 * k + 1] = (a[k] >> 8) as u8; }
                     for j in 0..16 { o[ib * 32 + j] = dl * IQ4K_VALUES[vo + (aux8[j] & 15) as usize] as f32; o[ib * 32 + j + 16] = dl * IQ4K_VALUES[vo + (aux8[j] >> 4) as usize] as f32; }
+                }
+            }
+            153 => { // IQ2_KT: scales[4], ql[64] (u16 codes: first half of the block, then second half)
+                let d = rd;
+                for ib in 0..4 {
+                    let (sl, sh) = (d * IQ4K_VALUES[(b[ib] & 15) as usize] as f32, d * IQ4K_VALUES[(b[ib] >> 4) as usize] as f32);
+                    for ig in 0..4 {
+                        let ql = u16le(b, 4 + 2 * (ib * 4 + ig)) as u32; let qh = u16le(b, 4 + 2 * (16 + ib * 4 + ig)) as u32;
+                        kt_values(ql, 4096, sl, false, &mut o[(ib * 4 + ig) * 8..][..8]);
+                        kt_values(qh, 4096, sh, false, &mut o[128 + (ib * 4 + ig) * 8..][..8]);
+                    }
+                }
+            }
+            154 => { // IQ3_KT: scales[4], ql[64], qh[32] (sign bits)
+                let d = rd * 1.01;
+                for ib in 0..4 {
+                    let (sl, sh) = (d * (b[ib] & 15) as f32, d * (b[ib] >> 4) as f32);
+                    let (lm, hm) = (1u8 << ib, 1u8 << (ib + 4));
+                    for ig in 0..4 {
+                        let jj = ib * 4 + ig;
+                        let ql = u16le(b, 4 + 2 * jj) as u32; let qh = u16le(b, 4 + 2 * (16 + jj)) as u32;
+                        let (yl, yh) = (jj * 8, 128 + jj * 8);
+                        kt_values(ql, 4096, sl, true, &mut o[yl..yl + 8]);
+                        kt_values(qh, 4096, sh, true, &mut o[yh..yh + 8]);
+                        for j in 0..8 {
+                            let sg = b[68 + ig * 8 + j];
+                            if sg & lm != 0 { o[yl + j] = -o[yl + j]; }
+                            if sg & hm != 0 { o[yh + j] = -o[yh + j]; }
+                        }
+                    }
+                }
+            }
+            155 => { // IQ4_KT: shb u32[8], ql[64], qh[32]; groups of 4
+                for ib in 0..8 {
+                    let shb = u32::from_le_bytes(b[ib * 4..ib * 4 + 4].try_into().unwrap());
+                    let offset = if shb & 1 != 0 { 32768 + 4096 } else { 4096 };
+                    let ls = ((shb & 0xff) >> 1) as i32 - 64; let sl = rd * ls as f32;
+                    for ig in 0..8 {
+                        let jj = ib * 8 + ig;
+                        let idx = b[32 + jj] as u32 | (((b[96 + jj % 32] as u32) << (8 - 4 * (jj / 32))) & 0xf00) | (((shb >> (8 + 3 * ig)) & 7) << 12);
+                        kt_values(idx, offset, sl, false, &mut o[jj * 4..jj * 4 + 4]);
+                    }
+                }
+            }
+            158 => { // IQ1_KT: sh[8], ql[32], qh[16]
+                for ib in 0..8 {
+                    let sl = rd * IQ4K_VALUES[(b[ib] & 15) as usize] as f32;
+                    for ig in 0..4 {
+                        let mut idx = b[8 + ib * 4 + ig] as u32 | (((b[40 + (ib % 4) * 4 + ig] as u32) << (8 - 4 * (ib / 4))) & 0xf00);
+                        idx |= ((b[ib] as u32) << (8 - ig)) & 0x1000;
+                        kt_values(idx, 4096, sl, false, &mut o[ib * 32 + ig * 8..][..8]);
+                    }
                 }
             }
             _ => unreachable!(),
