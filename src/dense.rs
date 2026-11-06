@@ -21,6 +21,7 @@ pub struct Dense {
     layers: Vec<LayerKind>, neox: bool,
 }
 
+#[derive(Clone)]
 pub struct State { kc: Vec<Vec<f32>>, vc: Vec<Vec<f32>>, conv: Vec<Vec<f32>> }
 
 fn rms(x: &[f32], w: &[f32], eps: f32) -> Vec<f32> {
@@ -184,5 +185,22 @@ impl Dense {
         }
         let xn = rms(&x, &self.vec_f32("output_norm.weight"), self.eps);
         self.matvec(if self.t.contains_key("output.weight") { "output.weight" } else { "token_embd.weight" }, &xn)
+    }
+}
+
+/// Stateful wrapper with the same surface `Local` uses on the GPU engine.
+pub struct DenseEng { m: Dense, st: State, pos: usize, snap: Option<State>, ctx: usize }
+impl DenseEng {
+    pub fn new(m: Dense, ctx: usize) -> DenseEng { let st = m.new_state(); DenseEng { m, st, pos: 0, snap: None, ctx } }
+    pub fn pos(&self) -> usize { self.pos }
+    pub fn reset(&mut self) { self.st = self.m.new_state(); self.pos = 0; }
+    pub fn forward(&mut self, t: u32) -> Vec<f32> { let l = self.m.forward(&mut self.st, t, self.pos); self.pos += 1; l }
+    pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
+        assert!(self.pos + ids.len() <= self.ctx.max(1) + 1);
+        let mut l = vec![]; for &t in ids { l = self.forward(t); } l
+    }
+    pub fn snap_recurrent(&mut self) -> Vec<u8> { self.snap = Some(self.st.clone()); Vec::new() }
+    pub fn restore_recurrent(&mut self, _b: &[u8], pos: usize) {
+        if let Some(s) = &self.snap { self.st = s.clone(); self.pos = pos; }
     }
 }

@@ -4,7 +4,19 @@ use crate::{cpu_ref::Model, gguf::Gguf, gpu::Gpu, template, tokenizer::Tokenizer
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 
-struct Inner { gpu: Gpu, hist: Vec<u32>, rng: u64, snap: Option<(Vec<u32>, Vec<u8>)> }
+enum Eng { Gpu(Gpu), Dense(crate::dense::DenseEng) }
+macro_rules! dispatch { ($e:expr, $x:ident => $b:expr) => { match $e { Eng::Gpu($x) => $b, Eng::Dense($x) => $b } } }
+impl Eng {
+    fn pos(&self) -> usize { dispatch!(self, g => g.pos()) }
+    fn reset(&mut self) { dispatch!(self, g => g.reset()) }
+    fn prefill(&mut self, ids: &[u32]) -> Vec<f32> { dispatch!(self, g => g.prefill(ids)) }
+    fn forward(&mut self, t: u32) -> Vec<f32> { dispatch!(self, g => g.forward(t)) }
+    fn snap_recurrent(&mut self) -> Vec<u8> { dispatch!(self, g => g.snap_recurrent()) }
+    fn restore_recurrent(&mut self, b: &[u8], pos: usize) { dispatch!(self, g => g.restore_recurrent(b, pos)) }
+    fn export_state(&mut self) -> Result<Vec<u8>, String> { match self { Eng::Gpu(g) => Ok(g.export_state()), _ => Err("slots unsupported for this architecture".into()) } }
+    fn import_state(&mut self, b: &[u8]) -> Result<(), String> { match self { Eng::Gpu(g) => g.import_state(b), _ => Err("slots unsupported for this architecture".into()) } }
+}
+struct Inner { gpu: Eng, hist: Vec<u32>, rng: u64, snap: Option<(Vec<u32>, Vec<u8>)> }
 pub struct Local { inner: Mutex<Inner>, tok: Tokenizer, tmpl: String, name: String, n_ctx: usize, n_params: u64, bos: String, eos: String }
 
 impl Local {
@@ -15,10 +27,11 @@ impl Local {
             Some(f) if f != "gguf" => std::fs::read_to_string(f).map_err(|e| format!("{f}: {e}"))?,
             _ => g.kv.get("tokenizer.chat_template").and_then(|v| v.as_str().map(String::from)).ok_or("model has no chat template")?,
         };
+        let tmpl = tmpl.replace("{%- generation -%}", "").replace("{%- endgeneration -%}", "").replace("{% generation %}", "").replace("{% endgeneration %}", "");
         let name = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let n_params = g.tensors.iter().map(|t| t.dims.iter().product::<u64>()).sum();
-        let m = Arc::new(Model::load(path, &g));
-        let gpu = Gpu::new(m, ctx, margin);
+        let gpu = if crate::dense::Dense::supports(&g).is_some() { Eng::Dense(crate::dense::DenseEng::new(crate::dense::Dense::load(path, &g), ctx)) }
+                  else { Eng::Gpu(Gpu::new(Arc::new(Model::load(path, &g)), ctx, margin)) };
         let s = |id: Option<u32>| id.map(|i| tok.tokens[i as usize].clone()).unwrap_or_default();
         let (bos, eos) = (s(tok.bos), s(tok.eos));
         Ok(Local { inner: Mutex::new(Inner { gpu, hist: vec![], rng: 0x9E3779B97F4A7C15, snap: None }), tok, tmpl, name, n_ctx: ctx, n_params, bos, eos })
@@ -47,7 +60,7 @@ fn sample(logits: &mut [f32], sp: &Sampling, hist: &[u32], rng: &mut u64) -> u32
         let tail = &hist[hist.len().saturating_sub(256)..];
         for &t in tail { let l = &mut logits[t as usize]; if sp.repeat_penalty > 1.0 { *l = if *l > 0.0 { *l / sp.repeat_penalty } else { *l * sp.repeat_penalty }; } *l -= sp.presence_penalty; }
     }
-    if sp.temperature <= 0.0 { return logits.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32; }
+    if sp.temperature <= 0.0 { return logits.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0 as u32; }
     let k = if sp.top_k == 0 { 64 } else { sp.top_k.min(256) };
     let mut ix: Vec<u32> = (0..logits.len() as u32).collect();
     ix.select_nth_unstable_by(k - 1, |a, b| logits[*b as usize].partial_cmp(&logits[*a as usize]).unwrap());
@@ -120,7 +133,7 @@ impl Backend for Local {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         if g.hist.len() != g.gpu.pos() { return Err("context in flux".into()); }
-        let st = g.gpu.export_state();
+        let st = g.gpu.export_state()?;
         let mut out = Vec::with_capacity(st.len() + g.hist.len() * 4 + 16);
         out.extend_from_slice(b"LESLOT01");
         out.extend_from_slice(&(g.hist.len() as u64).to_le_bytes());
@@ -186,7 +199,8 @@ impl Backend for Local {
         if let Some(s) = req.sampling.seed { g.rng = s.wrapping_mul(0x9E3779B97F4A7C15) | 1; }
         let mut bytes: Vec<u8> = vec![];
         let mut n = 0; let mut alive = true; let mut reason = "length";
-        let eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|t| self.tok.tokens.iter().position(|x| x == t).map(|i| i as u32)).collect();
+        let mut eos: Vec<u32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|t| self.tok.tokens.iter().position(|x| x == t).map(|i| i as u32)).collect();
+        if let Some(e) = self.tok.eos { if !eos.contains(&e) { eos.push(e); } }
         let budget = req.max_tokens.min(max_pos.saturating_sub(ids.len()));
         while n < budget {
             let t = sample(&mut logits, &req.sampling, &g.hist, &mut g.rng);
