@@ -2,7 +2,7 @@
 // One block per head: optional per-head RMS norm, then RoPE (NORM = adjacent pairs, NEOX = split halves), written as f16 (K) or f32 (Q).
 extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int hd, int rope_dim, int pos, float base, const float* ff, int neox, const float* nw, float eps) {
   __shared__ float v[256]; __shared__ float red[8];
-  int h = blockIdx.x; in += (size_t)h * hd;
+  int h = blockIdx.x; size_t tb = (size_t)blockIdx.y * gridDim.x * hd; pos += blockIdx.y; in += tb + (size_t)h * hd;
   for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = in[i];
   __syncthreads();
   float sc = 1.f;
@@ -22,14 +22,16 @@ extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int
     float a = v[ia], b = v[ib]; v[ia] = a * c - b * s; v[ib] = a * s + b * c;
   }
   __syncthreads();
-  if (out_half) { __half* o = (__half*)out + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
-  else { float* o = (float*)out + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
+  if (out_half) { __half* o = (__half*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
+  else { float* o = (float*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
 }
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
 // Decode attention, one block (8 warps) per query head; warps split the keys, online softmax, merged through shared memory.
-extern "C" __global__ void dn_attn(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int t0, int n, int nh, int nkv, int hd) {
+extern "C" __global__ void dn_attn(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int win, int n, int nh, int nkv, int hd) {
   __shared__ float mw[8], lw[8]; __shared__ float ow[8][256];
   int h = blockIdx.x, kvh = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  n += blockIdx.y; int t0 = (win > 0 && n > win) ? n - win : 0;
+  q += (size_t)blockIdx.y * nh * hd; o += (size_t)blockIdx.y * nh * hd; if (gate) gate += (size_t)blockIdx.y * nh;
   int per = hd / 32; float qv[8], acc[8];
   for (int j = 0; j < per; j++) { qv[j] = q[h * hd + lane + 32 * j]; acc[j] = 0.f; }
   float m = -1e30f, l = 0.f, scale = rsqrtf((float)hd);
@@ -62,4 +64,20 @@ extern "C" __global__ void dn_shortconv(const float* bcx, const float* w, float*
   for (int k = 0; k < lc - 2; k++) s[k] = s[k + 1];
   s[lc - 2] = bx;
   y[ch] = bcx[n + ch] * acc;
+}
+
+// Batched LFM short convolution: bcx [T][3n] -> y [T][n], sequential over tokens per channel.
+extern "C" __global__ void dn_shortconv_b(const float* bcx, const float* w, float* st, float* y, int n, int lc, int T) {
+  int ch = blockIdx.x * blockDim.x + threadIdx.x; if (ch >= n) return;
+  float s[8]; for (int k = 0; k < lc - 1; k++) s[k] = st[(size_t)ch * (lc - 1) + k];
+  for (int t = 0; t < T; t++) {
+    const float* r = bcx + (size_t)t * 3 * n;
+    float bx = r[ch] * r[2 * n + ch];
+    float acc = bx * w[ch * lc + lc - 1];
+    for (int k = 0; k < lc - 1; k++) acc += s[k] * w[ch * lc + k];
+    for (int k = 0; k < lc - 2; k++) s[k] = s[k + 1];
+    s[lc - 2] = bx;
+    y[(size_t)t * n + ch] = r[n + ch] * acc;
+  }
+  for (int k = 0; k < lc - 1; k++) st[(size_t)ch * (lc - 1) + k] = s[k];
 }

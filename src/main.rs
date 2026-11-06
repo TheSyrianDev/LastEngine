@@ -145,7 +145,8 @@ async fn main() {
             let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
             let lp = |v: &[f32], i: usize| { let mx = v.iter().cloned().fold(f32::MIN, f32::max); v[i] - mx - v.iter().map(|a| (a - mx).exp()).sum::<f32>().ln() };
             let (mut lc, mut lg) = (vec![], vec![]);
-            for (i, t) in ids.iter().enumerate() { lc = cpu.forward(&mut st, *t, i); lg = gp.forward(*t); }
+            for (i, t) in ids.iter().enumerate() { lc = cpu.forward(&mut st, *t, i); }
+            let t0 = std::time::Instant::now(); lg = gp.prefill(&ids); println!("gpu prefill {} tok in {:.3}s", ids.len(), t0.elapsed().as_secs_f32());
             let (mut diff, mut agree, mut maxd, mut sumd) = (0, 0, 0f32, 0f32);
             for k in 0..n {
                 let (a, b) = (am(&lc), am(&lg));
