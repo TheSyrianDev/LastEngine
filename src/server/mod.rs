@@ -87,7 +87,8 @@ async fn models(State(a): State<Arc<App>>) -> Json<Value> {
 async fn props(State(a): State<Arc<App>>) -> Json<Value> {
     let be = &a.be;
     Json(json!({
-        "default_generation_settings": {"n_ctx": be.n_ctx()},
+        "total_slots": 1, "model_alias": be.model_id(), "model_path": be.model_id(), "build_info": format!("lastengine {}", env!("CARGO_PKG_VERSION")),
+        "default_generation_settings": {"n_ctx": be.n_ctx(), "params": {"n_predict": -1, "temperature": 0.7, "top_p": 0.95, "top_k": 40, "min_p": 0.0}},
         "chat_template_caps": {"supports_tools": a.be.supports_tools(), "supports_reasoning_effort": false},
         "modalities": {"vision": false}
     }))
@@ -97,6 +98,38 @@ fn sampling_of(b: &Value) -> Sampling {
     let f = |k: &str, d: f32| b[k].as_f64().map(|v| v as f32).unwrap_or(d);
     Sampling { temperature: f("temperature", 0.7), top_p: f("top_p", 0.95), top_k: b["top_k"].as_u64().unwrap_or(40) as usize, min_p: f("min_p", 0.0),
                presence_penalty: f("presence_penalty", 0.0), repeat_penalty: f("repeat_penalty", 1.0), seed: b["seed"].as_u64() }
+}
+
+
+/// Holds back text that could still become a stop string; `push` returns (text safe to emit, stop hit).
+struct StopFilter { stops: Vec<String>, buf: String }
+impl StopFilter {
+    fn new(stops: Vec<String>) -> Self { StopFilter { stops: stops.into_iter().filter(|s| !s.is_empty()).collect(), buf: String::new() } }
+    fn push(&mut self, s: &str) -> (String, bool) {
+        if self.stops.is_empty() { return (s.to_string(), false); }
+        self.buf.push_str(s);
+        if let Some(i) = self.stops.iter().filter_map(|st| self.buf.find(st.as_str())).min() {
+            let out = self.buf[..i].to_string(); self.buf.clear(); return (out, true);
+        }
+        let mut hold = 0;
+        for st in &self.stops {
+            for k in (1..st.len()).rev() {
+                if st.is_char_boundary(k) && self.buf.ends_with(&st[..k]) { hold = hold.max(k); break; }
+            }
+        }
+        let cut = self.buf.len() - hold;
+        let out = self.buf[..cut].to_string(); self.buf.drain(..cut);
+        (out, false)
+    }
+    fn flush(&mut self) -> String { std::mem::take(&mut self.buf) }
+}
+
+/// Sets the flag when the request future is dropped (client closed the connection) unless disarmed.
+struct CancelOnDrop(Arc<std::sync::atomic::AtomicBool>, bool);
+impl Drop for CancelOnDrop { fn drop(&mut self) { if self.1 { self.0.store(true, std::sync::atomic::Ordering::Relaxed); } } }
+
+fn stops_of(b: &Value) -> Vec<String> {
+    match &b["stop"] { Value::String(s) => vec![s.clone()], Value::Array(a) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(), _ => vec![] }
 }
 
 fn tool_calls_json(u: &crate::backend::Usage) -> Value {
@@ -120,21 +153,30 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
     let rid = app.stats.begin();
     let t0 = Instant::now();
     let started_unix_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+    let stops = stops_of(&body);
     if !stream {
         let app2 = app.clone();
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut guard = CancelOnDrop(cancel.clone(), true);
         let h = tokio::task::spawn_blocking(move || {
             let (mut text, mut reasoning) = (String::new(), String::new());
-            let mut ttft = None;
-            let u = be.generate(&req, &mut |d| { ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0); match d { Delta::Content(s) => text.push_str(&s), Delta::Reasoning(s) => reasoning.push_str(&s) } true });
+            let mut ttft = None; let mut sf = StopFilter::new(stops); let mut hit = false;
+            let mut u = be.generate(&req, &mut |d| {
+                ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
+                match d { Delta::Content(s) => { let (o, h) = sf.push(&s); text.push_str(&o); if h { hit = true; return false; } } Delta::Reasoning(s) => reasoning.push_str(&s) }
+                !cancel.load(std::sync::atomic::Ordering::Relaxed)
+            });
+            if !hit { text.push_str(&sf.flush()); } else { u.finish_reason = "stop"; }
             let st = record(rid, started_unix_ms, t0, ttft, &u, true);
             app2.stats.finish(st.clone());
             (text, reasoning, u, st)
         });
         let (text, reasoning, u, st) = h.await.unwrap();
+        guard.1 = false;
         return Json(json!({
             "id": id, "object": "chat.completion", "model": model,
             "choices": [{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":tool_calls_json(&u)},"finish_reason":u.finish_reason}],
-            "usage": {"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,
+            "usage": {"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,"total_tokens":u.prompt_tokens+u.completion_tokens,
                       "prompt_tokens_details":{"cached_tokens":u.cached_tokens}},
             "timings": timings(&st)
         })).into_response();
@@ -148,19 +190,24 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
         // emit returns false when the receiver is dropped (client closed the socket): generation stops.
         let mut ttft = None;
         let mut alive = true;
-        let u = be.generate(&req, &mut |d| {
+        let mut sf = StopFilter::new(stops); let mut hit = false;
+        let mut u = be.generate(&req, &mut |d| {
             ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
-            let delta = match d { Delta::Content(s) => json!({"content":s}), Delta::Reasoning(s) => json!({"reasoning_content":s}) };
+            let delta = match d {
+                Delta::Content(s) => { let (o, h) = sf.push(&s); if h { hit = true; } if o.is_empty() { if hit { return false; } return true; } json!({"content":o}) }
+                Delta::Reasoning(s) => json!({"reasoning_content":s}),
+            };
             alive = tx.blocking_send(ev(chunk(delta, Value::Null))).is_ok();
-            alive
+            alive && !hit
         });
+        if !hit { let rest = sf.flush(); if !rest.is_empty() { alive = tx.blocking_send(ev(chunk(json!({"content":rest}), Value::Null))).is_ok(); } } else { u.finish_reason = "stop"; }
         if !u.tool_calls.is_empty() { let _ = tx.blocking_send(ev(chunk(json!({"tool_calls":tool_calls_json(&u)}), Value::Null))); }
         let st = record(rid, started_unix_ms, t0, ttft, &u, alive);
         app.stats.finish(st.clone());
         let _ = tx.blocking_send(ev(chunk(json!({}), json!(u.finish_reason))));
         if include_usage {
             let _ = tx.blocking_send(ev(json!({"id":id,"object":"chat.completion.chunk","model":model,"choices":[],
-                "usage":{"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,
+                "usage":{"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,"total_tokens":u.prompt_tokens+u.completion_tokens,
                          "prompt_tokens_details":{"cached_tokens":u.cached_tokens}},
                 "timings": timings(&st)})));
         }

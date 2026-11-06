@@ -11,7 +11,7 @@ root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 out = subprocess.run([f"{root}/target/release/lastengine", "tf-dump", model, prompt, str(n)], capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
 d = json.loads(out); pids, gen, top = d["prompt_ids"], d["gen_ids"], d["top"]
 port = 8397
-cmd = [os.path.expanduser("~/AI/engines/llama-mainline/build/bin/llama-server"), "-m", model, "--port", str(port), "-c", "8192", "-ngl", "99", "--no-webui"] + (["--cpu-moe"] if moe else [])
+cmd = [os.environ.get("LLAMA_SERVER") or os.path.expanduser("~/AI/engines/llama-mainline/build/bin/llama-server"), "-m", model, "--port", str(port), "-c", "8192", "-ngl", "99", "--no-webui"] + (["--cpu-moe"] if moe else [])
 srv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def post(path, body):
     r = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(), {"content-type": "application/json"})
