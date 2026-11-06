@@ -22,6 +22,7 @@ pub struct Model {
     pub ssm_a_raw: bool,
 }
 
+#[derive(Clone)]
 pub struct State {
     conv: Vec<Vec<f32>>,       // per layer [channels][k-1]
     s: Vec<Vec<f32>>,          // per layer [vhead][dk][dv]
@@ -258,6 +259,210 @@ impl Model {
         for &e in &idx { ffn(&p("ffn_gate_exps.weight"), &p("ffn_up_exps.weight"), &p("ffn_down_exps.weight"), e, pr[e] / tot, &mut out); }
         let sg = self.vec_f32(&p("ffn_gate_inp_shexp.weight")).iter().zip(h).map(|(a, b)| a * b).sum::<f32>();
         ffn(&p("ffn_gate_shexp.weight"), &p("ffn_up_shexp.weight"), &p("ffn_down_shexp.weight"), 0, sigmoid(sg), &mut out);
+        out
+    }
+
+    /// Row-major batched matvec: out[n][r] = W[r,:]·xs[n]; each weight row is dequantised once for all inputs.
+    pub fn matmat(&self, name: &str, expert: usize, xs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let (t, b) = self.bytes(name);
+        let (cols, rows) = (t.dims[0], t.dims[1]);
+        let rb = quant::row_bytes(t.ty, cols);
+        let base = expert * rows * rb;
+        let cols_out: Vec<Vec<f32>> = (0..rows).into_par_iter().map_init(|| vec![0f32; cols], |buf, r| {
+            quant::dequant_row(t.ty, &b[base + r * rb..base + (r + 1) * rb], buf);
+            xs.iter().map(|x| buf.iter().zip(x).map(|(a, b)| a * b).sum::<f32>()).collect()
+        }).collect();
+        (0..xs.len()).map(|n| cols_out.iter().map(|c| c[n]).collect()).collect()
+    }
+
+    /// Clover block-diffusion "preview": one bidirectional pass over a block of (mostly mask) tokens at
+    /// positions pos0.., reading the committed state in `st` without changing it. Returns logits per position.
+    pub fn preview(&self, st: &State, toks: &[u32], pos0: usize) -> Vec<Vec<f32>> {
+        let c = &self.cfg;
+        let nb = toks.len();
+        let mut xs: Vec<Vec<f32>> = toks.iter().map(|&tk| {
+            let mut x = vec![0f32; c.n_embd];
+            let (t, b) = self.bytes("token_embd.weight");
+            let rb = quant::row_bytes(t.ty, c.n_embd);
+            quant::dequant_row(t.ty, &b[tk as usize * rb..(tk as usize + 1) * rb], &mut x);
+            x
+        }).collect();
+        for l in 0..c.n_layer {
+            let p = |s: &str| format!("blk.{l}.{s}");
+            let an = self.vec_f32(&p("attn_norm.weight"));
+            let hs: Vec<Vec<f32>> = xs.iter().map(|x| rms(x, &an, c.eps)).collect();
+            let outs = if (l + 1) % c.interval == 0 { self.attn_preview(st, l, &hs, pos0) } else { self.delta_preview(st, l, &hs) };
+            for (x, o) in xs.iter_mut().zip(&outs) { for i in 0..x.len() { x[i] += o[i]; } }
+            let pn = self.vec_f32(&p("post_attention_norm.weight"));
+            let h2: Vec<Vec<f32>> = xs.iter().map(|x| rms(x, &pn, c.eps)).collect();
+            let ms = self.moe_preview(l, &h2);
+            for (x, o) in xs.iter_mut().zip(&ms) { for i in 0..x.len() { x[i] += o[i]; } }
+        }
+        let on = self.vec_f32("output_norm.weight");
+        let xf: Vec<Vec<f32>> = xs.iter().map(|x| rms(x, &on, c.eps)).collect();
+        debug_assert_eq!(xf.len(), nb);
+        self.matmat("output.weight", 0, &xf)
+    }
+
+    fn attn_preview(&self, st: &State, l: usize, hs: &[Vec<f32>], pos0: usize) -> Vec<Vec<f32>> {
+        let c = &self.cfg;
+        let p = |s: &str| format!("blk.{l}.{s}");
+        let (hd, nh, nkv) = (c.head_dim, c.n_head, c.n_kv);
+        let nb = hs.len();
+        let qf = self.matmat(&p("attn_q.weight"), 0, hs);
+        let mut ks = self.matmat(&p("attn_k.weight"), 0, hs);
+        let vs = self.matmat(&p("attn_v.weight"), 0, hs);
+        let (qn, kn) = (self.vec_f32(&p("attn_q_norm.weight")), self.vec_f32(&p("attn_k_norm.weight")));
+        let rope = |v: &mut [f32], pos: usize| {
+            let half = c.rope_dim / 2;
+            for i in 0..half {
+                let th = pos as f32 * c.rope_base.powf(-(2.0 * i as f32) / c.rope_dim as f32);
+                let (s, co) = th.sin_cos();
+                let (a, b) = (v[i], v[i + half]);
+                v[i] = a * co - b * s; v[i + half] = a * s + b * co;
+            }
+        };
+        let mut qs = vec![vec![0f32; nh * hd]; nb];
+        let mut gates = vec![vec![0f32; nh * hd]; nb];
+        for t in 0..nb {
+            for i in 0..nh {
+                qs[t][i * hd..(i + 1) * hd].copy_from_slice(&rms(&qf[t][i * 2 * hd..i * 2 * hd + hd], &qn, c.eps));
+                gates[t][i * hd..(i + 1) * hd].copy_from_slice(&qf[t][i * 2 * hd + hd..(i + 1) * 2 * hd]);
+                rope(&mut qs[t][i * hd..(i + 1) * hd], pos0 + t);
+            }
+            for i in 0..nkv {
+                let r = rms(&ks[t][i * hd..(i + 1) * hd], &kn, c.eps);
+                ks[t][i * hd..(i + 1) * hd].copy_from_slice(&r);
+                rope(&mut ks[t][i * hd..(i + 1) * hd], pos0 + t);
+            }
+        }
+        let np = st.kc[l].len() / (nkv * hd);
+        let outs: Vec<Vec<f32>> = (0..nb).into_par_iter().map(|t| {
+            let mut o = vec![0f32; nh * hd];
+            for hh in 0..nh {
+                let kvh = hh / (nh / nkv);
+                let q = &qs[t][hh * hd..(hh + 1) * hd];
+                let dot = |kk: &[f32]| kk.iter().zip(q).map(|(a, b)| a * b).sum::<f32>() / (hd as f32).sqrt();
+                let mut sc: Vec<f32> = (0..np).map(|j| dot(&st.kc[l][(j * nkv + kvh) * hd..(j * nkv + kvh + 1) * hd]))
+                    .chain((0..nb).map(|j| dot(&ks[j][kvh * hd..(kvh + 1) * hd]))).collect();
+                let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let mut sum = 0.0;
+                for v in sc.iter_mut() { *v = (*v - m).exp(); sum += *v; }
+                for j in 0..np + nb {
+                    let vv = if j < np { &st.vc[l][(j * nkv + kvh) * hd..(j * nkv + kvh + 1) * hd] } else { &vs[j - np][kvh * hd..(kvh + 1) * hd] };
+                    for d in 0..hd { o[hh * hd + d] += sc[j] / sum * vv[d]; }
+                }
+            }
+            for i in 0..o.len() { o[i] *= sigmoid(gates[t][i]); }
+            o
+        }).collect();
+        self.matmat(&p("attn_output.weight"), 0, &outs)
+    }
+
+    fn delta_preview(&self, st: &State, l: usize, hs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let c = &self.cfg;
+        let p = |s: &str| format!("blk.{l}.{s}");
+        let (dk, nv, ng) = (c.d_state, c.n_vhead, c.n_group);
+        let nb = hs.len();
+        let qkv = self.matmat(&p("attn_qkv.weight"), 0, hs);
+        let zs = self.matmat(&p("attn_gate.weight"), 0, hs);
+        let alphas = self.matmat(&p("ssm_alpha.weight"), 0, hs);
+        let (a_log, dtb) = (self.vec_f32(&p("ssm_a")), self.vec_f32(&p("ssm_dt.bias")));
+        let cw = self.vec_f32(&p("ssm_conv1d.weight"));
+        let wr = self.vec_f32(&p("ssm_conv1d.weight_right"));
+        let (lscale, hbias, hc) = (self.vec_f32(&p("ssm_bd_logit_scale.weight")), self.vec_f32(&p("ssm_bd_history.bias")), self.vec_f32(&p("ssm_bd_history.weight")));
+        let ch = qkv[0].len();
+        let (km1, kw) = (c.conv_k - 1, c.conv_k);
+        // conv over [3 committed columns ; block], plus the independent right-hand taps
+        let mut ys = vec![vec![0f32; ch]; nb];
+        for t in 0..nb {
+            for i in 0..ch {
+                let hist = &st.conv[l][i * km1..(i + 1) * km1];
+                let at = |k: usize| -> f32 { let j = t + k; if j < km1 { hist[j] } else { qkv[j - km1][i] } };
+                let mut acc = 0.0;
+                for k in 0..kw { acc += cw[i * kw + k] * at(k); }
+                for d in 1..kw.min(nb) { if t + d < nb { acc += qkv[t + d][i] * wr[i * km1 + d - 1]; } }
+                ys[t][i] = silu(acc);
+            }
+        }
+        let l2 = |v: &mut [f32]| { let r = 1.0 / (v.iter().map(|a| a * a).sum::<f32>() + 1e-6).sqrt(); for a in v.iter_mut() { *a *= r; } };
+        for y in ys.iter_mut() { for i in 0..2 * ng { l2(&mut y[i * dk..(i + 1) * dk]); } }
+        let scale = 1.0 / (dk as f32).sqrt();
+        let nw = self.vec_f32(&p("ssm_norm.weight"));
+        let kh_of = |vh: usize| if self.kv_repeat_interleave { vh / (nv / ng) } else { vh % ng };
+        let mut os = vec![vec![0f32; nv * dk]; nb];
+        for vh in 0..nv {
+            let kh = kh_of(vh);
+            let s = &st.s[l][vh * dk * dk..(vh + 1) * dk * dk];
+            let q = |t: usize| &ys[t][kh * dk..(kh + 1) * dk];
+            let k = |t: usize| &ys[t][ng * dk + kh * dk..ng * dk + (kh + 1) * dk];
+            let v = |t: usize| &ys[t][2 * ng * dk + vh * dk..2 * ng * dk + (vh + 1) * dk];
+            for t in 0..nb {
+                let g = a_log[vh] * { let a = alphas[t][vh] + dtb[vh]; if a > 20.0 { a } else { (1.0 + a.exp()).ln() } };
+                let eg = g.exp();
+                let mut hist = vec![0f32; dk];
+                for i in 0..dk { let qi = q(t)[i] * scale; for j in 0..dk { hist[j] += qi * s[i * dk + j]; } }
+                let mut lg: Vec<f32> = (0..nb).map(|u| q(t).iter().zip(k(u)).map(|(a, b)| a * b).sum::<f32>() * lscale[vh]).collect();
+                lg.push(hbias[vh] + hc[vh] * (nb as f32 / 32.0).ln());
+                let m = lg.iter().cloned().fold(f32::MIN, f32::max);
+                let mut sum = 0.0;
+                for a in lg.iter_mut() { *a = (*a - m).exp(); sum += *a; }
+                let oo = &mut os[t][vh * dk..(vh + 1) * dk];
+                for j in 0..dk { oo[j] = lg[nb] / sum * hist[j] * eg; }
+                for u in 0..nb { let w = lg[u] / sum; for j in 0..dk { oo[j] += w * v(u)[j]; } }
+                let nrm = rms(oo, &nw, c.eps);
+                for j in 0..dk { oo[j] = nrm[j] * silu(zs[t][vh * dk + j]); }
+            }
+        }
+        self.matmat(&p("ssm_out.weight"), 0, &os)
+    }
+
+    fn moe_preview(&self, l: usize, hs: &[Vec<f32>]) -> Vec<Vec<f32>> {
+        let c = &self.cfg;
+        let p = |s: &str| format!("blk.{l}.{s}");
+        let nb = hs.len();
+        let softmax = |v: &[f32]| { let m = v.iter().cloned().fold(f32::MIN, f32::max); let mut o: Vec<f32> = v.iter().map(|a| (a - m).exp()).collect(); let s: f32 = o.iter().sum(); for a in o.iter_mut() { *a /= s; } o };
+        let mut logits = self.matmat(&p("ffn_gate_inp.weight"), 0, hs);
+        // coreset: experts the whole block routes to, kept until their cumulative share reaches top_p
+        let mut totals = vec![0f32; c.n_expert];
+        for lg in &logits {
+            let pr = softmax(lg);
+            let mut idx: Vec<usize> = (0..pr.len()).collect();
+            idx.sort_by(|a, b| pr[*b].partial_cmp(&pr[*a]).unwrap());
+            for &e in idx.iter().take(c.n_used) { totals[e] += pr[e]; }
+        }
+        let sum: f32 = totals.iter().sum::<f32>().max(1e-9);
+        let mut order: Vec<usize> = (0..c.n_expert).collect();
+        order.sort_by(|a, b| totals[*b].partial_cmp(&totals[*a]).unwrap());
+        let mut allowed = vec![false; c.n_expert];
+        let mut cum = 0.0;
+        for (r, &e) in order.iter().enumerate() { let pe = totals[e] / sum; if r == 0 || cum < 0.9 { allowed[e] = true; } cum += pe; }
+        for lg in logits.iter_mut() { for e in 0..c.n_expert { if !allowed[e] { lg[e] = f32::NEG_INFINITY; } } }
+        let mut route: Vec<Vec<(usize, f32)>> = vec![vec![]; c.n_expert];
+        for (t, lg) in logits.iter().enumerate() {
+            let pr = softmax(lg);
+            let mut idx: Vec<usize> = (0..pr.len()).collect();
+            idx.sort_by(|a, b| pr[*b].partial_cmp(&pr[*a]).unwrap());
+            idx.truncate(c.n_used);
+            let tot: f32 = idx.iter().map(|i| pr[*i]).sum();
+            for &e in &idx { route[e].push((t, pr[e] / tot)); }
+        }
+        let mut out = vec![vec![0f32; c.n_embd]; nb];
+        let ffn = |g: &str, u: &str, d: &str, e: usize, items: &[(usize, f32)], out: &mut Vec<Vec<f32>>| {
+            let xs: Vec<Vec<f32>> = items.iter().map(|(t, _)| hs[*t].clone()).collect();
+            let gg = self.matmat(g, e, &xs);
+            let uu = self.matmat(u, e, &xs);
+            let a: Vec<Vec<f32>> = gg.iter().zip(&uu).map(|(g, u)| g.iter().zip(u).map(|(g, u)| silu(*g) * u).collect()).collect();
+            let r = self.matmat(d, e, &a);
+            for ((t, w), r) in items.iter().zip(&r) { for i in 0..r.len() { out[*t][i] += w * r[i]; } }
+        };
+        for e in 0..c.n_expert {
+            if route[e].is_empty() { continue; }
+            ffn(&p("ffn_gate_exps.weight"), &p("ffn_up_exps.weight"), &p("ffn_down_exps.weight"), e, &route[e], &mut out);
+        }
+        let sgw = self.vec_f32(&p("ffn_gate_inp_shexp.weight"));
+        let items: Vec<(usize, f32)> = (0..nb).map(|t| (t, sigmoid(sgw.iter().zip(&hs[t]).map(|(a, b)| a * b).sum::<f32>()))).collect();
+        ffn(&p("ffn_gate_shexp.weight"), &p("ffn_up_shexp.weight"), &p("ffn_down_shexp.weight"), 0, &items, &mut out);
         out
     }
 }

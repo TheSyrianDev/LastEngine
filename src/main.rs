@@ -83,6 +83,58 @@ async fn main() {
             ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
         }
+        cli::Cmd::CloverDraft { path, prompt, blocks } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let m = cpu_ref::Model::load(&path, &g);
+            let ids = tk.encode(&prompt);
+            let mut st = m.new_state();
+            let mut logits = vec![];
+            for (i, id) in ids.iter().enumerate() { logits = m.forward(&mut st, *id, i); }
+            let mut pos = ids.len();
+            let argmax = |l: &[f32]| l.iter().enumerate().fold((0usize, f32::MIN), |a, (i, v)| if *v > a.1 { (i, *v) } else { a }).0 as u32;
+            let mask = 151669u32;
+            let bs = 32usize;
+            let mut gen: Vec<u32> = vec![];
+            for b in 0..blocks {
+                // AR reference for the block, from a copy of the state
+                let mut st2 = st.clone();
+                let mut l2 = logits.clone();
+                let mut ar = vec![];
+                for j in 0..bs { let t = argmax(&l2); ar.push(t); l2 = m.forward(&mut st2, t, pos + j); }
+                // draft: iterative denoising
+                let mut blk = vec![mask; bs];
+                let t0 = std::time::Instant::now();
+                let mut iters = 0;
+                while blk.iter().any(|t| *t == mask) {
+                    iters += 1;
+                    let lg = m.preview(&st, &blk, pos);
+                    // logits at position i predict token i (same-position logits); mask id is never emitted
+                    let mut best: Option<(usize, u32, f32)> = None;
+                    let mut taken = 0;
+                    let mut cand = vec![];
+                    for i in 0..bs {
+                        if blk[i] != mask { continue; }
+                        let mut l = lg[i].clone(); l[mask as usize] = f32::NEG_INFINITY;
+                        let a = argmax(&l);
+                        let mx = l[a as usize];
+                        let conf = 1.0 / l.iter().map(|v| (v - mx).exp()).sum::<f32>();
+                        cand.push((i, a, conf));
+                        if best.map_or(true, |b| conf > b.2) { best = Some((i, a, conf)); }
+                    }
+                    for &(i, a, conf) in &cand { if conf > 0.95 { blk[i] = a; taken += 1; } }
+                    if taken == 0 { let (i, a, _) = best.unwrap(); blk[i] = a; }
+                    eprintln!("  iter {iters}: {} pending", blk.iter().filter(|t| **t == mask).count());
+                }
+                let acc = blk.iter().zip(&ar).take_while(|(a, b)| a == b).count();
+                let same = blk.iter().zip(&ar).filter(|(a, b)| a == b).count();
+                println!("block {b}: {iters} denoise iters in {:.1}s; prefix match {acc}/{bs}, positional match {same}/{bs}", t0.elapsed().as_secs_f32());
+                println!("  draft: {:?}", tk.decode_bytes(&blk).iter().map(|b| *b as char).collect::<String>());
+                println!("  AR   : {:?}", tk.decode_bytes(&ar).iter().map(|b| *b as char).collect::<String>());
+                for j in 0..bs { logits = m.forward(&mut st, ar[j], pos + j); }
+                pos += bs; gen.extend(&ar);
+            }
+        }
         cli::Cmd::Ref { path, prompt, top } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");

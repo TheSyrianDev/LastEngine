@@ -21,6 +21,8 @@ pub enum Cmd {
     /// GPU forward: top-N logprobs + 32-token greedy decode.
     Gpu { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize, #[arg(default_value_t = 128)] margin: usize },
     /// CPU reference: print top-N next-token logprobs for PROMPT.
+    /// Clover block-diffusion draft quality check on the CPU reference (draft a block, compare with greedy AR)
+    CloverDraft { path: String, prompt: String, #[arg(default_value_t = 1)] blocks: usize },
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },
     Dequant { path: String, name: String, n: usize, out: String },
     Template { path: String },
