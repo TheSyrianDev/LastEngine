@@ -26,11 +26,13 @@ pub fn block_info(ty: u32) -> Option<(usize, usize)> {
         F32 => (1, 4), F16 | BF16 => (1, 2),
         Q4_0 => (32, 18), Q8_0 => (32, 34),
         Q3_K => (256, 110), Q4_K => (256, 144), Q5_K => (256, 176), Q6_K => (256, 210), IQ3_XXS => (256, 98), IQ2_XXS => (256, 66), IQ2_S => (256, 82),
-        _ => return None,
+        _ => { let (v, b, _) = crate::quant_ik::info(ty)?; (v, b) }
     })
 }
 
-pub fn row_bytes(ty: u32, n: usize) -> usize { let (v, b) = block_info(ty).expect("quant type"); n / v * b }
+pub fn row_header(ty: u32) -> usize { crate::quant_ik::info(ty).map_or(0, |i| i.2) }
+
+pub fn row_bytes(ty: u32, n: usize) -> usize { let (v, b) = block_info(ty).expect("quant type"); n / v * b + row_header(ty) }
 
 pub fn f16_to_f32(h: u16) -> f32 {
     let s = ((h >> 15) & 1) as u32;
@@ -163,7 +165,7 @@ pub fn dequant_row(ty: u32, src: &[u8], out: &mut [f32]) {
                 }
             }
         },
-        _ => panic!("unsupported quant type {ty}"),
+        _ => if !crate::quant_ik::dequant(ty, src, out) { panic!("unsupported quant type {ty}") },
     }
 }
 

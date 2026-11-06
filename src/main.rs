@@ -9,6 +9,9 @@ mod gpu;
 mod local;
 mod server;
 mod quant;
+mod quant_ik;
+#[path = "quant_ik_tables.rs"]
+mod quant_ik_tables;
 mod template;
 mod tokenizer;
 
