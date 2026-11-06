@@ -7,6 +7,7 @@ use std::{collections::HashMap, sync::Arc};
 
 type Dp = CUdeviceptr;
 mod prefill;
+pub mod dense;
 fn mk_events() -> [sys::CUevent; 4] { let mut e = [std::ptr::null_mut(); 4]; for x in e.iter_mut() { unsafe { sys::cuEventCreate(x, 2).result().unwrap() }; } e }
 fn dalloc(bytes: usize) -> Dp { unsafe { result::malloc_sync(bytes.max(16)).expect("cuda alloc") } }
 fn dup<T>(data: &[T]) -> Dp { let p = dalloc(std::mem::size_of_val(data)); unsafe { result::memcpy_htod_sync(p, data).unwrap() }; p }
@@ -655,6 +656,7 @@ pub fn kernel_source() -> String {
             src.push_str("};\n");
         }
         src.push_str(include_str!("cuda/kernels.cu"));
+        src.push_str(include_str!("cuda/dense.cu"));
     src
 }
 

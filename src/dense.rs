@@ -10,15 +10,15 @@ use std::collections::HashMap;
 pub enum Kind { Llama, Lfm3 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum LayerKind { Attn { swa: bool }, Conv }
+pub(crate) enum LayerKind { Attn { swa: bool }, Conv }
 
-struct T { ty: u32, off: usize, dims: Vec<usize> }
+pub(crate) struct T { pub(crate) ty: u32, off: usize, pub(crate) dims: Vec<usize> }
 
 pub struct Dense {
-    pub kind: Kind, mmap: Mmap, t: HashMap<String, T>,
+    pub kind: Kind, mmap: Mmap, pub(crate) t: HashMap<String, T>,
     pub n_layer: usize, pub n_embd: usize, pub n_head: usize, pub n_kv: usize, pub head_dim: usize, pub rope_dim: usize,
     pub eps: f32, pub rope_base: f32, pub rope_base_swa: f32, pub window: usize, pub l_cache: usize, pub vocab: usize,
-    layers: Vec<LayerKind>, neox: bool,
+    pub(crate) layers: Vec<LayerKind>, pub(crate) neox: bool,
 }
 
 #[derive(Clone)]
@@ -72,12 +72,12 @@ impl Dense {
         State { kc: vec![Vec::new(); self.n_layer], vc: vec![Vec::new(); self.n_layer],
                 conv: (0..self.n_layer).map(|l| if self.layers[l] == LayerKind::Conv { vec![0.0; self.n_embd * (self.l_cache - 1)] } else { Vec::new() }).collect() }
     }
-    fn bytes(&self, name: &str) -> (&T, &[u8]) {
+    pub(crate) fn bytes(&self, name: &str) -> (&T, &[u8]) {
         let t = self.t.get(name).unwrap_or_else(|| panic!("missing tensor {name}"));
         let n: usize = t.dims.iter().product();
         (t, &self.mmap[t.off..t.off + quant::row_bytes(t.ty, n)])
     }
-    fn vec_f32(&self, name: &str) -> Vec<f32> {
+    pub(crate) fn vec_f32(&self, name: &str) -> Vec<f32> {
         let (t, b) = self.bytes(name);
         let mut o = vec![0.0; t.dims.iter().product()];
         quant::dequant_row(t.ty, b, &mut o); o
@@ -188,19 +188,30 @@ impl Dense {
     }
 }
 
-/// Stateful wrapper with the same surface `Local` uses on the GPU engine.
-pub struct DenseEng { m: Dense, st: State, pos: usize, snap: Option<State>, ctx: usize }
+/// Stateful engine with the same surface `Local` uses for the Qwen GPU engine: CUDA when available, else the CPU path.
+pub enum DenseEng { Cpu { m: Dense, st: State, pos: usize, snap: Option<State>, ctx: usize }, Cuda(Box<crate::gpu::dense::DenseGpu>) }
 impl DenseEng {
-    pub fn new(m: Dense, ctx: usize) -> DenseEng { let st = m.new_state(); DenseEng { m, st, pos: 0, snap: None, ctx } }
-    pub fn pos(&self) -> usize { self.pos }
-    pub fn reset(&mut self) { self.st = self.m.new_state(); self.pos = 0; }
-    pub fn forward(&mut self, t: u32) -> Vec<f32> { let l = self.m.forward(&mut self.st, t, self.pos); self.pos += 1; l }
-    pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
-        assert!(self.pos + ids.len() <= self.ctx.max(1) + 1);
-        let mut l = vec![]; for &t in ids { l = self.forward(t); } l
+    pub fn new(m: Dense, ctx: usize) -> DenseEng {
+        if std::env::var("LE_CPU").is_err() && std::panic::catch_unwind(|| cudarc::driver::CudaContext::new(0).is_ok()).unwrap_or(false) {
+            return DenseEng::Cuda(Box::new(crate::gpu::dense::DenseGpu::new(m, ctx)));
+        }
+        let st = m.new_state(); DenseEng::Cpu { m, st, pos: 0, snap: None, ctx }
     }
-    pub fn snap_recurrent(&mut self) -> Vec<u8> { self.snap = Some(self.st.clone()); Vec::new() }
-    pub fn restore_recurrent(&mut self, _b: &[u8], pos: usize) {
-        if let Some(s) = &self.snap { self.st = s.clone(); self.pos = pos; }
+    pub fn pos(&self) -> usize { match self { DenseEng::Cpu { pos, .. } => *pos, DenseEng::Cuda(g) => g.pos() } }
+    pub fn reset(&mut self) { match self { DenseEng::Cpu { m, st, pos, .. } => { *st = m.new_state(); *pos = 0; } DenseEng::Cuda(g) => g.reset() } }
+    pub fn forward(&mut self, t: u32) -> Vec<f32> {
+        match self { DenseEng::Cpu { m, st, pos, .. } => { let l = m.forward(st, t, *pos); *pos += 1; l } DenseEng::Cuda(g) => g.forward(t) }
+    }
+    pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> {
+        match self {
+            DenseEng::Cpu { ctx, pos, .. } => { assert!(*pos + ids.len() <= (*ctx).max(1) + 1); let mut l = vec![]; for &t in ids { l = self.forward(t); } l }
+            DenseEng::Cuda(g) => g.prefill(ids),
+        }
+    }
+    pub fn snap_recurrent(&mut self) -> Vec<u8> {
+        match self { DenseEng::Cpu { st, snap, .. } => { *snap = Some(st.clone()); Vec::new() } DenseEng::Cuda(g) => g.snap_recurrent() }
+    }
+    pub fn restore_recurrent(&mut self, b: &[u8], p: usize) {
+        match self { DenseEng::Cpu { st, snap, pos, .. } => { if let Some(s) = snap { *st = s.clone(); *pos = p; } } DenseEng::Cuda(g) => g.restore_recurrent(b, p) }
     }
 }
