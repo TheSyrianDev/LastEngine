@@ -3,6 +3,9 @@
 #[path = "quant_iq3xxs_grid.rs"]
 mod iq3xxs_grid;
 use iq3xxs_grid::IQ3XXS_GRID;
+#[path = "quant_iq2_grids.rs"]
+mod iq2_grids;
+use iq2_grids::{IQ2S_GRID, IQ2XXS_GRID};
 
 pub const F32: u32 = 0;
 pub const F16: u32 = 1;
@@ -13,6 +16,8 @@ pub const Q4_K: u32 = 12;
 pub const Q5_K: u32 = 13;
 pub const Q6_K: u32 = 14;
 pub const IQ3_XXS: u32 = 18;
+pub const IQ2_XXS: u32 = 16;
+pub const IQ2_S: u32 = 22;
 pub const BF16: u32 = 30;
 
 /// (values per block, bytes per block)
@@ -20,7 +25,7 @@ pub fn block_info(ty: u32) -> Option<(usize, usize)> {
     Some(match ty {
         F32 => (1, 4), F16 | BF16 => (1, 2),
         Q4_0 => (32, 18), Q8_0 => (32, 34),
-        Q3_K => (256, 110), Q4_K => (256, 144), Q5_K => (256, 176), Q6_K => (256, 210), IQ3_XXS => (256, 98),
+        Q3_K => (256, 110), Q4_K => (256, 144), Q5_K => (256, 176), Q6_K => (256, 210), IQ3_XXS => (256, 98), IQ2_XXS => (256, 66), IQ2_S => (256, 82),
         _ => return None,
     })
 }
@@ -132,8 +137,36 @@ pub fn dequant_row(ty: u32, src: &[u8], out: &mut [f32]) {
                 }
             }
         },
+        IQ2_XXS => for (b, o) in src.chunks_exact(66).zip(out.chunks_exact_mut(256)) {
+            let (d, qs) = (h(b, 0), &b[2..66]);
+            for ib in 0..8 {
+                let q = &qs[ib * 8..ib * 8 + 8];
+                let aux = u32::from_le_bytes(q[4..8].try_into().unwrap());
+                let db = d * (0.5 + (aux >> 28) as f32) * 0.25;
+                for l in 0..4 {
+                    let sgn = ksign(((aux >> (7 * l)) & 127) as usize);
+                    let g = &IQ2XXS_GRID[q[l] as usize];
+                    for j in 0..8 { o[ib * 32 + l * 8 + j] = db * g[j] as f32 * if sgn >> j & 1 != 0 { -1.0 } else { 1.0 }; }
+                }
+            }
+        },
+        IQ2_S => for (b, o) in src.chunks_exact(82).zip(out.chunks_exact_mut(256)) {
+            let (d, qs, qh, sc) = (h(b, 0), &b[2..34], &b[66..74], &b[74..82]);
+            let signs = &b[34..66];
+            for ib in 0..8 {
+                let db = [d * (0.5 + (sc[ib] & 15) as f32) * 0.25, d * (0.5 + (sc[ib] >> 4) as f32) * 0.25];
+                for l in 0..4 {
+                    let gi = qs[ib * 4 + l] as usize | ((qh[ib] as usize) << (8 - 2 * l) & 0x300);
+                    let g = &IQ2S_GRID[gi];
+                    let sgn = signs[ib * 4 + l];
+                    for j in 0..8 { o[ib * 32 + l * 8 + j] = db[l / 2] * g[j] as f32 * if sgn >> j & 1 != 0 { -1.0 } else { 1.0 }; }
+                }
+            }
+        },
         _ => panic!("unsupported quant type {ty}"),
     }
 }
 
 pub fn iq3_grid() -> &'static [[u8; 4]; 256] { &IQ3XXS_GRID }
+pub fn iq2xxs_grid() -> &'static [[u8; 8]; 256] { &IQ2XXS_GRID }
+pub fn iq2s_grid() -> &'static [[u8; 8]; 1024] { &IQ2S_GRID }

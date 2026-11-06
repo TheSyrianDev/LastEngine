@@ -45,12 +45,12 @@ impl Gpu {
         let pf = self.pf.as_ref().unwrap();
         let units = cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
         if self.mmq {
-            let name = match ty { 2 => "mmq_2", 8 => "mmq_8", 11 => "mmq_11", 12 => "mmq_12", 13 => "mmq_13", 14 => "mmq_14", 18 => "mmq_18", t => panic!("no mmq kernel for type {t}") };
+            let name = match ty { 2 => "mmq_2", 8 => "mmq_8", 11 => "mmq_11", 12 => "mmq_12", 13 => "mmq_13", 14 => "mmq_14", 16 => "mmq_16", 18 => "mmq_18", 22 => "mmq_22", t => panic!("no mmq kernel for type {t}") };
             self.launch3(name, (rows.div_ceil(64) as u32, max_n.div_ceil(64) as u32, slots as u32), 256, 0,
                 &[P(ptrs), P(off), P(ii), P(oi), P(pf.xq[set]), P(pf.xd[set]), P(pf.xs[set]), P(out), I(rows as i32), I(cols as i32)]);
             return;
         }
-        let name = match ty { 2 => "mm_2", 8 => "mm_8", 11 => "mm_11", 12 => "mm_12", 13 => "mm_13", 14 => "mm_14", 18 => "mm_18", t => panic!("no mm kernel for type {t}") };
+        let name = match ty { 2 => "mm_2", 8 => "mm_8", 11 => "mm_11", 12 => "mm_12", 13 => "mm_13", 14 => "mm_14", 16 => "mm_16", 18 => "mm_18", 22 => "mm_22", t => panic!("no mm kernel for type {t}") };
         self.launch3(name, (rows.div_ceil(rpb) as u32, max_n.div_ceil(8) as u32, slots as u32), 256, (8 * units * 44) as u32,
             &[P(ptrs), P(off), P(ii), P(oi), P(pf.xq[set]), P(pf.xd[set]), P(pf.xs[set]), P(out), I(rows as i32), I(cols as i32)]);
     }

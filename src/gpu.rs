@@ -63,6 +63,11 @@ impl Gpu {
         let mut src = String::from("#include <cuda_fp16.h>\n__device__ const unsigned int IQ3_G32[256] = {");
         for g in crate::quant::iq3_grid().iter() { src.push_str(&format!("{}u,", u32::from_le_bytes(*g))); }
         src.push_str("};\n");
+        for (nm, g2) in [("IQ2XXS_G", crate::quant::iq2xxs_grid().iter().map(|g| *g).collect::<Vec<_>>()), ("IQ2S_G", crate::quant::iq2s_grid().iter().map(|g| *g).collect::<Vec<_>>())] {
+            src.push_str(&format!("__device__ const unsigned int {nm}[{}] = {{", g2.len() * 2));
+            for g in g2 { src.push_str(&format!("{}u,{}u,", u32::from_le_bytes(g[0..4].try_into().unwrap()), u32::from_le_bytes(g[4..8].try_into().unwrap()))); }
+            src.push_str("};\n");
+        }
         for (nm, bytes, n) in [("TCQ_CB_K", &include_bytes!("../assets/tcq3_cb_k.bin")[..], 512), ("TCQ_CB_V", &include_bytes!("../assets/tcq3_cb_v.bin")[..], 512),
                                ("TCQ_S1", &include_bytes!("../assets/tcq3_signs1.bin")[..], 128), ("TCQ_S2", &include_bytes!("../assets/tcq3_signs2.bin")[..], 128)] {
             src.push_str(&format!("__device__ const float {nm}[{n}] = {{"));
@@ -74,9 +79,9 @@ impl Gpu {
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_18", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_18", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
+        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_18", "matvec_22", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_18", "mmq_22", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
-                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_18", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
+                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_18", "mm_22", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         { use cudarc::driver::sys::CUfunction_attribute as A; f.get("attn_flash_256").unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 72 * 1024).unwrap(); }
@@ -234,7 +239,7 @@ impl Gpu {
             self.launch("matvecf", (rows.div_ceil(4) as u32, slots as u32), 128, (cols * 4) as u32, &[P(ptrs), P(x), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
             return;
         }
-        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 18 => "matvec_18", t => panic!("no kernel for type {t}") };
+        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 16 => "matvec_16", 18 => "matvec_18", 22 => "matvec_22", t => panic!("no kernel for type {t}") };
         let units = cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
         self.launch(name, (rows.div_ceil(rpb) as u32, slots as u32), 256, (units * 36 + units * 8) as u32,
             &[P(ptrs), P(self.xqb[set]), P(self.xdb[set]), P(self.xsb[set]), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);

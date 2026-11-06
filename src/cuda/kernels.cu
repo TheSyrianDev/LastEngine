@@ -74,6 +74,25 @@ template <> __device__ float udot<14>(const u8* b, int j, const int* xq, float d
   }
   return h2f(b + 208) * dx * (float)(sc[0] * a0 + sc[1] * a1);
 }
+__device__ __forceinline__ u32 sgmask4(u32 nib) { return (nib & 1 ? 0xFFu : 0) | (nib & 2 ? 0xFF00u : 0) | (nib & 4 ? 0xFF0000u : 0) | (nib & 8 ? 0xFF000000u : 0); }
+template <> __device__ float udot<16>(const u8* b, int j, const int* xq, float dx, int) {
+  const u8* q = b + 2 + j * 8; u32 aux = (u32)*(const u16*)(q + 4) | ((u32)*(const u16*)(q + 6) << 16);
+  int a = 0;
+  for (int l = 0; l < 4; l++) {
+    u32 si = (aux >> (7 * l)) & 127; u32 sg = si | ((__popc(si) & 1) << 7);
+    for (int h = 0; h < 2; h++) { u32 m = sgmask4((sg >> (4 * h)) & 15); a = DP((int)__vsub4(IQ2XXS_G[q[l] * 2 + h] ^ m, m), xq[2 * l + h], a); }
+  }
+  return h2f(b) * (0.5f + (float)(aux >> 28)) * 0.25f * dx * (float)a;
+}
+template <> __device__ float udot<22>(const u8* b, int j, const int* xq, float dx, int) {
+  const u8* qs = b + 2 + j * 4; const u8* sn = b + 34 + j * 4; u32 qh = b[66 + j]; u32 sc = b[74 + j];
+  int a0 = 0, a1 = 0;
+  for (int l = 0; l < 4; l++) {
+    u32 gi = qs[l] | ((qh << (8 - 2 * l)) & 0x300); u32 sb = sn[l];
+    for (int h = 0; h < 2; h++) { u32 m = sgmask4((sb >> (4 * h)) & 15); int g = (int)__vsub4(IQ2S_G[gi * 2 + h] ^ m, m); if (l < 2) a0 = DP(g, xq[2 * l + h], a0); else a1 = DP(g, xq[2 * l + h], a1); }
+  }
+  return h2f(b) * 0.25f * dx * ((0.5f + (float)(sc & 15)) * (float)a0 + (0.5f + (float)(sc >> 4)) * (float)a1);
+}
 template <> __device__ float udot<18>(const u8* b, int j, const int* xq, float dx, int) {
   const u8* qs = b + 2 + j * 8; u32 aux = (u32)*(const u16*)(b + 66 + j * 4) | ((u32)*(const u16*)(b + 68 + j * 4) << 16);
   int a = 0;
@@ -136,6 +155,22 @@ template <> __device__ void uload<18>(const u8* b, int j, int* w, float& s0, flo
   }
   s0 = s1 = h2f(b) * (0.5f + (float)(aux >> 28)) * 0.5f; mn = 0.f;
 }
+template <> __device__ void uload<16>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  const u8* q = b + 2 + j * 8; u32 aux = (u32)*(const u16*)(q + 4) | ((u32)*(const u16*)(q + 6) << 16);
+  for (int l = 0; l < 4; l++) {
+    u32 si = (aux >> (7 * l)) & 127; u32 sg = si | ((__popc(si) & 1) << 7);
+    for (int h = 0; h < 2; h++) { u32 m = sgmask4((sg >> (4 * h)) & 15); w[2 * l + h] = (int)__vsub4(IQ2XXS_G[q[l] * 2 + h] ^ m, m); }
+  }
+  s0 = s1 = h2f(b) * (0.5f + (float)(aux >> 28)) * 0.25f; mn = 0.f;
+}
+template <> __device__ void uload<22>(const u8* b, int j, int* w, float& s0, float& s1, float& mn) {
+  const u8* qs = b + 2 + j * 4; const u8* sn = b + 34 + j * 4; u32 qh = b[66 + j]; u32 sc = b[74 + j];
+  for (int l = 0; l < 4; l++) {
+    u32 gi = qs[l] | ((qh << (8 - 2 * l)) & 0x300); u32 sb = sn[l];
+    for (int h = 0; h < 2; h++) { u32 m = sgmask4((sb >> (4 * h)) & 15); w[2 * l + h] = (int)__vsub4(IQ2S_G[gi * 2 + h] ^ m, m); }
+  }
+  float d = h2f(b) * 0.25f; s0 = d * (0.5f + (float)(sc & 15)); s1 = d * (0.5f + (float)(sc >> 4)); mn = 0.f;
+}
 template <int TY> struct Q { static const int UB = 8, BYTES = 0; };
 template <> struct Q<2>  { static const int UB = 1, BYTES = 18; };
 template <> struct Q<8>  { static const int UB = 1, BYTES = 34; };
@@ -144,6 +179,8 @@ template <> struct Q<12> { static const int UB = 8, BYTES = 144; };
 template <> struct Q<13> { static const int UB = 8, BYTES = 176; };
 template <> struct Q<14> { static const int UB = 8, BYTES = 210; };
 template <> struct Q<18> { static const int UB = 8, BYTES = 98; };
+template <> struct Q<16> { static const int UB = 8, BYTES = 66; };
+template <> struct Q<22> { static const int UB = 8, BYTES = 82; };
 
 // out[slot*rows + r] = W[slot][r,:] . x[slot]. Quantised activations: xq bytes, xd scales, xs sums, slot stride xstride elements.
 // 256 threads = 8 warps; a warp covers 32/lpr rows, lpr = min(32, cols/32) lanes per row.
@@ -168,7 +205,7 @@ __device__ void mv_impl(const u8* const* ptrs, const signed char* xq, const floa
   if (ok && li == 0) out[(size_t)slot * rows + r] = acc;
 }
 #define MV(TY) extern "C" __global__ void matvec_##TY(const u8* const* p, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols, int xstride) { mv_impl<TY>(p, xq, xd, xs, o, rows, cols, xstride); }
-MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(18)
+MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(16) MV(18) MV(22)
 
 // F32 matvec (router, tiny projections): same shape
 extern "C" __global__ void matvecf(const u8* const* p, const float* x, float* o, int rows, int cols, int xstride) {
@@ -489,7 +526,7 @@ __device__ void mm_impl(const u8* const* ptrs, const int* off, const int* in_idx
   if (ok && li == 0) for (int j = 0; j < nt; j++) { int orow = out_idx ? out_idx[base + j] : base + j; out[(size_t)orow * rows + r] = acc[j]; }
 }
 #define MM(TY) extern "C" __global__ void mm_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mm_impl<TY>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
-MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(18)
+MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(16) MM(18) MM(22)
 
 // F32 matmul O[t][r] = W[r].X[t] for T tokens. grid (ceil(rows/8), ceil(T/32)), 256 threads.
 extern "C" __global__ void mmf(const float* W, const float* X, float* O, int rows, int cols, int T) {
@@ -760,7 +797,7 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
     }
 }
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
-MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(18, false)
+MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(16, false) MMQ(18, false) MMQ(22, true)
 
 // F32 tiled matmul O[t][r] = W[r].X[t]; block 16x16, each thread 4x4 outputs; tile 64 rows x 64 tokens, K step 16. grid (ceil(rows/64), ceil(T/64)).
 extern "C" __global__ void mmf2(const float* W, const float* X, float* O, int rows, int cols, int T) {
