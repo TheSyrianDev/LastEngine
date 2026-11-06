@@ -1,6 +1,6 @@
 //! CUDA backend for qwen35moe: non-expert weights resident in VRAM, routed experts through a VRAM slot cache fed from host memory.
 use crate::cpu_ref::Model;
-use crate::quant_ik_tables::{IQ1S_GRID, IQ2XS_GRID, IQ3S_GRID};
+use crate::quant_ik_tables::*;
 use cudarc::driver::{result, sys, sys::CUdeviceptr, CudaContext, CudaFunction, CudaStream, LaunchConfig, PushKernelArg};
 use cudarc::nvrtc::{compile_ptx_with_opts, CompileOptions};
 use std::{collections::HashMap, sync::Arc};
@@ -66,9 +66,9 @@ impl Gpu {
         let ptx = compile_ptx_with_opts(src, opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_17", "matvec_18", "matvec_19", "matvec_20", "matvec_21", "matvec_22", "matvec_23", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_17", "mmq_18", "mmq_19", "mmq_20", "mmq_21", "mmq_22", "mmq_23", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
+        for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_17", "matvec_18", "matvec_19", "matvec_20", "matvec_21", "matvec_22", "matvec_23", "matvec_29", "matvec_134", "matvec_135", "matvec_137", "matvec_138", "matvec_139", "matvec_140", "matvec_141", "matvec_144", "matvec_145", "matvec_146", "matvec_152", "matvec_153", "matvec_154", "matvec_155", "matvec_156", "matvec_157", "matvec_158", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_17", "mmq_18", "mmq_19", "mmq_20", "mmq_21", "mmq_22", "mmq_23", "mmq_29", "mmq_134", "mmq_135", "mmq_137", "mmq_138", "mmq_139", "mmq_140", "mmq_141", "mmq_144", "mmq_145", "mmq_146", "mmq_152", "mmq_153", "mmq_154", "mmq_155", "mmq_156", "mmq_157", "mmq_158", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
                   "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
-                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_17", "mm_18", "mm_19", "mm_20", "mm_21", "mm_22", "mm_23", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
+                  "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_17", "mm_18", "mm_19", "mm_20", "mm_21", "mm_22", "mm_23", "mm_29", "mm_134", "mm_135", "mm_137", "mm_138", "mm_139", "mm_140", "mm_141", "mm_144", "mm_145", "mm_146", "mm_152", "mm_153", "mm_154", "mm_155", "mm_156", "mm_157", "mm_158", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         { use cudarc::driver::sys::CUfunction_attribute as A; f.get("attn_flash_256").unwrap().set_attribute(A::CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES, 72 * 1024).unwrap(); }
@@ -226,7 +226,7 @@ impl Gpu {
             self.launch("matvecf", (rows.div_ceil(4) as u32, slots as u32), 128, (cols * 4) as u32, &[P(ptrs), P(x), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
             return;
         }
-        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 16 => "matvec_16", 17 => "matvec_17", 19 => "matvec_19", 20 => "matvec_20", 21 => "matvec_21", 23 => "matvec_23", 18 => "matvec_18", 22 => "matvec_22", t => panic!("no kernel for type {t}") };
+        let name = match ty { 2 => "matvec_2", 8 => "matvec_8", 11 => "matvec_11", 12 => "matvec_12", 13 => "matvec_13", 14 => "matvec_14", 16 => "matvec_16", 17 => "matvec_17", 19 => "matvec_19", 20 => "matvec_20", 21 => "matvec_21", 23 => "matvec_23", 18 => "matvec_18", 22 => "matvec_22", 29 => "matvec_29", 134 => "matvec_134", 135 => "matvec_135", 137 => "matvec_137", 138 => "matvec_138", 139 => "matvec_139", 140 => "matvec_140", 141 => "matvec_141", 144 => "matvec_144", 145 => "matvec_145", 146 => "matvec_146", 152 => "matvec_152", 153 => "matvec_153", 154 => "matvec_154", 155 => "matvec_155", 156 => "matvec_156", 157 => "matvec_157", 158 => "matvec_158", t => panic!("no kernel for type {t}") };
         let units = cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
         self.launch(name, (rows.div_ceil(rpb) as u32, slots as u32), 256, (units * 36 + units * 8) as u32,
             &[P(ptrs), P(self.xqb[set]), P(self.xdb[set]), P(self.xsb[set]), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
@@ -606,6 +606,13 @@ pub fn kernel_source() -> String {
             for ch in bytes.chunks(4) { src.push_str(&format!("{:e}f,", f32::from_le_bytes(ch.try_into().unwrap()))); }
             src.push_str("};\n");
         }
+        for (nm, ty, v) in [("IQ2NL_V", "signed char", IQ2NL_VALUES.iter().map(|&x| x as i32).collect::<Vec<_>>()), ("IQ3NL_V", "signed char", IQ3NL_VALUES.iter().map(|&x| x as i32).collect()),
+                            ("IQ4K_V", "signed char", IQ4K_VALUES.iter().map(|&x| x as i32).collect()), ("IQ5NL_V", "signed char", IQ5NL_VALUES.iter().map(|&x| x as i32).collect()),
+                            ("IQ6NL_V", "signed char", IQ6NL_VALUES.iter().map(|&x| x as i32).collect()), ("IQ2KL_V", "unsigned short", IQ2KL_VALUES.iter().map(|&x| x as i32).collect())] {
+            src.push_str(&format!("__device__ const {ty} {nm}[{}] = {{", v.len()));
+            for x in v { src.push_str(&format!("{x},")); }
+            src.push_str("};\n");
+        }
         src.push_str(include_str!("cuda/kernels.cu"));
     src
 }
@@ -630,7 +637,7 @@ mod quant_tests {
         let nu = units as i32;
         unsafe { b.arg(&xd).arg(&xq).arg(&xdv).arg(&xs).arg(&nu).launch(LaunchConfig { grid_dim: (units.div_ceil(8) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: 0 }).unwrap(); }
         let mut bad = vec![];
-        for ty in [11u32, 16, 17, 18, 19, 20, 21, 22, 23] {
+        for ty in [16u32, 17, 18, 19, 20, 21, 22, 23, 29, 134, 135, 137, 138, 139, 140, 141, 144, 145, 146, 152, 153, 154, 155, 156, 157, 158] {
             let Ok(q) = std::fs::read(format!("{dir}/or_{ty}.q")) else { continue };
             if ty == 11 { continue; }
             let rb = crate::quant::row_bytes(ty, cols);

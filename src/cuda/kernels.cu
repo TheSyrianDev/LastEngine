@@ -171,16 +171,19 @@ template <> __device__ void uload<22>(const u8* b, int j, int* w, float& s0, flo
   }
   float d = h2f(b) * 0.25f; s0 = d * (0.5f + (float)(sc & 15)); s1 = d * (0.5f + (float)(sc >> 4)); mn = 0.f;
 }
-template <int TY> struct Q { static const int UB = 8, BYTES = 0; };
-template <> struct Q<2>  { static const int UB = 1, BYTES = 18; };
-template <> struct Q<8>  { static const int UB = 1, BYTES = 34; };
-template <> struct Q<11> { static const int UB = 8, BYTES = 110; };
-template <> struct Q<12> { static const int UB = 8, BYTES = 144; };
-template <> struct Q<13> { static const int UB = 8, BYTES = 176; };
-template <> struct Q<14> { static const int UB = 8, BYTES = 210; };
-template <> struct Q<18> { static const int UB = 8, BYTES = 98; };
-template <> struct Q<16> { static const int UB = 8, BYTES = 66; };
-template <> struct Q<22> { static const int UB = 8, BYTES = 82; };
+template <int TY> struct Q { static const int UB = 8, BYTES = 0, HDR = 0, NEW = 0; };
+#define QN(ty, ub, by, hdr) template <> struct Q<ty> { static const int UB = ub, BYTES = by, HDR = hdr, NEW = 1; };
+QN(29, 8, 56, 0) QN(134, 2, 13, 2) QN(135, 2, 16, 4) QN(137, 8, 76, 0) QN(138, 8, 110, 0) QN(139, 8, 144, 0) QN(140, 8, 176, 0) QN(141, 8, 212, 0)
+QN(144, 8, 136, 4) QN(145, 8, 70, 2) QN(146, 8, 128, 4) QN(152, 8, 168, 4) QN(153, 8, 68, 4) QN(154, 8, 100, 4) QN(155, 8, 128, 4) QN(156, 8, 102, 2) QN(157, 8, 86, 2) QN(158, 8, 56, 4)
+template <> struct Q<2>  { static const int UB = 1, BYTES = 18, HDR = 0, NEW = 0; };
+template <> struct Q<8>  { static const int UB = 1, BYTES = 34, HDR = 0, NEW = 0; };
+template <> struct Q<11> { static const int UB = 8, BYTES = 110, HDR = 0, NEW = 0; };
+template <> struct Q<12> { static const int UB = 8, BYTES = 144, HDR = 0, NEW = 0; };
+template <> struct Q<13> { static const int UB = 8, BYTES = 176, HDR = 0, NEW = 0; };
+template <> struct Q<14> { static const int UB = 8, BYTES = 210, HDR = 0, NEW = 0; };
+template <> struct Q<18> { static const int UB = 8, BYTES = 98, HDR = 0, NEW = 0; };
+template <> struct Q<16> { static const int UB = 8, BYTES = 66, HDR = 0, NEW = 0; };
+template <> struct Q<22> { static const int UB = 8, BYTES = 82, HDR = 0, NEW = 0; };
 
 // ---- IQ formats translated from ik_llama.cpp / ggml (MIT; see NOTICE): unpack one 32-value unit ----
 __device__ const signed char KVN[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -226,11 +229,142 @@ template <> __device__ float udot<19>(const u8* b, int j, const int* xq, float d
 template <> __device__ float udot<20>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<20>(b, j, xq, dx, sx); }
 template <> __device__ float udot<21>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<21>(b, j, xq, dx, sx); }
 template <> __device__ float udot<23>(const u8* b, int j, const int* xq, float dx, int sx) { return udot_gen<23>(b, j, xq, dx, sx); }
-template <> struct Q<17> { static const int UB = 8, BYTES = 74; };
-template <> struct Q<19> { static const int UB = 8, BYTES = 50; };
-template <> struct Q<20> { static const int UB = 1, BYTES = 18; };
-template <> struct Q<21> { static const int UB = 8, BYTES = 110; };
-template <> struct Q<23> { static const int UB = 8, BYTES = 136; };
+
+// ---- ik_llama IQ formats: one unit = 32 values -> int8 weights + two scales; `row` is the row start (per-row scale header lives there) ----
+__device__ __forceinline__ float rowscale(const u8* row, int hdr) { return hdr == 4 ? *(const float*)row : hdr == 2 ? h2f(row) : 0.f; }
+__device__ __forceinline__ u32 rd16(const u8* p) { return (u32)p[0] | ((u32)p[1] << 8); }
+__device__ __forceinline__ void kt_gen(u32 code, u32 off, int n, bool ab, signed char* out) {
+  u32 x = code + off;
+  for (int i = 0; i < n; i++) {
+    x *= 0xCBAC1FEDu; u32 s = x & 0x3f3f3f3fu;
+    int t = (int)(s & 0xff) + (int)((s >> 8) & 0xff) + (int)((s >> 16) & 0xff) + (int)(s >> 24) - 126;
+    out[i] = (signed char)(ab ? (t < 0 ? -t : t) : t);
+  }
+}
+template <int TY> __device__ void uloadr(const u8* b, int j, int* w, float& s0, float& s1, float& mn, const u8* row) {
+  if constexpr (!Q<TY>::NEW) { uload<TY>(b, j, w, s0, s1, mn); }
+  else {
+    __align__(4) signed char v[32]; float rd = rowscale(row, Q<TY>::HDR); mn = 0.f; float d0 = 0.f, d1 = 0.f;
+    if constexpr (TY == 29) {
+      u32 sc[4]; for (int i = 0; i < 4; i++) sc[i] = rd16(b + 48 + 2 * i);
+      u16 db = (u16)((sc[0] >> 12) | ((sc[1] >> 8) & 0xf0) | ((sc[2] >> 4) & 0xf00) | (sc[3] & 0xf000)); float d = __half2float(*(const __half*)&db);
+      u32 s = sc[j / 2]; int sh = 6 * (j % 2);
+      d0 = d * (2 * ((s >> sh) & 7) + 1) * 0.125f; d1 = d * (2 * ((s >> (sh + 3)) & 7) + 1) * 0.125f;
+      const u8* qs = b + j * 4; const u8* qh = b + 32 + j * 2;
+      for (int l = 0; l < 4; l++) {
+        u32 hb = qh[l / 2]; u32 idx = qs[l] | ((l % 2 == 0 ? (hb << 8) : (hb << 4)) & 0x700); int neg = (hb & (l % 2 == 0 ? 0x08 : 0x80)) != 0;
+        const signed char* g = (const signed char*)&IQ1S_G[idx * 2];
+        for (int i = 0; i < 8; i++) v[l * 8 + i] = (signed char)(8 * g[i] + (neg ? -1 : 1));
+      }
+    } else if constexpr (TY == 134) {
+      d0 = d1 = rd;
+      for (int k = 0; k < 32; k++) {
+        int n = j * 32 + k, i16 = n / 16, r = n % 16; u32 vv = r < 15 ? ((u32)b[i16 * 3 + r / 5] * (u32)(81 / (r % 5 == 0 ? 1 : r % 5 == 1 ? 3 : r % 5 == 2 ? 9 : r % 5 == 3 ? 27 : 81))) : 0;
+        static_assert(true, "");
+        const int km[5] = {81, 27, 9, 3, 1};
+        vv = (u32)(u8)((u32)b[r < 15 ? i16 * 3 + r / 5 : 12] * (u32)(r < 15 ? km[r % 5] : km[i16]));
+        v[k] = (signed char)(((vv + (vv >> 1)) >> 7) - 1);
+      }
+    } else if constexpr (TY == 135) {
+      d0 = d1 = rd;
+      for (int k = 0; k < 32; k++) { int n = j * 32 + k; v[k] = (signed char)(((b[n % 16] >> (2 * (n / 16))) & 3) - 1); }
+    } else if constexpr (TY == 137) {
+      float d = h2f(b); u32 ex = rd16(b + 2) >> (2 * j); u32 sc = b[4 + j]; int sh = 2 * (j % 4); const u8* qs = b + 12 + 32 * (j / 4);
+      d0 = d * (float)((int)(sc & 15) - 8); d1 = d * (float)((int)(sc >> 4) - 8); int v0 = (ex & 1) ? 4 : 0, v1 = (ex & 2) ? 4 : 0;
+      for (int k = 0; k < 32; k++) v[k] = IQ2NL_V[(k < 16 ? v0 : v1) + ((qs[k] >> sh) & 3)];
+    } else if constexpr (TY == 145) {
+      int ib = j / 2, hf = j % 2; u32 ex = rd16(b) >> (2 * ib); u32 sc = b[2 + ib]; int sh = 4 * (ib % 2) + 2 * hf; const u8* qs = b + 6 + 32 * (ib / 2);
+      d0 = d1 = rd * (float)((int)(hf ? ((sc >> 4) | ((ex >> 5) & 0x10)) : ((sc & 15) | ((ex >> 4) & 0x10))) - 16); int vo = (ex >> hf) & 1 ? 4 : 0;
+      for (int k = 0; k < 32; k++) v[k] = IQ2NL_V[vo + ((qs[k] >> sh) & 3)];
+    } else if constexpr (TY == 157) {
+      int ib = j / 2, hf = j % 2; int shh = (int)rd16(b); const u8* sl = b + 2; const u8* qs = b + 6 + ib * 16; const u8* qh = b + 70;
+      int lo = (sl[(2 * ib + hf) % 4] >> (4 * (ib / 2))) & 15, hi = (shh >> (4 * ib + 2 * hf)) & 3;
+      d0 = d1 = rd * (float)((lo | (hi << 4)) - 32);
+      for (int jj = 0; jj < 16; jj++) {
+        u32 q = qs[jj]; u32 idx = (hf ? (q >> 4) : (q & 15)) | (((qh[jj] >> (2 * ib + hf)) & 1) << 4); u32 vv = IQ2KL_V[idx];
+        v[2 * jj] = (signed char)(vv & 0xff); v[2 * jj + 1] = (signed char)(vv >> 8);
+      }
+    } else if constexpr (TY == 138) {
+      float d = h2f(b); u32 ex = rd16(b + 2) >> (2 * j), shs = rd16(b + 4) >> (2 * j); u32 sl = b[6 + j];
+      d0 = d * (float)((2 * (int)(sl & 15) + 1) * ((shs & 1) ? -1 : 1)); d1 = d * (float)((2 * (int)(sl >> 4) + 1) * ((shs & 2) ? -1 : 1));
+      int v0 = (ex & 1) ? 8 : 0, v1 = (ex & 2) ? 8 : 0; int sh = 2 * (j % 4); const u8* qs = b + 14 + 32 * (j / 4); const u8* qh = b + 78;
+      for (int k = 0; k < 32; k++) v[k] = IQ3NL_V[(k < 16 ? v0 : v1) + (((qs[k] >> sh) & 3) | (((qh[k] >> j) & 1) << 2))];
+    } else if constexpr (TY == 156) {
+      int ex = (int)rd16(b); int i128 = j / 4, ib = j % 4; const u8* sc = b + 2; const u8* qs = b + 6 + i128 * 32; const u8* qh = b + 70;
+      int lowp = j < 4 ? (sc[j] & 15) : (sc[j - 4] >> 4);
+      d0 = d1 = rd * (float)((lowp | (((ex >> j) & 1) << 4)) - 16); int vo = ((ex >> (8 + j)) & 1) << 3;
+      for (int k = 0; k < 32; k++) v[k] = IQ3NL_V[vo + (((qs[k] >> (2 * ib)) & 3) | (((qh[k] >> (4 * i128 + ib)) & 1) << 2))];
+    } else if constexpr (TY == 139) {
+      float d = h2f(b); u32 ex = rd16(b + 2) >> (2 * j); u32 sh = b[4 + j / 2] >> (4 * (j % 2)); u32 sl = b[8 + j];
+      d0 = d * (float)((int)((sl & 15) | ((sh << 4) & 0x30)) - 32); d1 = d * (float)((int)((sl >> 4) | ((sh << 2) & 0x30)) - 32);
+      int v0 = (ex & 1) ? 16 : 0, v1 = (ex & 2) ? 16 : 0; const u8* qs = b + 16 + j * 16;
+      for (int k = 0; k < 32; k++) v[k] = k < 16 ? IQ4K_V[v0 + (qs[k] & 15)] : IQ4K_V[v1 + (qs[k - 16] >> 4)];
+    } else if constexpr (TY == 140) {
+      float d = h2f(b); int ib = j / 2, hf = j % 2; u32 ex = rd16(b + 2) >> (4 * ib); u32 s = b[4 + ib]; const u8* sl = b + 8; int shf = 2 * (ib % 4);
+      const u8* qs = b + 16 + ib * 32; const u8* qh = b + 144 + 32 * (ib / 4);
+      float dl[4]; dl[0] = d * (float)((int)((sl[2 * ib] & 15) | ((s << 4) & 0x30)) - 32); dl[1] = d * (float)((int)((sl[2 * ib] >> 4) | ((s << 2) & 0x30)) - 32);
+      dl[2] = d * (float)((int)((sl[2 * ib + 1] & 15) | (s & 0x30)) - 32); dl[3] = d * (float)((int)((sl[2 * ib + 1] >> 4) | ((s >> 2) & 0x30)) - 32);
+      d0 = dl[2 * hf]; d1 = dl[2 * hf + 1]; int vo0 = hf ? ((ex & 4) << 3) : ((ex & 1) << 5), vo1 = hf ? ((ex & 8) << 2) : ((ex & 2) << 4);
+      for (int k = 0; k < 32; k++) {
+        u32 lowb = hf ? ((qs[k] >> 4) | (((qh[k] >> shf) & 2) << 3)) : ((qs[k] & 15) | (((qh[k] >> shf) & 1) << 4));
+        v[k] = IQ5NL_V[(k < 16 ? vo0 : vo1) + lowb];
+      }
+    } else if constexpr (TY == 141) {
+      float d = h2f(b); int ib = j / 2, hf = j % 2; u32 ex = rd16(b + 2) >> (4 * ib); const signed char* sl = (const signed char*)(b + 4);
+      const u8* qs = b + 20 + ib * 32; const u8* qh = b + 148 + 32 * (ib / 2); int shf = 4 * (ib % 2);
+      d0 = d * (float)sl[4 * ib + 2 * hf]; d1 = d * (float)sl[4 * ib + 2 * hf + 1];
+      for (int k = 0; k < 32; k++) {
+        int n = 2 * hf + (k >> 4); u32 q = hf ? ((qs[k] >> 4) | (((qh[k] >> shf) & 12) << 2)) : ((qs[k] & 15) | (((qh[k] >> shf) & 3) << 4));
+        v[k] = IQ6NL_V[q + (((ex >> n) & 1) ? 64 : 0)];
+      }
+    } else if constexpr (TY == 144) {
+      u32 sc = b[j]; d0 = d1 = rd * (float)((int)(sc & 254) - 127); int vo = (sc & 1) << 4; const u8* qs = b + 8 + j * 16;
+      for (int k = 0; k < 32; k++) v[k] = k < 16 ? IQ4K_V[vo + (qs[k] & 15)] : IQ4K_V[vo + (qs[k - 16] >> 4)];
+    } else if constexpr (TY == 152) {
+      int ib = j / 2, hf = j % 2; u32 sc = b[2 * ib + hf]; d0 = d1 = rd * (float)((int)(sc & 254) - 127); int vo = (sc & 1) << 5;
+      const u8* qs = b + 8 + ib * 32; const u8* qh = b + 136;
+      for (int k = 0; k < 32; k++) v[k] = IQ5NL_V[vo + ((hf ? (qs[k] >> 4) : (qs[k] & 15)) | (((qh[k] >> (2 * ib + hf)) & 1) << 4))];
+    } else if constexpr (TY == 146) {
+      u32 a[8]; int ls = 0; for (int k = 0; k < 8; k++) { u32 q = rd16(b + j * 16 + 2 * k); a[k] = q & 0xfffe; a[k] ^= a[k] >> 1; ls |= (int)(q & 1) << k; }
+      d0 = d1 = rd * (float)((ls & 254) - 127); int vo = (ls & 1) << 4; u8 ax[16]; for (int k = 0; k < 8; k++) { ax[2 * k] = (u8)a[k]; ax[2 * k + 1] = (u8)(a[k] >> 8); }
+      for (int k = 0; k < 32; k++) v[k] = k < 16 ? IQ4K_V[vo + (ax[k] & 15)] : IQ4K_V[vo + (ax[k - 16] >> 4)];
+    } else if constexpr (TY == 153 || TY == 154) {
+      int ib = j % 4, hf = j / 4; float sc = rd * (TY == 154 ? 1.01f : 1.f); u32 nb = b[ib];
+      float s = (float)IQ4K_V[(nb >> (4 * hf)) & 15]; d0 = d1 = sc * (TY == 154 ? (float)(nb >> (4 * hf) & 15) : s);
+      for (int ig = 0; ig < 4; ig++) {
+        u32 code = rd16(b + 4 + 2 * (hf * 16 + ib * 4 + ig)); kt_gen(code, 4096, 8, TY == 154, v + ig * 8);
+        if (TY == 154) for (int i = 0; i < 8; i++) if (b[68 + ig * 8 + i] & (1u << (ib + 4 * hf))) v[ig * 8 + i] = -v[ig * 8 + i];
+      }
+    } else if constexpr (TY == 155) {
+      u32 shb = *(const u32*)(b + j * 4); u32 off = (shb & 1) ? 32768 + 4096 : 4096; d0 = d1 = rd * (float)((int)((shb & 0xff) >> 1) - 64);
+      for (int ig = 0; ig < 8; ig++) {
+        int jj = j * 8 + ig; u32 idx = b[32 + jj] | (((u32)b[96 + jj % 32] << (8 - 4 * (jj / 32))) & 0xf00) | (((shb >> (8 + 3 * ig)) & 7) << 12);
+        kt_gen(idx, off, 4, false, v + ig * 4);
+      }
+    } else if constexpr (TY == 158) {
+      d0 = d1 = rd * (float)IQ4K_V[b[j] & 15];
+      for (int ig = 0; ig < 4; ig++) {
+        u32 idx = b[8 + j * 4 + ig] | (((u32)b[40 + (j % 4) * 4 + ig] << (8 - 4 * (j / 4))) & 0xf00); idx |= ((u32)b[j] << (8 - ig)) & 0x1000;
+        kt_gen(idx, 4096, 8, false, v + ig * 8);
+      }
+    }
+    for (int i = 0; i < 8; i++) w[i] = *(const int*)&v[4 * i];
+    s0 = d0; s1 = d1;
+  }
+}
+template <int TY> __device__ float udotr(const u8* b, int j, const int* xq, float dx, int sx, const u8* row) {
+  if constexpr (!Q<TY>::NEW) { return udot<TY>(b, j, xq, dx, sx); }
+  else {
+    int w[8]; float s0, s1, mn; uloadr<TY>(b, j, w, s0, s1, mn, row); int a0 = 0, a1 = 0;
+    for (int i = 0; i < 4; i++) { a0 = DP(w[i], xq[i], a0); a1 = DP(w[4 + i], xq[4 + i], a1); }
+    return dx * (s0 * (float)a0 + s1 * (float)a1);
+  }
+}
+template <> struct Q<17> { static const int UB = 8, BYTES = 74, HDR = 0, NEW = 0; };
+template <> struct Q<19> { static const int UB = 8, BYTES = 50, HDR = 0, NEW = 0; };
+template <> struct Q<20> { static const int UB = 1, BYTES = 18, HDR = 0, NEW = 0; };
+template <> struct Q<21> { static const int UB = 8, BYTES = 110, HDR = 0, NEW = 0; };
+template <> struct Q<23> { static const int UB = 8, BYTES = 136, HDR = 0, NEW = 0; };
 
 // out[slot*rows + r] = W[slot][r,:] . x[slot]. Quantised activations: xq bytes, xd scales, xs sums, slot stride xstride elements.
 // 256 threads = 8 warps; a warp covers 32/lpr rows, lpr = min(32, cols/32) lanes per row.
@@ -248,14 +382,14 @@ __device__ void mv_impl(const u8* const* ptrs, const signed char* xq, const floa
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int r = (blockIdx.x * 8 + warp) * rpw + lane / lpr, li = lane % lpr;
   bool ok = r < rows;
-  const u8* row = ptrs[slot] + (size_t)(ok ? r : 0) * (cols / (UB * 32)) * BY;
+  const u8* row = ptrs[slot] + (size_t)(ok ? r : 0) * ((cols / (UB * 32)) * BY + Q<TY>::HDR);
   float acc = 0.f;
-  if (ok) for (int u = li; u < units; u += lpr) acc += udot<TY>(row + (u / UB) * BY, u % UB, sxq + u * 9, sxd[u], sxs[u]);
+  if (ok) for (int u = li; u < units; u += lpr) acc += udotr<TY>(row + Q<TY>::HDR + (u / UB) * BY, u % UB, sxq + u * 9, sxd[u], sxs[u], row);
   for (int o = lpr >> 1; o; o >>= 1) acc += __shfl_xor_sync(FULL, acc, o);
   if (ok && li == 0) out[(size_t)slot * rows + r] = acc;
 }
 #define MV(TY) extern "C" __global__ void matvec_##TY(const u8* const* p, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols, int xstride) { mv_impl<TY>(p, xq, xd, xs, o, rows, cols, xstride); }
-MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(16) MV(17) MV(18) MV(19) MV(20) MV(21) MV(22) MV(23)
+MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(16) MV(17) MV(18) MV(29) MV(134) MV(135) MV(137) MV(138) MV(139) MV(140) MV(141) MV(144) MV(145) MV(146) MV(152) MV(153) MV(154) MV(155) MV(156) MV(157) MV(158) MV(19) MV(20) MV(21) MV(22) MV(23)
 
 // F32 matvec (router, tiny projections): same shape
 extern "C" __global__ void matvecf(const u8* const* p, const float* x, float* o, int rows, int cols, int xstride) {
@@ -557,12 +691,12 @@ __device__ void mm_impl(const u8* const* ptrs, const int* off, const int* in_idx
   int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int r = (blockIdx.x * 8 + warp) * rpw + lane / lpr, li = lane % lpr;
   bool ok = r < rows;
-  const u8* row = ptrs[z] + (size_t)(ok ? r : 0) * (cols / (UB * 32)) * BY;
+  const u8* row = ptrs[z] + (size_t)(ok ? r : 0) * ((cols / (UB * 32)) * BY + Q<TY>::HDR);
   float acc[8] = {0, 0, 0, 0, 0, 0, 0, 0};
   if (ok) for (int u = li; u < units; u += lpr) {
-    const u8* wb = row + (u / UB) * BY; int uj = u % UB;
+    const u8* wb = row + Q<TY>::HDR + (u / UB) * BY; int uj = u % UB;
     #pragma unroll
-    int w[8]; float s0, s1, mn; uload<TY>(wb, uj, w, s0, s1, mn);
+    int w[8]; float s0, s1, mn; uloadr<TY>(wb, uj, w, s0, s1, mn, row);
     #pragma unroll
     for (int j = 0; j < 8; j++) if (j < nt) {
       const int* xq = sxq + (j * units + u) * 9; int a0 = 0, a1 = 0;
@@ -576,7 +710,7 @@ __device__ void mm_impl(const u8* const* ptrs, const int* off, const int* in_idx
   if (ok && li == 0) for (int j = 0; j < nt; j++) { int orow = out_idx ? out_idx[base + j] : base + j; out[(size_t)orow * rows + r] = acc[j]; }
 }
 #define MM(TY) extern "C" __global__ void mm_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mm_impl<TY>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
-MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(16) MM(17) MM(18) MM(19) MM(20) MM(21) MM(22) MM(23)
+MM(2) MM(8) MM(11) MM(12) MM(13) MM(14) MM(16) MM(17) MM(18) MM(19) MM(20) MM(21) MM(22) MM(23) MM(29) MM(134) MM(135) MM(137) MM(138) MM(139) MM(140) MM(141) MM(144) MM(145) MM(146) MM(152) MM(153) MM(154) MM(155) MM(156) MM(157) MM(158)
 
 // F32 matmul O[t][r] = W[r].X[t] for T tokens. grid (ceil(rows/8), ceil(T/32)), 256 threads.
 extern "C" __global__ void mmf(const float* W, const float* X, float* O, int rows, int cols, int T) {
@@ -782,7 +916,7 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
   int la_row = tid >> 2, la_u = tid & 3;                 // weight (row, unit-in-step)
   int lb_tok = tid >> 2, lb_u = tid & 3;                 // activation (token, unit-in-step)
   int wr = r0 + la_row; bool wok = wr < rows;
-  const u8* wrow = ptrs[z] + (size_t)(wok ? wr : 0) * (cols / (UB * 32)) * BY;
+  const u8* wrow = ptrs[z] + (size_t)(wok ? wr : 0) * ((cols / (UB * 32)) * BY + Q<TY>::HDR);
   int tk = t0 + lb_tok; bool tok_ok = tk < n;
   int xr = tok_ok ? (in_idx ? in_idx[off[z] + tk] : off[z] + tk) : 0;
   float acc[4][4];
@@ -793,7 +927,7 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
     int u = u0 + la_u;
     {
       int w[8]; float s0 = 0.f, s1 = 0.f, mn = 0.f;
-      if (wok && !NODEQ) { uload<TY>(wrow + (u / UB) * BY, u % UB, w, s0, s1, mn); } else { for (int i = 0; i < 8; i++) w[i] = 0; }
+      if (wok && !NODEQ) { uloadr<TY>(wrow + Q<TY>::HDR + (u / UB) * BY, u % UB, w, s0, s1, mn, wrow); } else { for (int i = 0; i < 8; i++) w[i] = 0; }
       #pragma unroll
       for (int i = 0; i < 8; i++) As[la_u][la_row][i] = w[i];
       Sa0[la_u][la_row] = s0; Sa1[la_u][la_row] = s1; Sam[la_u][la_row] = mn;
@@ -847,7 +981,7 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
     }
 }
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
-MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(16, false) MMQ(17, true) MMQ(18, false) MMQ(19, false) MMQ(20, false) MMQ(21, false) MMQ(22, true) MMQ(23, false)
+MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(16, false) MMQ(17, true) MMQ(18, false) MMQ(19, false) MMQ(20, false) MMQ(21, false) MMQ(22, true) MMQ(23, false) MMQ(29, false) MMQ(134, false) MMQ(135, false) MMQ(137, false) MMQ(138, false) MMQ(139, false) MMQ(140, false) MMQ(141, false) MMQ(144, false) MMQ(145, false) MMQ(146, false) MMQ(152, false) MMQ(153, false) MMQ(154, false) MMQ(155, false) MMQ(156, false) MMQ(157, false) MMQ(158, false)
 
 // F32 tiled matmul O[t][r] = W[r].X[t]; block 16x16, each thread 4x4 outputs; tile 64 rows x 64 tokens, K step 16. grid (ceil(rows/64), ceil(T/64)).
 extern "C" __global__ void mmf2(const float* W, const float* X, float* O, int rows, int cols, int T) {

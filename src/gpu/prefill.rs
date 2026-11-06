@@ -45,12 +45,12 @@ impl Gpu {
         let pf = self.pf.as_ref().unwrap();
         let units = cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
         if self.mmq {
-            let name = match ty { 2 => "mmq_2", 8 => "mmq_8", 11 => "mmq_11", 12 => "mmq_12", 13 => "mmq_13", 14 => "mmq_14", 16 => "mmq_16", 17 => "mmq_17", 18 => "mmq_18", 19 => "mmq_19", 20 => "mmq_20", 21 => "mmq_21", 23 => "mmq_23", 22 => "mmq_22", t => panic!("no mmq kernel for type {t}") };
+            let name = match ty { 2 => "mmq_2", 8 => "mmq_8", 11 => "mmq_11", 12 => "mmq_12", 13 => "mmq_13", 14 => "mmq_14", 16 => "mmq_16", 17 => "mmq_17", 18 => "mmq_18", 19 => "mmq_19", 20 => "mmq_20", 21 => "mmq_21", 23 => "mmq_23", 22 => "mmq_22", 29 => "mmq_29", 134 => "mmq_134", 135 => "mmq_135", 137 => "mmq_137", 138 => "mmq_138", 139 => "mmq_139", 140 => "mmq_140", 141 => "mmq_141", 144 => "mmq_144", 145 => "mmq_145", 146 => "mmq_146", 152 => "mmq_152", 153 => "mmq_153", 154 => "mmq_154", 155 => "mmq_155", 156 => "mmq_156", 157 => "mmq_157", 158 => "mmq_158", t => panic!("no mmq kernel for type {t}") };
             self.launch3(name, (rows.div_ceil(64) as u32, max_n.div_ceil(64) as u32, slots as u32), 256, 0,
                 &[P(ptrs), P(off), P(ii), P(oi), P(pf.xq[set]), P(pf.xd[set]), P(pf.xs[set]), P(out), I(rows as i32), I(cols as i32)]);
             return;
         }
-        let name = match ty { 2 => "mm_2", 8 => "mm_8", 11 => "mm_11", 12 => "mm_12", 13 => "mm_13", 14 => "mm_14", 16 => "mm_16", 17 => "mm_17", 18 => "mm_18", 19 => "mm_19", 20 => "mm_20", 21 => "mm_21", 23 => "mm_23", 22 => "mm_22", t => panic!("no mm kernel for type {t}") };
+        let name = match ty { 2 => "mm_2", 8 => "mm_8", 11 => "mm_11", 12 => "mm_12", 13 => "mm_13", 14 => "mm_14", 16 => "mm_16", 17 => "mm_17", 18 => "mm_18", 19 => "mm_19", 20 => "mm_20", 21 => "mm_21", 23 => "mm_23", 22 => "mm_22", 29 => "mm_29", 134 => "mm_134", 135 => "mm_135", 137 => "mm_137", 138 => "mm_138", 139 => "mm_139", 140 => "mm_140", 141 => "mm_141", 144 => "mm_144", 145 => "mm_145", 146 => "mm_146", 152 => "mm_152", 153 => "mm_153", 154 => "mm_154", 155 => "mm_155", 156 => "mm_156", 157 => "mm_157", 158 => "mm_158", t => panic!("no mm kernel for type {t}") };
         self.launch3(name, (rows.div_ceil(rpb) as u32, max_n.div_ceil(8) as u32, slots as u32), 256, (8 * units * 44) as u32,
             &[P(ptrs), P(off), P(ii), P(oi), P(pf.xq[set]), P(pf.xd[set]), P(pf.xs[set]), P(out), I(rows as i32), I(cols as i32)]);
     }
