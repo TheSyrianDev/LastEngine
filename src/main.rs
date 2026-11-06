@@ -135,6 +135,26 @@ async fn main() {
                 pos += bs; gen.extend(&ar);
             }
         }
+        cli::Cmd::DenseCmp { path, prompt, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let cpu = dense::Dense::load(&path, &g);
+            let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
+            let mut st = cpu.new_state();
+            let ids = tk.encode(&prompt);
+            let am = |v: &[f32]| v.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap().0;
+            let lp = |v: &[f32], i: usize| { let mx = v.iter().cloned().fold(f32::MIN, f32::max); v[i] - mx - v.iter().map(|a| (a - mx).exp()).sum::<f32>().ln() };
+            let (mut lc, mut lg) = (vec![], vec![]);
+            for (i, t) in ids.iter().enumerate() { lc = cpu.forward(&mut st, *t, i); lg = gp.forward(*t); }
+            let (mut diff, mut agree, mut maxd, mut sumd) = (0, 0, 0f32, 0f32);
+            for k in 0..n {
+                let (a, b) = (am(&lc), am(&lg));
+                let d = (lp(&lc, a) - lp(&lg, a)).abs(); maxd = maxd.max(d); sumd += d;
+                if a == b { agree += 1 } else if diff < 8 { diff += 1; println!("step {k}: cpu {a} lp {:.3} (gpu lp {:.3}) vs gpu {b} lp {:.3} (cpu lp {:.3})", lp(&lc, a), lp(&lg, a), lp(&lg, b), lp(&lc, b)); }
+                let t = a as u32; lc = cpu.forward(&mut st, t, ids.len() + k); lg = gp.forward(t);
+            }
+            println!("{agree}/{n} argmax agree, mean |dlogprob| {:.4}, max {:.4}", sumd / n as f32, maxd);
+        }
         cli::Cmd::Ref { path, prompt, top } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");

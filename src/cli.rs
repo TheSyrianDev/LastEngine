@@ -23,6 +23,8 @@ pub enum Cmd {
     /// CPU reference: print top-N next-token logprobs for PROMPT.
     /// Clover block-diffusion draft quality check on the CPU reference (draft a block, compare with greedy AR)
     CloverDraft { path: String, prompt: String, #[arg(default_value_t = 1)] blocks: usize },
+    /// Dense model: CPU greedy for N tokens, GPU teacher-forced on the same tokens; report first logit/argmax divergences
+    DenseCmp { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },
     Dequant { path: String, name: String, n: usize, out: String },
     Template { path: String },
