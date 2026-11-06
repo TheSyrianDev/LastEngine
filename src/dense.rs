@@ -208,6 +208,8 @@ impl DenseEng {
     }
     pub fn pos(&self) -> usize { match self { DenseEng::Cpu { pos, .. } => *pos, DenseEng::Cuda(g) => g.pos() } }
     pub fn reset(&mut self) { match self { DenseEng::Cpu { m, st, pos, .. } => { *st = m.new_state(); *pos = 0; } DenseEng::Cuda(g) => g.reset() } }
+    pub fn export_state(&mut self) -> Result<Vec<u8>, String> { match self { DenseEng::Cuda(g) => Ok(g.export_state()), _ => Err("slots need the GPU engine for dense models".into()) } }
+    pub fn import_state(&mut self, b: &[u8]) -> Result<(), String> { match self { DenseEng::Cuda(g) => g.import_state(b), _ => Err("slots need the GPU engine for dense models".into()) } }
     pub fn forward(&mut self, t: u32) -> Vec<f32> {
         match self { DenseEng::Cpu { m, st, pos, .. } => { let l = m.forward(st, t, *pos); *pos += 1; l } DenseEng::Cuda(g) => g.forward(t) }
     }

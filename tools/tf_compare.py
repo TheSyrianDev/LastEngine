@@ -8,11 +8,12 @@ import json, subprocess, sys, time, urllib.request, os
 model, prompt, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 moe = "--cpu-moe" in sys.argv
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-out = subprocess.run([f"{root}/target/release/lastengine", "tf-dump", model, prompt, str(n)], capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
+out = open(os.environ["TF_DUMP"]).read().strip().splitlines()[-1] if os.environ.get("TF_DUMP") else subprocess.run([f"{root}/target/release/lastengine", "tf-dump", model, prompt, str(n)], capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
 d = json.loads(out); pids, gen, top = d["prompt_ids"], d["gen_ids"], d["top"]
-port = 8397
+port = int(os.environ.get("LLAMA_PORT", "8397"))
+external = "LLAMA_PORT" in os.environ
 cmd = [os.environ.get("LLAMA_SERVER") or os.path.expanduser("~/AI/engines/llama-mainline/build/bin/llama-server"), "-m", model, "--port", str(port), "-c", "8192", "-ngl", "99", "--no-webui"] + (["--cpu-moe"] if moe else [])
-srv = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+srv = None if external else subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def post(path, body):
     r = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(), {"content-type": "application/json"})
     return json.load(urllib.request.urlopen(r, timeout=300))
@@ -36,4 +37,4 @@ try:
     print(f"{os.path.basename(model)}: top1 {agree}/{n}, near-tie {near}, other {len(bad)}; effective agreement {100*(agree+near)/n:.1f}%; mean |dlogprob| {dsum/max(cnt,1):.4f} over {cnt}")
     for b in bad[:5]: print("  mismatch step", b[0], "ours", b[1], "llama", b[2])
 finally:
-    srv.terminate(); srv.wait()
+    if srv: srv.terminate(); srv.wait()

@@ -13,8 +13,8 @@ impl Eng {
     fn forward(&mut self, t: u32) -> Vec<f32> { dispatch!(self, g => g.forward(t)) }
     fn snap_recurrent(&mut self) -> Vec<u8> { dispatch!(self, g => g.snap_recurrent()) }
     fn restore_recurrent(&mut self, b: &[u8], pos: usize) { dispatch!(self, g => g.restore_recurrent(b, pos)) }
-    fn export_state(&mut self) -> Result<Vec<u8>, String> { match self { Eng::Gpu(g) => Ok(g.export_state()), _ => Err("slots unsupported for this architecture".into()) } }
-    fn import_state(&mut self, b: &[u8]) -> Result<(), String> { match self { Eng::Gpu(g) => g.import_state(b), _ => Err("slots unsupported for this architecture".into()) } }
+    fn export_state(&mut self) -> Result<Vec<u8>, String> { match self { Eng::Gpu(g) => Ok(g.export_state()), Eng::Dense(d) => d.export_state() } }
+    fn import_state(&mut self, b: &[u8]) -> Result<(), String> { match self { Eng::Gpu(g) => g.import_state(b), Eng::Dense(d) => d.import_state(b) } }
 }
 struct Inner { gpu: Eng, hist: Vec<u32>, rng: u64, snap: Option<(Vec<u32>, Vec<u8>)> }
 pub struct Local { inner: Mutex<Inner>, tok: Tokenizer, tmpl: String, name: String, n_ctx: usize, n_params: u64, bos: String, eos: String }
@@ -85,6 +85,16 @@ impl Splitter {
     fn push(&mut self, s: &str, out: &mut Vec<Delta>) {
         self.buf.push_str(s);
         loop {
+            if self.mode == 0 {
+                // MiniCPM-style calls have no <tool_call> wrapper: the text starts at <function name="
+                const FN: &str = "<function name=\"";
+                let (pt, pf) = (self.buf.find("<tool_call>"), self.buf.find(FN));
+                if let Some(pf) = pf.filter(|&f| pt.map_or(true, |t| f < t)) {
+                    let head = self.buf[..pf].to_string();
+                    if !head.is_empty() { out.push(Delta::Content(head)); }
+                    self.tool.push_str("<tool_call>"); self.tool.push_str(&self.buf[pf..]); self.buf.clear(); self.mode = 2; return;
+                }
+            }
             let (marker, next): (&str, u8) = match self.mode { 1 => ("</think>", 0), 0 => ("<tool_call>", 2), _ => { self.tool.push_str(&std::mem::take(&mut self.buf)); return; } };
             if let Some(p) = self.buf.find(marker) {
                 let head: String = self.buf[..p].to_string();
@@ -96,6 +106,7 @@ impl Splitter {
             // hold back a possible partial marker at the end
             let mut hold = 0;
             for i in 1..marker.len().min(self.buf.len() + 1) { if self.buf.is_char_boundary(self.buf.len() - i) && marker.starts_with(&self.buf[self.buf.len() - i..]) { hold = i; } }
+            if self.mode == 0 { for i in 1..16usize.min(self.buf.len() + 1) { if self.buf.is_char_boundary(self.buf.len() - i) && "<function name=\"".starts_with(&self.buf[self.buf.len() - i..]) { hold = hold.max(i); } } }
             let emit_to = self.buf.len() - hold;
             if emit_to > 0 { let t = self.buf[..emit_to].to_string(); out.push(if self.mode == 1 { Delta::Reasoning(t) } else { Delta::Content(t) }); self.buf = self.buf[emit_to..].to_string(); }
             return;
@@ -111,6 +122,23 @@ impl Splitter {
 fn parse_tools(s: &str) -> Vec<ToolCall> {
     let mut v = vec![];
     for blk in s.split("<tool_call>").skip(1) {
+        if let Some(a) = blk.find("<function name=\"") {
+            let rest = &blk[a + 16..];
+            let Some(e) = rest.find('"') else { continue };
+            let name = rest[..e].to_string();
+            let body = rest[e..].split("</function>").next().unwrap_or("");
+            let mut args = serde_json::Map::new();
+            for p in body.split("<param name=\"").skip(1) {
+                let Some(e2) = p.find('"') else { continue };
+                let key = p[..e2].to_string();
+                let Some(gt) = p[e2..].find('>') else { continue };
+                let mut val = p[e2 + gt + 1..].split("</param>").next().unwrap_or("").trim();
+                if let Some(c) = val.strip_prefix("<![CDATA[").and_then(|v| v.strip_suffix("]]>")) { val = c; }
+                args.insert(key, serde_json::from_str::<Value>(val).ok().filter(|v| !v.is_string()).unwrap_or_else(|| json!(val)));
+            }
+            v.push(ToolCall { name, arguments: Value::Object(args).to_string() });
+            continue;
+        }
         let Some(a) = blk.find("<function=") else { continue };
         let rest = &blk[a + 10..];
         let Some(e) = rest.find('>') else { continue };
@@ -167,7 +195,11 @@ impl Backend for Local {
         let t0 = std::time::Instant::now();
         let msgs = fix_messages(&req.messages);
         let prompt = match template::render(&self.tmpl, &msgs, req.tools.as_ref(), true, &self.bos, &self.eos) {
-            Ok(p) => p, Err(e) => { eprintln!("template error: {e}"); String::new() }
+            Ok(p) => p, Err(e) => {
+                eprintln!("template error: {e}");
+                emit(Delta::Content(format!("[lastengine: chat template error: {e}]")));
+                return Usage { prompt_tokens: 0, completion_tokens: 0, cached_tokens: 0, prefill_ms: 0.0, tool_calls: vec![], finish_reason: "error" };
+            }
         };
         let ids = self.tok.encode(&prompt);
         let mut g = self.inner.lock().unwrap();

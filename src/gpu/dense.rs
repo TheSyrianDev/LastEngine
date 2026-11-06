@@ -234,6 +234,28 @@ impl DenseGpu {
         while i < ids.len() { let e = (i + CH).min(ids.len()); l = self.chunk(&ids[i..e], e == ids.len()); i = e; }
         l
     }
+    pub fn export_state(&mut self) -> Vec<u8> { self.bind();
+        unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
+        let (nkv, hd) = (self.m.n_kv, self.m.head_dim);
+        let kvb = self.pos * nkv * hd * 2; let cb = self.m.n_embd * (self.m.l_cache.max(1) - 1) * 4;
+        let mut out = (self.pos as u64).to_le_bytes().to_vec();
+        let rd = |p: Dp, n: usize, out: &mut Vec<u8>| { let o = out.len(); out.resize(o + n, 0); if n > 0 { unsafe { result::memcpy_dtoh_sync(&mut out[o..], p).unwrap() } } };
+        for l in 0..self.lay.len() { if self.lay[l].conv { rd(self.conv[l], cb, &mut out); } else { rd(self.kc[l], kvb, &mut out); rd(self.vc[l], kvb, &mut out); } }
+        out
+    }
+    pub fn import_state(&mut self, b: &[u8]) -> Result<(), String> { self.bind();
+        if b.len() < 8 { return Err("slot file too short".into()); }
+        let pos = u64::from_le_bytes(b[..8].try_into().unwrap()) as usize;
+        if pos > self.ctx_len { return Err(format!("slot holds {pos} tokens but the context is {}", self.ctx_len)); }
+        let (nkv, hd) = (self.m.n_kv, self.m.head_dim);
+        let kvb = pos * nkv * hd * 2; let cb = self.m.n_embd * (self.m.l_cache.max(1) - 1) * 4;
+        let need: usize = 8 + self.lay.iter().map(|l| if l.conv { cb } else { 2 * kvb }).sum::<usize>();
+        if b.len() != need { return Err("slot file does not match this model".into()); }
+        let mut o = 8;
+        let mut wr = |p: Dp, n: usize| { if n > 0 { unsafe { result::memcpy_htod_sync(p, &b[o..o + n]).unwrap() } } o += n; };
+        for l in 0..self.lay.len() { if self.lay[l].conv { wr(self.conv[l], cb); } else { wr(self.kc[l], kvb); wr(self.vc[l], kvb); } }
+        self.pos = pos; Ok(())
+    }
     pub fn snap_recurrent(&mut self) -> Vec<u8> { self.bind();
         unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap() };
         let n = self.m.n_embd * (self.m.l_cache.max(1) - 1) * 4; let mut out = Vec::new();

@@ -6,10 +6,10 @@ import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib
 model = sys.argv[1]; port = 8399; base = f"http://127.0.0.1:{port}"
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 slots = tempfile.mkdtemp()
-srv = subprocess.Popen([f"{root}/target/release/lastengine", "serve", "--model", model, "--addr", f"127.0.0.1:{port}", "--ctx", "4096", "--slot-save-path", slots], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+srv = subprocess.Popen([f"{root}/target/release/lastengine", "serve", "--model", model, "--addr", f"127.0.0.1:{port}", "--ctx", "4096", "--slot-save-path", slots], stdout=subprocess.DEVNULL, stderr=open("/tmp/claude-1000/conf_srv.log","w"))
 res = []
 def check(name, ok, info=""):
-    res.append(ok); print(("PASS " if ok else "FAIL ") + name + (f"  [{info}]" if info else ""))
+    ok = bool(ok); res.append(ok); print(("PASS " if ok else "FAIL ") + name + (f"  [{info}]" if info else ""))
 def req(path, body=None, timeout=300):
     r = urllib.request.Request(base + path, None if body is None else json.dumps(body).encode(), {"content-type": "application/json"})
     try:
