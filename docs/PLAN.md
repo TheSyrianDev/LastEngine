@@ -67,3 +67,9 @@ Decode 28 -> 34.7 tok/s via: one routing readback per layer, warp-parallel top-k
 
 ## Correction to proposal 1 (CPU runs missed experts)
 Re-costed before building: an expert is ~1.3 MB; at ~12 GB/s PCIe a miss is ~0.1 ms, so ~68 misses/token is ~7 ms, partly overlapped. The CPU would need ~3M multiply-adds per expert; even with a vectorised int8 kernel at ~20 GMAC/s/core that is ~0.15 ms/core/expert, i.e. no better than the PCIe copy, and the existing `dequant_row` path is far slower. So CPU-side experts are NOT a clear win on this machine; dropped to low priority. Remaining credible decode levers: device-side routing + graph capture (removes host syncs), deeper prefetch, a profile-guided resident set.
+
+## Design for device-side routing + graphs (investigated, not built)
+Blocker found in `src/gpu.rs` (`slot_for`/`pick_slot`/`prefetch`): the expert cache (slot map, LRU ticks, copy issue) is entirely host state, so every layer needs the routed expert ids on the host before the expert matvecs can be launched. Graph capture is therefore impossible until the cache lookup moves to the device. Required pieces:
+1. Device-resident table `slot_of[layer*n_expert+e] -> slot|-1` and device LRU stamps; `router_topk` also emits slot pointers (gather from the table) into the pointer buffer the matvecs already read.
+2. Hit-only fast path inside a captured per-layer graph; a miss flag written by the kernel. Host checks one flag per layer (still a sync, but only for fetch decisions) or per token, falling back to the current path on a miss.
+3. Because ~25-30% of lookups miss at 4 GB VRAM, most layers would still take the slow path; expected gain is bounded by hit rate (~70%) times the ~8 ms/token of host gap, i.e. maybe 3-5 ms/token (34 -> ~38-40 tok/s). Real win needs a higher hit rate first (bigger VRAM budget, or resident-set pinning), so this is deferred until that lever exists.
