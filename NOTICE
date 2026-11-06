@@ -6,3 +6,5 @@ The IQ3_XXS lattice table in src/quant_iq3xxs_grid.rs is a format constant extra
 Trellis-coded KV cache (--kv tcq3): the encoder/decoder design, the trained codebooks (assets/tcq3_cb_k.bin, tcq3_cb_v.bin) and the
 Walsh-Hadamard sign arrays (assets/tcq3_signs*.bin) are adapted from spiritbuun's buun-llama-cpp (MIT License, Copyright (c) 2023-2026
 The ggml authors; TCQ work by spiritbuun). The CUDA kernels in src/cuda/kernels.cu (tcq_encode, tcq_rot, tcq_dec) are a Rust/NVRTC re-adaptation.
+
+assets/webui/ — web UI taken from the llama.cpp project (https://github.com/ggml-org/llama.cpp), MIT License, Copyright (c) 2023-2026 The ggml authors. Rebranded: product name strings replaced, logo/icon replaced, PWA assets removed.
