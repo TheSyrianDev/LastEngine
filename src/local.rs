@@ -194,7 +194,7 @@ impl Backend for Local {
     fn generate(&self, req: &GenRequest, emit: &mut dyn FnMut(Delta) -> bool) -> Usage {
         let t0 = std::time::Instant::now();
         let msgs = fix_messages(&req.messages);
-        let prompt = match template::render(&self.tmpl, &msgs, req.tools.as_ref(), true, &self.bos, &self.eos) {
+        let prompt = match template::render(&self.tmpl, &msgs, req.tools.as_ref(), true, &self.bos, &self.eos, req.enable_thinking) {
             Ok(p) => p, Err(e) => {
                 eprintln!("template error: {e}");
                 emit(Delta::Content(format!("[lastengine: chat template error: {e}]")));
