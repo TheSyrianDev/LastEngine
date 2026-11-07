@@ -68,3 +68,8 @@ dense-cmp 15/15 argmax (MiniCPM5, 15 tokens, mean |dlogprob| 0.0032). Gain is ab
 Change: LE_DN_SPLIT_MIN / LE_DN_SPLIT / LE_DN_SP are read once (dn_split_env, src/gpu/dense.rs) instead of per layer per token. Expected gain: host time only.
 Measured: no measurable change. Three repeat runs gave 4K decode 74.8 / 72.2 / 73.3 tok/s and 4K prefill 1558 on the first (cold) run; a single run earlier in the session gave 77.1, so run-to-run spread is about ±3%.
 dense-cmp 15/15 argmax (MiniCPM5, 15 tokens, mean |dlogprob| 0.0032).
+
+## Device-side pos/nk (2026-11-07, MiniCPM5 Q4_K_M, serve --ctx 17000, 128 tokens, temp 0)
+Change: decode position and KV length are uploaded once per token into a device buffer (DenseGpu.dpos); dn_prep, dn_cvt_half_d, dn_attn and dn_attn_split read them there, so kernel launch args no longer change per token. Prerequisite for CUDA graph capture; no speed change by itself.
+Measured: 4K prefill 1572, decode 73.1 and 76.6 (two runs); 16K prefill 1088, decode 49.7. Same as before within run-to-run noise (4K decode 72-77).
+dense-cmp 15/15 argmax: MiniCPM5 default (mean |dlogprob| 0.0032), LFM3 (0.0018), MiniCPM5 with LE_DN_SPLIT_MIN=4 (0.0045).

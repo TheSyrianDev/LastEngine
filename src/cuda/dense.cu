@@ -1,8 +1,8 @@
 // ---- dense transformer (llama / lfm3) decode kernels ----
 // One block per head: optional per-head RMS norm, then RoPE (NORM = adjacent pairs, NEOX = split halves), written as f16 (K) or f32 (Q).
-extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int hd, int rope_dim, int pos, float base, const float* ff, int neox, const float* nw, float eps) {
+extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int hd, int rope_dim, int pos, float base, const float* ff, int neox, const float* nw, float eps, const int* pdev, int rstride) {
   __shared__ float v[256]; __shared__ float red[8];
-  int h = blockIdx.x; size_t tb = (size_t)blockIdx.y * gridDim.x * hd; pos += blockIdx.y; in += tb + (size_t)h * hd;
+  int h = blockIdx.x; size_t tb = (size_t)blockIdx.y * gridDim.x * hd; size_t ob = pdev ? (size_t)pdev[0] * rstride : 0; if (pdev) pos = pdev[0]; pos += blockIdx.y; in += tb + (size_t)h * hd;
   for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = in[i];
   __syncthreads();
   float sc = 1.f;
@@ -22,12 +22,15 @@ extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int
     float a = v[ia], b = v[ib]; v[ia] = a * c - b * s; v[ib] = a * s + b * c;
   }
   __syncthreads();
-  if (out_half) { __half* o = (__half*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
-  else { float* o = (float*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
+  if (out_half) { __half* o = (__half*)out + ob + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
+  else { float* o = (float*)out + ob + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
 }
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
+// Decode variant: destination row is pdev[0] (device-resident position), so the launch args do not change per token.
+extern "C" __global__ void dn_cvt_half_d(const float* in, __half* base, const int* pdev, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) base[(size_t)pdev[0] * n + i] = __float2half(in[i]); }
 // Decode attention, one block (8 warps) per query head; warps split the keys, online softmax, merged through shared memory.
-extern "C" __global__ void dn_attn(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int win, int n, int nh, int nkv, int hd) {
+extern "C" __global__ void dn_attn(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int win, int n, int nh, int nkv, int hd, const int* ndev) {
+  if (ndev) n = ndev[0];
   __shared__ float mw[8], lw[8]; __shared__ float ow[8][256];
   int h = blockIdx.x, kvh = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   n += blockIdx.y; int t0 = (win > 0 && n > win) ? n - win : 0;
@@ -84,7 +87,8 @@ extern "C" __global__ void dn_shortconv_b(const float* bcx, const float* w, floa
 
 // Split-K decode attention for long contexts: grid (nh, S), each block covers a slice of the key range; partial (m, l, acc[hd]) go to
 // part[(h*S+s)*(hd+2)], dn_attn_comb merges them (and applies the head gate).
-extern "C" __global__ void dn_attn_split(const float* q, const __half* kc, const __half* vc, float* part, int win, int n, int nh, int nkv, int hd, int S) {
+extern "C" __global__ void dn_attn_split(const float* q, const __half* kc, const __half* vc, float* part, int win, int n, int nh, int nkv, int hd, int S, const int* ndev) {
+  if (ndev) n = ndev[0];
   __shared__ float mw[8], lw[8]; __shared__ float ow[8][128];
   int h = blockIdx.x, s = blockIdx.y, kvh = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31;
   int t0 = (win > 0 && n > win) ? n - win : 0; int len = n - t0; int per_s = (len + S - 1) / S;

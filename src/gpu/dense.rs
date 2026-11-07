@@ -14,6 +14,8 @@ pub struct DenseGpu {
     lay: Vec<DL>, out_norm: Dp, out_w: W, ff: Dp,
     x: Dp, h: Dp, q: Dp, k: Dp, v: Dp, g: Dp, o: Dp, t1: Dp, t2: Dp, u: Dp, a: Dp, logits: Dp,
     xqb: Dp, xdb: Dp, xsb: Dp, part: Dp,
+    /// Device-resident [pos, pos+1] for the decode step: kernels read the position and KV length here, so launch args stay constant per token (graph-capturable).
+    dpos: Dp,
     kc: Vec<Dp>, vc: Vec<Dp>, conv: Vec<Dp>, pos: usize, ctx_len: usize,
     bx: Dp, bh: Dp, bq: Dp, bk: Dp, bv: Dp, bg: Dp, bo: Dp, bt1: Dp, bt2: Dp, bu: Dp, ba: Dp, bxq: Dp, bxd: Dp, bxs: Dp, boff: Dp,
 }
@@ -39,7 +41,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -85,7 +87,7 @@ impl DenseGpu {
         DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
             x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(ffn), logits: fb(m.vocab),
-            part: dalloc(m.n_head * 128 * (hd + 2) * 4), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
+            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
             kc, vc, conv, pos: 0, ctx_len, lay,
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
             bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bu: dalloc(CH * ffn * 4), ba: dalloc(CH * ffn * 4),
@@ -156,15 +158,15 @@ impl DenseGpu {
                 let ff = if d.swa { 0 } else { self.ff };
                 let neox = m.neox as i32;
                 let kslot = self.kc[l] + (pos0 * nkv * hd * 2) as u64;
-                self.launch3("dn_prep", (nh as u32, t as u32, 1), 128, &[P(self.bq), P(self.bq), I(0), I(hd as i32), I(m.rope_dim as i32), I(pos0 as i32), F(base), P(ff), I(neox), P(d.qn), F(m.eps)]);
-                self.launch3("dn_prep", (nkv as u32, t as u32, 1), 128, &[P(self.bk), P(kslot), I(1), I(hd as i32), I(m.rope_dim as i32), I(pos0 as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps)]);
+                self.launch3("dn_prep", (nh as u32, t as u32, 1), 128, &[P(self.bq), P(self.bq), I(0), I(hd as i32), I(m.rope_dim as i32), I(pos0 as i32), F(base), P(ff), I(neox), P(d.qn), F(m.eps), P(0), I(0)]);
+                self.launch3("dn_prep", (nkv as u32, t as u32, 1), 128, &[P(self.bk), P(kslot), I(1), I(hd as i32), I(m.rope_dim as i32), I(pos0 as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(0), I(0)]);
                 self.launch("dn_cvt_half", (t * nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.bv), P(self.vc[l] + (pos0 * nkv * hd * 2) as u64), I((t * nkv * hd) as i32)]);
                 let win = if d.swa { m.window } else { 0 };
                 if hd == 128 && std::env::var("LE_DN_FLASH").map_or(true, |v| v != "0") {
                     let smem = ((64 + 32) * (hd + 8) + hd * 40) * 2;
                     self.launch3s("dn_flash_128", (t.div_ceil(64) as u32, nh as u32, 1), 128, smem as u32, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), I(win as i32)]);
                 } else {
-                self.launch3("dn_attn", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I((pos0 + 1) as i32), I(nh as i32), I(nkv as i32), I(hd as i32)]);
+                self.launch3("dn_attn", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I((pos0 + 1) as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(0)]);
                 }
                 self.bqx(self.bo, t, nh * hd);
                 self.bmm(d.wo, self.bt2, t);
@@ -202,7 +204,7 @@ impl DenseGpu {
         let pos = self.pos as i32;
         let mut e = vec![0f32; n];
         { let (t, b) = m.bytes("token_embd.weight"); let rb = crate::quant::row_bytes(t.ty, n); crate::quant::dequant_row(t.ty, &b[token as usize * rb..(token as usize + 1) * rb], &mut e); }
-        unsafe { result::memcpy_htod_sync(self.x, &e).unwrap() };
+        unsafe { result::memcpy_htod_sync(self.x, &e).unwrap(); result::memcpy_htod_sync(self.dpos, &[self.pos as i32, (self.pos + 1) as i32]).unwrap() };
         let lfm = m.kind == Kind::Lfm3;
         for l in 0..m.n_layer {
             let d = &self.lay[l];
@@ -219,18 +221,18 @@ impl DenseGpu {
                 let ff = if d.swa { 0 } else { self.ff };
                 let neox = m.neox as i32;
                 let kslot = self.kc[l] + (self.pos * nkv * hd * 2) as u64;
-                self.launch("dn_prep", nh as u32, 128, 0, &[P(self.q), P(self.q), I(0), I(hd as i32), I(m.rope_dim as i32), I(pos), F(base), P(ff), I(neox), P(d.qn), F(m.eps)]);
-                self.launch("dn_prep", nkv as u32, 128, 0, &[P(self.k), P(kslot), I(1), I(hd as i32), I(m.rope_dim as i32), I(pos), F(base), P(ff), I(neox), P(d.kn), F(m.eps)]);
-                self.launch("dn_cvt_half", (nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.v), P(self.vc[l] + (self.pos * nkv * hd * 2) as u64), I((nkv * hd) as i32)]);
+                self.launch("dn_prep", nh as u32, 128, 0, &[P(self.q), P(self.q), I(0), I(hd as i32), I(m.rope_dim as i32), I(pos), F(base), P(ff), I(neox), P(d.qn), F(m.eps), P(self.dpos), I(0)]);
+                self.launch("dn_prep", nkv as u32, 128, 0, &[P(self.k), P(self.kc[l]), I(1), I(hd as i32), I(m.rope_dim as i32), I(pos), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(self.dpos), I((nkv * hd) as i32)]);
+                self.launch("dn_cvt_half_d", (nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.v), P(self.vc[l]), P(self.dpos), I((nkv * hd) as i32)]);
                 let nk = self.pos + 1;
                 let win = if d.swa { m.window } else { 0 };
                 let span = if win > 0 { nk.min(win) } else { nk };
                 let (split_min, split_on, sp) = dn_split_env();
                 if hd == 128 && span >= split_min && split_on {
-                    self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32)]);
+                    self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32), P(self.dpos + 4)]);
                     self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp as i32)]);
                 } else {
-                self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32)]);
+                self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(self.dpos + 4)]);
                 }
                 self.mv(d.wo, self.o, self.t2);
             }
