@@ -63,3 +63,8 @@ Change: mmq_impl loads the next 4-unit step's weights and activations into regis
 | 4K (4071 tok) | 1541 / 75.7 | 1582 / 77.1 |
 | 16K (16359 tok) | 1060 / 49.4 | 1094 / 50.1 |
 dense-cmp 15/15 argmax (MiniCPM5, 15 tokens, mean |dlogprob| 0.0032). Gain is about 3%; llama.cpp b12182 is 3376 / 2374 prefill and ~102 decode on the same card.
+
+## Split-K env read cached (2026-11-07, MiniCPM5 Q4_K_M, serve --ctx 17000, 128 tokens, temp 0)
+Change: LE_DN_SPLIT_MIN / LE_DN_SPLIT / LE_DN_SP are read once (dn_split_env, src/gpu/dense.rs) instead of per layer per token. Expected gain: host time only.
+Measured: no measurable change. Three repeat runs gave 4K decode 74.8 / 72.2 / 73.3 tok/s and 4K prefill 1558 on the first (cold) run; a single run earlier in the session gave 77.1, so run-to-run spread is about ±3%.
+dense-cmp 15/15 argmax (MiniCPM5, 15 tokens, mean |dlogprob| 0.0032).

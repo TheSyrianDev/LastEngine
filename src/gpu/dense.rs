@@ -19,6 +19,16 @@ pub struct DenseGpu {
 }
 const CH: usize = 512;
 
+/// Split-K knobs, read from the environment once per process (the decode loop used to re-read them every layer).
+fn dn_split_env() -> (usize, bool, usize) {
+    static V: std::sync::OnceLock<(usize, bool, usize)> = std::sync::OnceLock::new();
+    *V.get_or_init(|| (
+        std::env::var("LE_DN_SPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize),
+        std::env::var("LE_DN_SPLIT").map_or(true, |v| v != "0"),
+        std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize),
+    ))
+}
+
 impl DenseGpu {
     pub fn new(m: Dense, ctx_len: usize) -> DenseGpu {
         let ctx = CudaContext::new(0).unwrap_or_else(|e| { eprintln!("lastengine: no usable CUDA device: {e:?}"); std::process::exit(1) });
@@ -215,10 +225,10 @@ impl DenseGpu {
                 let nk = self.pos + 1;
                 let win = if d.swa { m.window } else { 0 };
                 let span = if win > 0 { nk.min(win) } else { nk };
-                if hd == 128 && span >= std::env::var("LE_DN_SPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize) && std::env::var("LE_DN_SPLIT").map_or(true, |v| v != "0") {
-                    let sp = std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
-                    self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp)]);
-                    self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp)]);
+                let (split_min, split_on, sp) = dn_split_env();
+                if hd == 128 && span >= split_min && split_on {
+                    self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32)]);
+                    self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp as i32)]);
                 } else {
                 self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32)]);
                 }
