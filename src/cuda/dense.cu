@@ -81,3 +81,43 @@ extern "C" __global__ void dn_shortconv_b(const float* bcx, const float* w, floa
   }
   for (int k = 0; k < lc - 1; k++) st[(size_t)ch * (lc - 1) + k] = s[k];
 }
+
+// Split-K decode attention for long contexts: grid (nh, S), each block covers a slice of the key range; partial (m, l, acc[hd]) go to
+// part[(h*S+s)*(hd+2)], dn_attn_comb merges them (and applies the head gate).
+extern "C" __global__ void dn_attn_split(const float* q, const __half* kc, const __half* vc, float* part, int win, int n, int nh, int nkv, int hd, int S) {
+  __shared__ float mw[8], lw[8]; __shared__ float ow[8][128];
+  int h = blockIdx.x, s = blockIdx.y, kvh = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int t0 = (win > 0 && n > win) ? n - win : 0; int len = n - t0; int per_s = (len + S - 1) / S;
+  int a = t0 + s * per_s, b = min(n, a + per_s);
+  int per = hd / 32; float qv[4], acc[4];
+  for (int j = 0; j < per; j++) { qv[j] = q[h * hd + lane * 4 + j]; acc[j] = 0.f; }
+  float m = -1e30f, l = 0.f, scale = rsqrtf((float)hd);
+  for (int t = a + w; t < b; t += 8) {
+    const __half* kp = kc + ((size_t)t * nkv + kvh) * hd; const __half* vp = vc + ((size_t)t * nkv + kvh) * hd;
+    uint2 kr = *(const uint2*)(kp + lane * 4), vr = *(const uint2*)(vp + lane * 4);
+    const __half* kh = (const __half*)&kr; const __half* vh = (const __half*)&vr;
+    float sc = 0.f; for (int j = 0; j < 4; j++) sc += qv[j] * __half2float(kh[j]);
+    sc = warp_sum(sc) * scale;
+    float mn = fmaxf(m, sc), cr = __expf(m - mn), p = __expf(sc - mn);
+    l = l * cr + p;
+    for (int j = 0; j < 4; j++) acc[j] = acc[j] * cr + p * __half2float(vh[j]);
+    m = mn;
+  }
+  if (lane == 0) { mw[w] = m; lw[w] = l; }
+  for (int j = 0; j < per; j++) ow[w][lane * 4 + j] = acc[j];
+  __syncthreads();
+  float M = -1e30f; for (int i = 0; i < 8; i++) M = fmaxf(M, mw[i]);
+  float* pp = part + ((size_t)h * S + s) * (hd + 2);
+  if (threadIdx.x == 0) { float L = 0.f; for (int i = 0; i < 8; i++) L += lw[i] * __expf(mw[i] - M); pp[0] = M; pp[1] = L; }
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) { float x = 0.f; for (int i = 0; i < 8; i++) x += ow[i][d] * __expf(mw[i] - M); pp[2 + d] = x; }
+}
+extern "C" __global__ void dn_attn_comb(const float* part, const float* gate, float* o, int hd, int S) {
+  int h = blockIdx.x; const float* pp = part + (size_t)h * S * (hd + 2);
+  float M = -1e30f; for (int s = 0; s < S; s++) M = fmaxf(M, pp[s * (hd + 2)]);
+  float L = 0.f; for (int s = 0; s < S; s++) L += pp[s * (hd + 2) + 1] * __expf(pp[s * (hd + 2)] - M);
+  float g = gate ? sigm_f(gate[h]) : 1.f;
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+    float a = 0.f; for (int s = 0; s < S; s++) a += pp[s * (hd + 2) + 2 + d] * __expf(pp[s * (hd + 2)] - M);
+    o[h * hd + d] = a / L * g;
+  }
+}

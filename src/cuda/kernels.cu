@@ -1076,7 +1076,7 @@ __device__ __forceinline__ void mma16816h(float* c, unsigned a0, unsigned a1, un
                : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
 }
 template <int HD>
-__device__ void flash_impl(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq, int nc) {
+__device__ void flash_impl(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq, int nc, int win = 0, int gm = 0) {
   constexpr int PQ = HD + 8, VT = 40;
   extern __shared__ __align__(16) __half fsm[];
   __half* qs = fsm; __half* ks = qs + 64 * PQ; __half* vt = ks + 32 * PQ;
@@ -1094,7 +1094,8 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
   #pragma unroll
   for (int d = 0; d < HD / 8; d++) { o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f; }
   float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
-  for (int k0 = 0; k0 <= last; k0 += 32) {
+  const int kstart = win > 0 ? (max(0, pos0 + q0 - win + 1) & ~31) : 0;
+  for (int k0 = kstart; k0 <= last; k0 += 32) {
     __syncthreads();
     for (int i = tid; i < 32 * HD / 8; i += 128) {
       int r = i / (HD / 8), c = (i % (HD / 8)) * 8;
@@ -1153,8 +1154,8 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
     #pragma unroll
     for (int nt = 0; nt < 4; nt++) {
       int key = k0 + nt * 8 + 2 * t4;
-      if (key > qp0) s[nt][0] = -1e30f; if (key + 1 > qp0) s[nt][1] = -1e30f;
-      if (key > qp1) s[nt][2] = -1e30f; if (key + 1 > qp1) s[nt][3] = -1e30f;
+      if (key > qp0 || (win > 0 && key <= qp0 - win)) s[nt][0] = -1e30f; if (key + 1 > qp0 || (win > 0 && key + 1 <= qp0 - win)) s[nt][1] = -1e30f;
+      if (key > qp1 || (win > 0 && key <= qp1 - win)) s[nt][2] = -1e30f; if (key + 1 > qp1 || (win > 0 && key + 1 <= qp1 - win)) s[nt][3] = -1e30f;
       mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1])); mx1 = fmaxf(mx1, fmaxf(s[nt][2], s[nt][3]));
     }
     mx0 = fmaxf(mx0, __shfl_xor_sync(FULL, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(FULL, mx0, 2));
@@ -1186,7 +1187,7 @@ __device__ void flash_impl(const float* q, const void* kc, const void* vc, const
     float inv = 1.f / (r ? l1 : l0); size_t base = ((size_t)t * nh + h) * HD;
     #pragma unroll
     for (int d = 0; d < HD / 8; d++) for (int e = 0; e < 2; e++) {
-      int col = d * 8 + 2 * t4 + e; out[base + col] = o[d][2 * r + e] * inv * (kvq == 3 ? 1.f : sigm_f(gate[base + col]));
+      int col = d * 8 + 2 * t4 + e; out[base + col] = o[d][2 * r + e] * inv * (gm == 1 ? 1.f : gm == 2 ? sigm_f(gate[(size_t)t * nh + h]) : (kvq == 3 ? 1.f : sigm_f(gate[base + col])));
     }
   }
 }
@@ -1196,4 +1197,9 @@ extern "C" __global__ void __launch_bounds__(128) attn_flash_256(const float* q,
 // block-diffusion preview: every query sees the whole prefix and the whole block
 extern "C" __global__ void __launch_bounds__(128) attn_flash_256_nc(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, const __half* ksc, const __half* vsc, int kvq) {
   flash_impl<256>(q, kc, vc, gate, out, pos0, T, nh, nkv, ksc, vsc, kvq, 1);
+}
+
+// Dense-model prefill attention (hd 128, f16 KV, optional sliding window, optional per-head sigmoid gate [T][nh]).
+extern "C" __global__ void __launch_bounds__(128) dn_flash_128(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, int win) {
+  flash_impl<128>(q, kc, vc, gate, out, pos0, T, nh, nkv, nullptr, nullptr, 0, 0, win, gate ? 2 : 1);
 }

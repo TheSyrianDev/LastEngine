@@ -13,7 +13,7 @@ pub struct DenseGpu {
     m: Dense, _ctx: Arc<CudaContext>, st: Arc<CudaStream>, f: HashMap<&'static str, CudaFunction>,
     lay: Vec<DL>, out_norm: Dp, out_w: W, ff: Dp,
     x: Dp, h: Dp, q: Dp, k: Dp, v: Dp, g: Dp, o: Dp, t1: Dp, t2: Dp, u: Dp, a: Dp, logits: Dp,
-    xqb: Dp, xdb: Dp, xsb: Dp,
+    xqb: Dp, xdb: Dp, xsb: Dp, part: Dp,
     kc: Vec<Dp>, vc: Vec<Dp>, conv: Vec<Dp>, pos: usize, ctx_len: usize,
     bx: Dp, bh: Dp, bq: Dp, bk: Dp, bv: Dp, bg: Dp, bo: Dp, bt1: Dp, bt2: Dp, bu: Dp, ba: Dp, bxq: Dp, bxd: Dp, bxs: Dp, boff: Dp,
 }
@@ -29,7 +29,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_attn", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -75,7 +75,7 @@ impl DenseGpu {
         DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
             x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(ffn), logits: fb(m.vocab),
-            xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
+            part: dalloc(m.n_head * 128 * (hd + 2) * 4), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
             kc, vc, conv, pos: 0, ctx_len, lay,
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
             bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bu: dalloc(CH * ffn * 4), ba: dalloc(CH * ffn * 4),
@@ -107,6 +107,11 @@ impl DenseGpu {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
         unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 }).expect("launch"); }
+    }
+    fn launch3s(&self, name: &str, grid: (u32, u32, u32), block: u32, smem: u32, args: &[A]) {
+        let mut b = self.st.launch_builder(&self.f[name]);
+        for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
     }
     /// Quantise `t` rows of `cols` floats from `x` for the batched GEMMs.
     fn bqx(&self, x: Dp, t: usize, cols: usize) { let u = t * cols / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.bxq), P(self.bxd), P(self.bxs), I(u as i32)]); }
@@ -145,7 +150,12 @@ impl DenseGpu {
                 self.launch3("dn_prep", (nkv as u32, t as u32, 1), 128, &[P(self.bk), P(kslot), I(1), I(hd as i32), I(m.rope_dim as i32), I(pos0 as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps)]);
                 self.launch("dn_cvt_half", (t * nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.bv), P(self.vc[l] + (pos0 * nkv * hd * 2) as u64), I((t * nkv * hd) as i32)]);
                 let win = if d.swa { m.window } else { 0 };
+                if hd == 128 && std::env::var("LE_DN_FLASH").map_or(true, |v| v != "0") {
+                    let smem = ((64 + 32) * (hd + 8) + hd * 40) * 2;
+                    self.launch3s("dn_flash_128", (t.div_ceil(64) as u32, nh as u32, 1), 128, smem as u32, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), I(win as i32)]);
+                } else {
                 self.launch3("dn_attn", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I((pos0 + 1) as i32), I(nh as i32), I(nkv as i32), I(hd as i32)]);
+                }
                 self.bqx(self.bo, t, nh * hd);
                 self.bmm(d.wo, self.bt2, t);
             }
@@ -204,7 +214,14 @@ impl DenseGpu {
                 self.launch("dn_cvt_half", (nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.v), P(self.vc[l] + (self.pos * nkv * hd * 2) as u64), I((nkv * hd) as i32)]);
                 let nk = self.pos + 1;
                 let win = if d.swa { m.window } else { 0 };
+                let span = if win > 0 { nk.min(win) } else { nk };
+                if hd == 128 && span >= std::env::var("LE_DN_SPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize) && std::env::var("LE_DN_SPLIT").map_or(true, |v| v != "0") {
+                    let sp = std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or((span / 64).clamp(2, 128) as i32);
+                    self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp)]);
+                    self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp)]);
+                } else {
                 self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32)]);
+                }
                 self.mv(d.wo, self.o, self.t2);
             }
             if lfm { self.rms(self.t2, d.post_attn, self.t2, n); }

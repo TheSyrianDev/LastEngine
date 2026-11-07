@@ -20,3 +20,11 @@ Tool: `tools/bench_vs_llamacpp.py`. One run per cell for LastEngine, mean of 2 f
 | 16384 | not run (attention cost grows quadratically) | | | |
 
 Cause: the dense attention kernels (`dn_attn` in src/cuda/dense.cu) are a simple one-block-per-head loop with a warp reduction per key; no flash-style tiling or split-K. Fixing this is the next dense-model task.
+
+## MiniCPM5-2B Q4_K_M after flash prefill + split-K decode (2026-11-07, LastEngine only)
+llama.cpp could not be re-run: its build directory (~/AI/engines/llama-mainline) is no longer on disk, so no matched llama.cpp numbers exist for this section.
+| prompt | prefill tok/s | decode tok/s (128 tokens) |
+|---|---|---|
+| ~4K (4071) | 1540 | 71.1 |
+| ~16K (16359) | 1071 | 44.5 |
+Earlier llama.cpp numbers in this file (prefill 3400/2890 at 512/4K, decode ~90) are from the earlier session and should be re-measured before any claim.
