@@ -36,10 +36,10 @@ try:
     check("chat usage/timings", c == 200 and a["usage"]["prompt_tokens"] > 100 and a["usage"]["total_tokens"] == a["usage"]["prompt_tokens"] + a["usage"]["completion_tokens"] and a["timings"]["predicted_per_second"] > 0, str(a.get("usage")))
     c, b = chat([{"role": "user", "content": long_user}], max_tokens=8)
     check("prefix-cache reuse on identical prompt", c == 200 and b["usage"]["prompt_tokens_details"]["cached_tokens"] > 50, f"cached {b['usage']['prompt_tokens_details']['cached_tokens']}")
-    c, d = chat([{"role": "user", "content": "Count: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10. Repeat the list."}], max_tokens=60, stop=["5"])
+    c, d = chat([{"role": "user", "content": "Count: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10. Repeat the list."}], max_tokens=400, stop=["5"])
     txt = d["choices"][0]["message"]["content"]; check("stop string", c == 200 and "5" not in txt and d["choices"][0]["finish_reason"] == "stop", repr(txt[-30:]))
     tools = [{"type": "function", "function": {"name": "get_weather", "description": "Get weather for a city", "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}]
-    c, t = chat([{"role": "user", "content": "What is the weather in Paris? Use the tool."}], max_tokens=120, tools=tools)
+    c, t = chat([{"role": "user", "content": "What is the weather in Paris? Use the tool."}], max_tokens=400, tools=tools)
     tc = t["choices"][0]["message"].get("tool_calls") if c == 200 else None
     check("tool_calls (non-stream)", bool(tc) and tc[0]["function"]["name"] == "get_weather" and json.loads(tc[0]["function"]["arguments"]).get("city"), str(tc)[:100])
     # streaming
