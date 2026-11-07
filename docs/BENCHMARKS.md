@@ -91,3 +91,12 @@ Same session, back to back:
 So prefill +10% at 4K and +7% at 16K. Decode unchanged.
 dense-cmp 15/15 argmax: MiniCPM5 (mean |dlogprob| 0.0032), LFM3 (0.0018).
 llama.cpp b12182 (same card, same flags): 4K pp 3376, 16K pp 2374. Still behind, about 1.9x at 4K.
+
+## MMQ128 launch bounds (2026-11-07, MiniCPM5 Q4_K_M, serve --ctx 17000, 128 tokens, temp 0, same session)
+Change: `__launch_bounds__(256, 2)` on the mmq128 kernels (src/cuda/kernels.cu, MMQ128 macro). Lets the compiler use up to 2 blocks per SM.
+Two binaries, run back to back with the same script (/tmp/claude-1000/bench_bin.sh):
+- base (813bf9f): 4K prefill 1770 (first run), decode 80.8; 16K prefill 1174, decode 51.9
+- launch bounds (256,2): 4K prefill 1854 (first run), decode 80.7; 16K prefill 1217, decode 51.8
+Prefill +5% at 4K, +4% at 16K; decode unchanged. The second 4K prefill run in each build (about 70 tok/s) is a prefix-cache hit on the repeated prompt, not prefill; use the first run.
+dense-cmp 15/15 argmax: MiniCPM5 (mean |dlogprob| 0.0032, max 0.0169), LFM3 (0.0018, max 0.0091).
+llama.cpp b12182 (same card): 4K pp 3376, 16K pp 2374, tg ~102.

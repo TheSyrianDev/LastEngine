@@ -1119,7 +1119,7 @@ __device__ void mmq128_impl(const u8* const* ptrs, const int* off, const int* in
     }
 }
 
-#define MMQ128(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq128_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
+#define MMQ128(TY, H) extern "C" __global__ void __launch_bounds__(256, 2) mmq128_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
 MMQ128(2, false) MMQ128(8, false) MMQ128(11, true) MMQ128(12, false) MMQ128(13, false) MMQ128(14, true)
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
 MMQ(2, false) MMQ(8, false) MMQ(11, true) MMQ(12, false) MMQ(13, false) MMQ(14, true) MMQ(16, false) MMQ(17, true) MMQ(18, false) MMQ(19, false) MMQ(20, false) MMQ(21, false) MMQ(22, true) MMQ(23, false) MMQ(29, false) MMQ(134, false) MMQ(135, false) MMQ(137, false) MMQ(138, false) MMQ(139, false) MMQ(140, false) MMQ(141, false) MMQ(144, false) MMQ(145, false) MMQ(146, false) MMQ(152, false) MMQ(153, false) MMQ(154, false) MMQ(155, false) MMQ(156, false) MMQ(157, false) MMQ(158, false)
