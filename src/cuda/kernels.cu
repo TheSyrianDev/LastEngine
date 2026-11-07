@@ -977,29 +977,29 @@ __device__ void mmq_impl(const u8* const* ptrs, const int* off, const int* in_id
   #pragma unroll
   for (int i = 0; i < 4; i++) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f; }
   int wm = (warp & 3) * 16, wn = (warp >> 2) * 32;
-  for (int u0 = 0; u0 < units; u0 += 4) {
+  // Register prefetch: step u0+4's global loads are issued before this step's mma, so memory latency overlaps tensor-core work.
+  int w[8]; float s0 = 0.f, s1 = 0.f, mn = 0.f; int4 q0 = make_int4(0, 0, 0, 0), q1 = q0; float bd = 0.f, bs = 0.f;
+  auto fetch = [&](int u0) {
     int u = u0 + la_u;
-    {
-      int w[8]; float s0 = 0.f, s1 = 0.f, mn = 0.f;
-      if (wok && !NODEQ) { uloadr<TY>(wrow + Q<TY>::HDR + (u / UB) * BY, u % UB, w, s0, s1, mn, wrow); } else { for (int i = 0; i < 8; i++) w[i] = 0; }
-      #pragma unroll
-      for (int i = 0; i < 8; i++) As[la_u][la_row][i] = w[i];
-      Sa0[la_u][la_row] = s0; Sa1[la_u][la_row] = s1; Sam[la_u][la_row] = mn;
-    }
-    {
-      int ub = u0 + lb_u;
-      if (tok_ok) {
-        const int4* gq = (const int4*)(xq + (size_t)xr * cols + ub * 32);
-        int4 q0 = gq[0], q1 = gq[1];
-        Bs[lb_u][lb_tok][0] = q0.x; Bs[lb_u][lb_tok][1] = q0.y; Bs[lb_u][lb_tok][2] = q0.z; Bs[lb_u][lb_tok][3] = q0.w;
-        Bs[lb_u][lb_tok][4] = q1.x; Bs[lb_u][lb_tok][5] = q1.y; Bs[lb_u][lb_tok][6] = q1.z; Bs[lb_u][lb_tok][7] = q1.w;
-        Sbd[lb_u][lb_tok] = xd[(size_t)xr * units + ub]; Sbs[lb_u][lb_tok] = (float)xs[(size_t)xr * units + ub];
-      } else {
-        for (int i = 0; i < 8; i++) Bs[lb_u][lb_tok][i] = 0;
-        Sbd[lb_u][lb_tok] = 0.f; Sbs[lb_u][lb_tok] = 0.f;
-      }
-    }
+    if (wok && !NODEQ) { uloadr<TY>(wrow + Q<TY>::HDR + (u / UB) * BY, u % UB, w, s0, s1, mn, wrow); }
+    else { for (int i = 0; i < 8; i++) w[i] = 0; s0 = s1 = mn = 0.f; }
+    int ub = u0 + lb_u;
+    if (tok_ok) {
+      const int4* gq = (const int4*)(xq + (size_t)xr * cols + ub * 32);
+      q0 = gq[0]; q1 = gq[1];
+      bd = xd[(size_t)xr * units + ub]; bs = (float)xs[(size_t)xr * units + ub];
+    } else { q0 = make_int4(0, 0, 0, 0); q1 = q0; bd = 0.f; bs = 0.f; }
+  };
+  fetch(0);
+  for (int u0 = 0; u0 < units; u0 += 4) {
+    #pragma unroll
+    for (int i = 0; i < 8; i++) As[la_u][la_row][i] = w[i];
+    Sa0[la_u][la_row] = s0; Sa1[la_u][la_row] = s1; Sam[la_u][la_row] = mn;
+    Bs[lb_u][lb_tok][0] = q0.x; Bs[lb_u][lb_tok][1] = q0.y; Bs[lb_u][lb_tok][2] = q0.z; Bs[lb_u][lb_tok][3] = q0.w;
+    Bs[lb_u][lb_tok][4] = q1.x; Bs[lb_u][lb_tok][5] = q1.y; Bs[lb_u][lb_tok][6] = q1.z; Bs[lb_u][lb_tok][7] = q1.w;
+    Sbd[lb_u][lb_tok] = bd; Sbs[lb_u][lb_tok] = bs;
     __syncthreads();
+    if (u0 + 4 < units) fetch(u0 + 4);
     #pragma unroll
     for (int uu = 0; uu < 4; uu++) {
       int ra = wm + g, rb = wm + g + 8;

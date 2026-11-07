@@ -55,3 +55,11 @@ Hardware: RTX 3050 Laptop 4 GB, driver 615.78.08.
 LastEngine on MiniCPM5 Q4_K_M, same card (serve, one chat request, 128 generated tokens, temperature 0; not llama-bench, so prompt text differs): 4K prefill 1541, decode 75.7 tok/s; 16K prefill 1060, decode 49.4 tok/s.
 Sage MoE LastEngine numbers are from the earlier run against llama.cpp mainline (not re-run here): 4K prefill 817, decode 31.7 tok/s.
 Caveat: one repetition per cell, so no error bars; the llama-bench rows show ±0.00 because only one run was done.
+
+## mmq register prefetch (2026-11-07, MiniCPM5 Q4_K_M, serve, one chat request, 128 generated tokens, temperature 0)
+Change: mmq_impl loads the next 4-unit step's weights and activations into registers before the current step's mma (src/cuda/kernels.cu, mmq_impl).
+| prompt | before prefill / decode | after prefill / decode |
+|---|---|---|
+| 4K (4071 tok) | 1541 / 75.7 | 1582 / 77.1 |
+| 16K (16359 tok) | 1060 / 49.4 | 1094 / 50.1 |
+dense-cmp 15/15 argmax (MiniCPM5, 15 tokens, mean |dlogprob| 0.0032). Gain is about 3%; llama.cpp b12182 is 3376 / 2374 prefill and ~102 decode on the same card.
