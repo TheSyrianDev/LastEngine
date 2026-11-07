@@ -1,0 +1,22 @@
+# DRAFT, not yet run. Builds the CPU-only checks on tags. CUDA builds need a self-hosted runner with an NVIDIA GPU.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build (no CUDA)
+        run: cargo build --release
+      - name: Unit tests that need no GPU
+        run: cargo test --release --lib
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lastengine-linux-x86_64
+          path: target/release/lastengine
