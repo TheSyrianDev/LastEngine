@@ -73,3 +73,12 @@ dense-cmp 15/15 argmax (MiniCPM5, 15 tokens, mean |dlogprob| 0.0032).
 Change: decode position and KV length are uploaded once per token into a device buffer (DenseGpu.dpos); dn_prep, dn_cvt_half_d, dn_attn and dn_attn_split read them there, so kernel launch args no longer change per token. Prerequisite for CUDA graph capture; no speed change by itself.
 Measured: 4K prefill 1572, decode 73.1 and 76.6 (two runs); 16K prefill 1088, decode 49.7. Same as before within run-to-run noise (4K decode 72-77).
 dense-cmp 15/15 argmax: MiniCPM5 default (mean |dlogprob| 0.0032), LFM3 (0.0018), MiniCPM5 with LE_DN_SPLIT_MIN=4 (0.0045).
+
+## Decode CUDA graph (2026-11-07, MiniCPM5 Q4_K_M, serve --ctx 17000, 128 tokens, temp 0)
+Change: the decode layer loop (fn layers, src/gpu/dense.rs) is captured once per split-K pattern into a CUDA graph and replayed each token (cudarc begin_capture/end_capture, thread-local mode). The dense engine stream is now a non-blocking stream (the legacy default stream cannot capture). LE_DN_GRAPH=0 turns graphs off.
+Same session, back to back:
+- graph on: 4K prefill 1583, decode 80.4 and 80.5; 16K prefill 1092, decode 51.8
+- graph off (LE_DN_GRAPH=0): 4K prefill 1578, decode 76.8 and 76.6; 16K prefill 1089, decode 50.1
+So graphs give about +5% decode at 4K and +3% at 16K. Prefill unchanged.
+dense-cmp 15/15 argmax: MiniCPM5 default (mean |dlogprob| 0.0032), LFM3 (0.0018), MiniCPM5 with LE_DN_SPLIT_MIN=4 forced split (0.0045).
+llama.cpp b12182 (same card, same flags as above): 4K pp 3376, 16K pp 2374, tg ~102. Still behind.

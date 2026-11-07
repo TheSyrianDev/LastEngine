@@ -2,6 +2,10 @@
 //! one token at a time through the existing quantised matvec kernels plus the `dn_*` kernels in cuda/dense.cu.
 use super::*;
 use crate::dense::{Dense, Kind, LayerKind};
+use cudarc::driver::CudaGraph;
+/// A captured graph is only ever launched by the thread that owns this DenseGpu (behind the engine's mutex).
+pub struct GraphBox(CudaGraph);
+unsafe impl Send for GraphBox {}
 
 struct DL {
     attn_norm: Dp, ffn_norm: Dp, post_attn: Dp, post_ffw: Dp, swa: bool, conv: bool,
@@ -16,6 +20,8 @@ pub struct DenseGpu {
     xqb: Dp, xdb: Dp, xsb: Dp, part: Dp,
     /// Device-resident [pos, pos+1] for the decode step: kernels read the position and KV length here, so launch args stay constant per token (graph-capturable).
     dpos: Dp,
+    /// CUDA graphs of the decode layer loop, keyed by the per-layer split-K choice.
+    graphs: HashMap<Vec<bool>, GraphBox>,
     kc: Vec<Dp>, vc: Vec<Dp>, conv: Vec<Dp>, pos: usize, ctx_len: usize,
     bx: Dp, bh: Dp, bq: Dp, bk: Dp, bv: Dp, bg: Dp, bo: Dp, bt1: Dp, bt2: Dp, bu: Dp, ba: Dp, bxq: Dp, bxd: Dp, bxs: Dp, boff: Dp,
 }
@@ -35,7 +41,7 @@ impl DenseGpu {
     pub fn new(m: Dense, ctx_len: usize) -> DenseGpu {
         let ctx = CudaContext::new(0).unwrap_or_else(|e| { eprintln!("lastengine: no usable CUDA device: {e:?}"); std::process::exit(1) });
         let arch = cuda_arch(&ctx).unwrap_or_else(|e| { eprintln!("lastengine: {e}"); std::process::exit(1) });
-        let st = ctx.default_stream();
+        let st = ctx.new_stream().expect("stream"); // non-blocking: the legacy default stream cannot be graph-captured
         let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
         let opts = CompileOptions { arch: Some(arch), include_paths: inc.into_iter().collect(), ..Default::default() };
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
@@ -87,7 +93,7 @@ impl DenseGpu {
         DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
             x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(ffn), logits: fb(m.vocab),
-            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
+            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
             kc, vc, conv, pos: 0, ctx_len, lay,
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
             bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bu: dalloc(CH * ffn * 4), ba: dalloc(CH * ffn * 4),
@@ -198,13 +204,10 @@ impl DenseGpu {
         self.pos = 0;
         for l in 0..self.lay.len() { if self.lay[l].conv { dzero(self.conv[l], self.m.n_embd * (self.m.l_cache - 1) * 4); } }
     }
-    fn step(&mut self, token: u32, want: bool) -> Vec<f32> {
-        assert!(self.pos < self.ctx_len, "dense gpu: context full");
+    /// Runs all layers for one decode token. Only kernel launches here, so the sequence can be captured in a CUDA graph.
+    /// `split[l]` picks split-K attention for layer l (decided on the host from the KV length).
+    fn layers(&self, split: &[bool]) {
         let m = &self.m; let (n, hd, nh, nkv) = (m.n_embd, m.head_dim, m.n_head, m.n_kv);
-        let pos = self.pos as i32;
-        let mut e = vec![0f32; n];
-        { let (t, b) = m.bytes("token_embd.weight"); let rb = crate::quant::row_bytes(t.ty, n); crate::quant::dequant_row(t.ty, &b[token as usize * rb..(token as usize + 1) * rb], &mut e); }
-        unsafe { result::memcpy_htod_sync(self.x, &e).unwrap(); result::memcpy_htod_sync(self.dpos, &[self.pos as i32, (self.pos + 1) as i32]).unwrap() };
         let lfm = m.kind == Kind::Lfm3;
         for l in 0..m.n_layer {
             let d = &self.lay[l];
@@ -220,15 +223,13 @@ impl DenseGpu {
                 let base = if d.swa { m.rope_base_swa } else { m.rope_base };
                 let ff = if d.swa { 0 } else { self.ff };
                 let neox = m.neox as i32;
-                let kslot = self.kc[l] + (self.pos * nkv * hd * 2) as u64;
-                self.launch("dn_prep", nh as u32, 128, 0, &[P(self.q), P(self.q), I(0), I(hd as i32), I(m.rope_dim as i32), I(pos), F(base), P(ff), I(neox), P(d.qn), F(m.eps), P(self.dpos), I(0)]);
-                self.launch("dn_prep", nkv as u32, 128, 0, &[P(self.k), P(self.kc[l]), I(1), I(hd as i32), I(m.rope_dim as i32), I(pos), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(self.dpos), I((nkv * hd) as i32)]);
+                self.launch("dn_prep", nh as u32, 128, 0, &[P(self.q), P(self.q), I(0), I(hd as i32), I(m.rope_dim as i32), I(self.pos as i32), F(base), P(ff), I(neox), P(d.qn), F(m.eps), P(self.dpos), I(0)]);
+                self.launch("dn_prep", nkv as u32, 128, 0, &[P(self.k), P(self.kc[l]), I(1), I(hd as i32), I(m.rope_dim as i32), I(self.pos as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(self.dpos), I((nkv * hd) as i32)]);
                 self.launch("dn_cvt_half_d", (nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.v), P(self.vc[l]), P(self.dpos), I((nkv * hd) as i32)]);
                 let nk = self.pos + 1;
                 let win = if d.swa { m.window } else { 0 };
-                let span = if win > 0 { nk.min(win) } else { nk };
-                let (split_min, split_on, sp) = dn_split_env();
-                if hd == 128 && span >= split_min && split_on {
+                let (_, _, sp) = dn_split_env();
+                if split[l] {
                     self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32), P(self.dpos + 4)]);
                     self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp as i32)]);
                 } else {
@@ -247,6 +248,28 @@ impl DenseGpu {
             if lfm { self.rms(self.t2, d.post_ffw, self.t2, n); }
             self.add(self.x, self.t2, n);
         }
+    }
+
+    fn step(&mut self, token: u32, want: bool) -> Vec<f32> {
+        assert!(self.pos < self.ctx_len, "dense gpu: context full");
+        let m = &self.m; let (n, hd, nh, nkv) = (m.n_embd, m.head_dim, m.n_head, m.n_kv);
+        let pos = self.pos as i32;
+        let mut e = vec![0f32; n];
+        { let (t, b) = m.bytes("token_embd.weight"); let rb = crate::quant::row_bytes(t.ty, n); crate::quant::dequant_row(t.ty, &b[token as usize * rb..(token as usize + 1) * rb], &mut e); }
+        unsafe { result::memcpy_htod_sync(self.x, &e).unwrap(); result::memcpy_htod_sync(self.dpos, &[self.pos as i32, (self.pos + 1) as i32]).unwrap() };
+        let lfm = m.kind == Kind::Lfm3;
+        let (split_min, split_on, _) = dn_split_env();
+        let nk = self.pos + 1;
+        let split: Vec<bool> = (0..m.n_layer).map(|l| { if self.lay[l].conv { return false; } let win = if self.lay[l].swa { m.window } else { 0 }; let span = if win > 0 { nk.min(win) } else { nk }; m.head_dim == 128 && span >= split_min && split_on }).collect();
+        if std::env::var("LE_DN_GRAPH").map_or(true, |v| v != "0") {
+            if !self.graphs.contains_key(&split) {
+                self.st.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL).expect("graph begin");
+                self.layers(&split);
+                let g = self.st.end_capture(sys::CUgraphInstantiate_flags(0)).expect("graph end").expect("empty graph");
+                self.graphs.insert(split.clone(), GraphBox(g));
+            }
+            self.graphs[&split].0.launch().expect("graph launch");
+        } else { self.layers(&split); }
         self.pos += 1;
         if !want { return Vec::new(); }
         self.rms(self.x, self.out_norm, self.h, n);
