@@ -46,6 +46,6 @@ HEAD 085ede9 re-measured this session: 4K prefill 1690 / 1687 tok/s, 16K 1187, 4
 | step 3 `__launch_bounds__(256,1)` | 1581 | 1136 | slower, reverted |
 | step 1 256-token tile, 16 warps, dynamic smem 57344 B | 1699 / 1693 | 1201 | within noise, reverted |
 | scale loads as float2 out of inner loop | 1704 / 1701 | 1198 | within noise, reverted |
-| stream-K / wave fit | not built | | grid bound: 4K qkv grid 1152 blocks = 57.6 waves at 20 SMs x 1, last wave 40% empty, about 0.7% waste; ruled out on this bound, not measured |
+| persistent wave-fit (grid = 40 resident blocks, strided tile loop, no fixup kernel) | 1553 / 1549 | 1115 | slower, reverted. The grid bound (about 0.7% tail waste) is consistent with this result: the loop-over-tiles cost outweighs any tail gain. Not a full stream-K (no split-K fixup was built). |
 
 Profiling blocked: Nsight Compute returns ERR_NVGPUCTRPERM (no GPU performance counter access for this user). Per-kernel limits are unknown until counters are enabled.
