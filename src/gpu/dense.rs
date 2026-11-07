@@ -47,7 +47,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -135,8 +135,12 @@ impl DenseGpu {
     fn bqx(&self, x: Dp, t: usize, cols: usize) { let u = t * cols / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.bxq), P(self.bxd), P(self.bxs), I(u as i32)]); }
     /// out[t][rows] = W · quantised x[t][cols] (int8 tensor-core path).
     fn bmm(&self, w: W, out: Dp, t: usize) {
-        let name = match w.ty { 2 => "mmq_2", 8 => "mmq_8", 11 => "mmq_11", 12 => "mmq_12", 13 => "mmq_13", 14 => "mmq_14", t => panic!("dense gpu: no mmq kernel for type {t}") };
-        self.launch3(name, (w.rows.div_ceil(64) as u32, t.div_ceil(64) as u32, 1), 256, &[P(w.cell), P(self.boff), P(0), P(0), P(self.bxq), P(self.bxd), P(self.bxs), P(out), I(w.rows as i32), I(w.cols as i32)]);
+        let wide = std::env::var("LE_MMQ128").map_or(true, |v| v != "0");
+        let name = match (w.ty, wide) { (2, false) => "mmq_2", (8, false) => "mmq_8", (11, false) => "mmq_11", (12, false) => "mmq_12", (13, false) => "mmq_13", (14, false) => "mmq_14",
+            (2, true) => "mmq128_2", (8, true) => "mmq128_8", (11, true) => "mmq128_11", (12, true) => "mmq128_12", (13, true) => "mmq128_13", (14, true) => "mmq128_14",
+            (t, _) => panic!("dense gpu: no mmq kernel for type {t}") };
+        let tile = if wide { 128 } else { 64 };
+        self.launch3(name, (w.rows.div_ceil(64) as u32, t.div_ceil(tile) as u32, 1), 256, &[P(w.cell), P(self.boff), P(0), P(0), P(self.bxq), P(self.bxd), P(self.bxs), P(out), I(w.rows as i32), I(w.cols as i32)]);
     }
     fn brms(&self, x: Dp, w: Dp, o: Dp, t: usize) { self.launch("rmsnorm_b", t as u32, 256, 0, &[P(x), P(w), P(o), I(self.m.n_embd as i32), F(self.m.eps)]); }
     /// Process up to CH tokens as one batch; returns the logits of the last one.

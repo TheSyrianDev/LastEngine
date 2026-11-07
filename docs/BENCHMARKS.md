@@ -82,3 +82,12 @@ Same session, back to back:
 So graphs give about +5% decode at 4K and +3% at 16K. Prefill unchanged.
 dense-cmp 15/15 argmax: MiniCPM5 default (mean |dlogprob| 0.0032), LFM3 (0.0018), MiniCPM5 with LE_DN_SPLIT_MIN=4 forced split (0.0045).
 llama.cpp b12182 (same card, same flags as above): 4K pp 3376, 16K pp 2374, tg ~102. Still behind.
+
+## Dense prefill: 128-token MMQ tile (2026-11-07, MiniCPM5 Q4_K_M, serve --ctx 17000, 128 tokens, temp 0)
+Change: mmq128_impl (src/cuda/kernels.cu) stages 128 tokens per block instead of 64, so each weight tile is dequantised half as often. Selected by LE_MMQ128 (default on; LE_MMQ128=0 gives the 64-token kernel). Dense path only; MoE unchanged.
+Same session, back to back:
+- LE_MMQ128=0: 4K prefill 1589, decode 80.7; 16K prefill 1093, decode 51.8
+- LE_MMQ128=1 (default): 4K prefill 1752, decode 80.5; 16K prefill 1167, decode 51.7
+So prefill +10% at 4K and +7% at 16K. Decode unchanged.
+dense-cmp 15/15 argmax: MiniCPM5 (mean |dlogprob| 0.0032), LFM3 (0.0018).
+llama.cpp b12182 (same card, same flags): 4K pp 3376, 16K pp 2374. Still behind, about 1.9x at 4K.
