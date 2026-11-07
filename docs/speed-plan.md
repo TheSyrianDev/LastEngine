@@ -49,3 +49,5 @@ HEAD 085ede9 re-measured this session: 4K prefill 1690 / 1687 tok/s, 16K 1187, 4
 | persistent wave-fit (grid = 40 resident blocks, strided tile loop, no fixup kernel) | 1553 / 1549 | 1115 | slower, reverted. The grid bound (about 0.7% tail waste) is consistent with this result: the loop-over-tiles cost outweighs any tail gain. Not a full stream-K (no split-K fixup was built). |
 
 Profiling blocked: Nsight Compute returns ERR_NVGPUCTRPERM (no GPU performance counter access for this user). Per-kernel limits are unknown until counters are enabled.
+
+Full stream-K (fixed 40 blocks, contiguous K-step ranges per block, atomicAdd merge into a zeroed output): 1450 / 1454 tok/s at 4K, 1066 at 16K. Slower than HEAD, reverted. The grid bound (about 0.7% tail waste) was not the limiting factor.
