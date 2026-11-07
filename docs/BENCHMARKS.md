@@ -41,3 +41,17 @@ Default split count changed from span/64 to a fixed 16 (`LE_DN_SP` still overrid
 | 128 | 64.7 | |
 Prefill unchanged (~1530 tok/s at 4K, ~1060 at 16K). dense-cmp 15/15 argmax after the change.
 Profile at 4K (nsys, decode-heavy run): mmq_12 46% of GPU time (prefill GEMMs), dn_flash_128 13%, matvec_12 11%, mmq_14 9%, dn_attn_split 6% (78 us per call, 2268 launches incl. prefill), matvec_14 5%.
+
+## llama.cpp b12182 (2026-11-07, matched flags, single run each)
+Binaries: /home/omar/AI/engines/llama-prebuilt-b12182/full/llama-b12182/ (llama-bench, llama-server; version 0.9.0-dev build 12182 commit fd27b2034; CUDA 12.8 cudart and cublas libs from the cudart archive copied into the same folder; run with LD_LIBRARY_PATH set to that folder).
+Command: llama-bench -m MODEL -p N -n 128 -ngl 99 -fa 1 -r 1 (MoE adds -ncmoe 99).
+Hardware: RTX 3050 Laptop 4 GB, driver 615.78.08.
+
+| model | pp512 | pp4096 | pp16384 | tg128 |
+|---|---|---|---|---|
+| MiniCPM5 Q4_K_M (dense) | 3796 | 3376 | 2374 | 102.3 (pp16384 run: 102.9) |
+| Sage-A1.5 APEX MiniPlus, -ncmoe 99 | | 342 | 335 | 25.2 |
+
+LastEngine on MiniCPM5 Q4_K_M, same card (serve, one chat request, 128 generated tokens, temperature 0; not llama-bench, so prompt text differs): 4K prefill 1541, decode 75.7 tok/s; 16K prefill 1060, decode 49.4 tok/s.
+Sage MoE LastEngine numbers are from the earlier run against llama.cpp mainline (not re-run here): 4K prefill 817, decode 31.7 tok/s.
+Caveat: one repetition per cell, so no error bars; the llama-bench rows show ±0.00 because only one run was done.
