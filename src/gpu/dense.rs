@@ -216,7 +216,7 @@ impl DenseGpu {
                 let win = if d.swa { m.window } else { 0 };
                 let span = if win > 0 { nk.min(win) } else { nk };
                 if hd == 128 && span >= std::env::var("LE_DN_SPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize) && std::env::var("LE_DN_SPLIT").map_or(true, |v| v != "0") {
-                    let sp = std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or((span / 64).clamp(2, 128) as i32);
+                    let sp = std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or(16);
                     self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp)]);
                     self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp)]);
                 } else {

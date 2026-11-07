@@ -28,3 +28,16 @@ llama.cpp could not be re-run: its build directory (~/AI/engines/llama-mainline)
 | ~4K (4071) | 1540 | 71.1 |
 | ~16K (16359) | 1071 | 44.5 |
 Earlier llama.cpp numbers in this file (prefill 3400/2890 at 512/4K, decode ~90) are from the earlier session and should be re-measured before any claim.
+
+## Dense split-K tuning (2026-11-07, LastEngine only, MiniCPM5 Q4_K_M, 128 generated tokens)
+Default split count changed from span/64 to a fixed 16 (`LE_DN_SP` still overrides).
+| split count | 4K decode tok/s | 16K decode tok/s |
+|---|---|---|
+| 4 | 74.6 | |
+| 8 | 75.1 | |
+| 16 (new default) | 76.2 | 49.4 |
+| 32 | | 48.2 |
+| 64 (old default) | 71.3 | 46.5 |
+| 128 | 64.7 | |
+Prefill unchanged (~1530 tok/s at 4K, ~1060 at 16K). dense-cmp 15/15 argmax after the change.
+Profile at 4K (nsys, decode-heavy run): mmq_12 46% of GPU time (prefill GEMMs), dn_flash_128 13%, matvec_12 11%, mmq_14 9%, dn_attn_split 6% (78 us per call, 2268 launches incl. prefill), matvec_14 5%.
