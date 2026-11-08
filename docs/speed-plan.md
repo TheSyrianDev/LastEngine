@@ -51,3 +51,16 @@ HEAD 085ede9 re-measured this session: 4K prefill 1690 / 1687 tok/s, 16K 1187, 4
 Profiling blocked: Nsight Compute returns ERR_NVGPUCTRPERM (no GPU performance counter access for this user). Per-kernel limits are unknown until counters are enabled.
 
 Full stream-K (fixed 40 blocks, contiguous K-step ranges per block, atomicAdd merge into a zeroed output): 1450 / 1454 tok/s at 4K, 1066 at 16K. Slower than HEAD, reverted. The grid bound (about 0.7% tail waste) was not the limiting factor.
+
+## Matched baseline (2026-11-08, RTX 3050 Laptop, sm_86, MiniCPM5-2B Q4_K_M)
+
+llama.cpp: local checkout b10330 (commit 687e778), Linux CUDA build of `git archive` in /tmp/claude-1000/llama-src, CMAKE_CUDA_ARCHITECTURES=86.
+Command: `llama-bench -m MiniCPM5-2B-Q4_K_M.gguf -ngl 99 -p 4096,16384 -n 128 -r 2 -o md`
+
+| Test | llama.cpp b10330 | LastEngine HEAD 085ede9 (server timings) | Gap |
+|---|---|---|---|
+| pp4096 | 3196.34 +- 5.97 | 1690 / 1687 | 1.9x |
+| pp16384 | 2289.69 +- 3.44 | 1187 | 1.9x |
+| tg128 | 102.03 +- 0.32 | 71.6 / 72.4 | 1.4x |
+
+Caveat: llama-bench times bare prefill/decode; our numbers come from the HTTP server timings, so server overhead is not isolated.
