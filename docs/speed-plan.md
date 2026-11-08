@@ -73,3 +73,8 @@ Model read per token: Q4_K_M, about 1.45 GiB (about 1.56 GB).
 - llama.cpp decode 102 tok/s: about 159 GB/s, about 83% of peak.
 
 Kernel reading: `mv_impl` (src/cuda/kernels.cu:372) runs one row per warp for cols=2304 (32 lanes, one 32-value unit each). Weight blocks are 18-to-210-byte packed structs read per lane, not vector loads. This is the likely cause of the low bandwidth. Not yet changed or measured.
+
+## Decode matvec: two rows per lane group (2026-11-08)
+
+`mv_impl` handles two rows per lane group, both weight streams issued before reduction, rpb 8→16 in dense.rs and gpu.rs. Kernel test gpu_matvec_matches_cpu_dequant passed.
+Bench (bench_bin.sh, same settings): HEAD decode 73.0 / 73.0 tok/s, prefill 1705/1692 (4K), 1194 (16K). Two-row: decode 70.7 / 70.7, prefill 1695/1692, 1189. Slower on decode, reverted; not committed.
