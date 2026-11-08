@@ -64,3 +64,12 @@ Command: `llama-bench -m MiniCPM5-2B-Q4_K_M.gguf -ngl 99 -p 4096,16384 -n 128 -r
 | tg128 | 102.03 +- 0.32 | 71.6 / 72.4 | 1.4x |
 
 Caveat: llama-bench times bare prefill/decode; our numbers come from the HTTP server timings, so server overhead is not isolated.
+
+## Decode bandwidth check (2026-11-08)
+
+GPU memory: 4096 MiB, 6001 MHz, 128-bit bus, so peak is about 192 GB/s (estimate from clock and bus width, not measured).
+Model read per token: Q4_K_M, about 1.45 GiB (about 1.56 GB).
+- LastEngine decode 72 tok/s: about 112 GB/s, about 58% of peak.
+- llama.cpp decode 102 tok/s: about 159 GB/s, about 83% of peak.
+
+Kernel reading: `mv_impl` (src/cuda/kernels.cu:372) runs one row per warp for cols=2304 (32 lanes, one 32-value unit each). Weight blocks are 18-to-210-byte packed structs read per lane, not vector loads. This is the likely cause of the low bandwidth. Not yet changed or measured.
