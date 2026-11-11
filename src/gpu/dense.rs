@@ -37,6 +37,12 @@ fn dn_split_env() -> (usize, bool, usize) {
     ))
 }
 
+/// LE_PROF=1: per-kernel-name wall time with a sync after each launch (profiling only; distorts overlap).
+fn prof_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| std::env::var("LE_PROF").is_ok()) }
+static PROF: std::sync::Mutex<Vec<(String, f64, usize)>> = std::sync::Mutex::new(Vec::new());
+fn prof_add(name: &str, secs: f64) { let mut v = PROF.lock().unwrap(); match v.iter_mut().find(|e| e.0 == name) { Some(e) => { e.1 += secs; e.2 += 1; } None => v.push((name.to_string(), secs, 1)) } }
+fn prof_dump() { let mut v = PROF.lock().unwrap(); v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); let tot: f64 = v.iter().map(|e| e.1).sum(); for e in v.iter().take(25) { eprintln!("prof {:>22} {:>9.2} ms {:>6} calls {:>5.1}%", e.0, e.1 * 1e3, e.2, 100.0 * e.1 / tot); } eprintln!("prof total {:.2} ms", tot * 1e3); v.clear(); }
+
 impl DenseGpu {
     pub fn new(m: Dense, ctx_len: usize) -> DenseGpu {
         let ctx = CudaContext::new(0).unwrap_or_else(|e| { eprintln!("lastengine: no usable CUDA device: {e:?}"); std::process::exit(1) });
@@ -103,7 +109,9 @@ impl DenseGpu {
     fn launch(&self, name: &str, grid: u32, block: u32, smem: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        let t0 = std::time::Instant::now();
         unsafe { b.launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
+        if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
     fn qx(&self, x: Dp, n: usize) { let u = n / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.xqb), P(self.xdb), P(self.xsb), I(u as i32)]); }
     /// out = W · x, with x quantised first.
@@ -124,12 +132,16 @@ impl DenseGpu {
     fn launch3(&self, name: &str, grid: (u32, u32, u32), block: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        let t0 = std::time::Instant::now();
         unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 }).expect("launch"); }
+        if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
     fn launch3s(&self, name: &str, grid: (u32, u32, u32), block: u32, smem: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        let t0 = std::time::Instant::now();
         unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
+        if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
     /// Quantise `t` rows of `cols` floats from `x` for the batched GEMMs.
     fn bqx(&self, x: Dp, t: usize, cols: usize) { let u = t * cols / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.bxq), P(self.bxd), P(self.bxs), I(u as i32)]); }
@@ -288,6 +300,7 @@ impl DenseGpu {
         if std::env::var("LE_DENSE_SERIAL").is_ok() { for (i, &t) in ids.iter().enumerate() { l = self.step(t, i + 1 == ids.len()); } return l; }
         let mut i = 0;
         while i < ids.len() { let e = (i + CH).min(ids.len()); l = self.chunk(&ids[i..e], e == ids.len()); i = e; }
+        if prof_on() { prof_dump(); }
         l
     }
     pub fn export_state(&mut self) -> Vec<u8> { self.bind();
