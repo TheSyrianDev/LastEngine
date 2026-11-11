@@ -736,3 +736,15 @@ mod quant_tests {
         assert!(bad.is_empty(), "GPU mismatch: {bad:?}");
     }
 }
+
+// No-GPU check: NVRTC + ptxas must accept every kernel for sm_86 (shared-memory limits, syntax). Runs without a device.
+#[cfg(test)]
+mod nvrtc_compile {
+    use super::*;
+    #[test]
+    fn kernels_compile_for_sm86() {
+        let inc = ["/opt/cuda/include", "/usr/local/cuda/include", "/usr/include/cuda"].iter().find(|p| std::path::Path::new(&format!("{p}/cuda_fp16.h")).exists()).map(|s| s.to_string());
+        let opts = CompileOptions { arch: Some("sm_86"), include_paths: inc.into_iter().collect(), ..Default::default() };
+        compile_ptx_with_opts(kernel_source(), opts).expect("kernel source must compile for sm_86");
+    }
+}
