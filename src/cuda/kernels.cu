@@ -1119,6 +1119,100 @@ __device__ void mmq128_impl(const u8* const* ptrs, const int* off, const int* in
     }
 }
 
+// 128-row x 128-token block tile (llama.cpp-style reuse): 8 warps, each 16 rows x 128 tokens. Selected by LE_MMQR=1.
+template <int TY, bool HALF>
+__device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* in_idx, const int* out_idx, const signed char* xq, const float* xd, const int* xs,
+                          float* out, int rows, int cols) {
+  __shared__ int As[4][128][9], Bs[4][128][9];
+  __shared__ float Sa0[4][128], Sa1[4][128], Sam[4][128], Sbd[4][128], Sbs[4][128];
+  int z = blockIdx.z, n = off[z + 1] - off[z], t0 = blockIdx.y * 128;
+  if (t0 >= n) return;
+  int r0 = blockIdx.x * 128, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  int units = cols >> 5;
+  const int UB = Q<TY>::UB, BY = Q<TY>::BYTES;
+  int la_row = tid >> 2, la_u = tid & 3;                     // weight rows la_row and la_row+64, unit la_u
+  int lb_u = tid & 3; int lb_tok[2] = {tid >> 2, (tid >> 2) + 64};
+  int wr[2]; bool wok[2]; const u8* wrow[2];
+  #pragma unroll
+  for (int k = 0; k < 2; k++) { wr[k] = r0 + la_row + 64 * k; wok[k] = wr[k] < rows; wrow[k] = ptrs[z] + (size_t)(wok[k] ? wr[k] : 0) * ((cols / (UB * 32)) * BY + Q<TY>::HDR); }
+  int xr[2]; bool tok_ok[2];
+  for (int j = 0; j < 2; j++) { int tk = t0 + lb_tok[j]; tok_ok[j] = tk < n; xr[j] = tok_ok[j] ? (in_idx ? in_idx[off[z] + tk] : off[z] + tk) : 0; }
+  float acc[16][4];
+  #pragma unroll
+  for (int i = 0; i < 16; i++) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f; }
+  int wm = warp * 16;
+  int w[2][8]; float s0[2] = {0.f, 0.f}, s1[2] = {0.f, 0.f}, mn[2] = {0.f, 0.f}; int4 q0[2], q1[2]; float bd[2], bs[2];
+  for (int j = 0; j < 2; j++) { q0[j] = make_int4(0, 0, 0, 0); q1[j] = q0[j]; bd[j] = bs[j] = 0.f; }
+  auto fetch = [&](int u0) {
+    int u = u0 + la_u;
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+      if (wok[k] && !NODEQ) { uloadr<TY>(wrow[k] + Q<TY>::HDR + (u / UB) * BY, u % UB, w[k], s0[k], s1[k], mn[k], wrow[k]); }
+      else { for (int i = 0; i < 8; i++) w[k][i] = 0; s0[k] = s1[k] = mn[k] = 0.f; }
+    }
+    for (int j = 0; j < 2; j++) {
+      int ub = u0 + lb_u;
+      if (tok_ok[j]) {
+        const int4* gq = (const int4*)(xq + (size_t)xr[j] * cols + ub * 32);
+        q0[j] = gq[0]; q1[j] = gq[1];
+        bd[j] = xd[(size_t)xr[j] * units + ub]; bs[j] = (float)xs[(size_t)xr[j] * units + ub];
+      } else { q0[j] = make_int4(0, 0, 0, 0); q1[j] = q0[j]; bd[j] = 0.f; bs[j] = 0.f; }
+    }
+  };
+  fetch(0);
+  for (int u0 = 0; u0 < units; u0 += 4) {
+    #pragma unroll
+    for (int k = 0; k < 2; k++) {
+      int rw = la_row + 64 * k;
+      #pragma unroll
+      for (int i = 0; i < 8; i++) As[la_u][rw][i] = w[k][i];
+      Sa0[la_u][rw] = s0[k]; Sa1[la_u][rw] = s1[k]; Sam[la_u][rw] = mn[k];
+    }
+    for (int j = 0; j < 2; j++) {
+      Bs[lb_u][lb_tok[j]][0] = q0[j].x; Bs[lb_u][lb_tok[j]][1] = q0[j].y; Bs[lb_u][lb_tok[j]][2] = q0[j].z; Bs[lb_u][lb_tok[j]][3] = q0[j].w;
+      Bs[lb_u][lb_tok[j]][4] = q1[j].x; Bs[lb_u][lb_tok[j]][5] = q1[j].y; Bs[lb_u][lb_tok[j]][6] = q1[j].z; Bs[lb_u][lb_tok[j]][7] = q1[j].w;
+      Sbd[lb_u][lb_tok[j]] = bd[j]; Sbs[lb_u][lb_tok[j]] = bs[j];
+    }
+    __syncthreads();
+    if (u0 + 4 < units) fetch(u0 + 4);
+    #pragma unroll
+    for (int uu = 0; uu < 4; uu++) {
+      int ra = wm + g, rb = wm + g + 8;
+      int a0 = As[uu][ra][t], a1 = As[uu][rb][t], a2 = As[uu][ra][t + 4], a3 = As[uu][rb][t + 4];
+      float sA0 = Sa0[uu][ra], sA1 = Sa0[uu][rb], mA0 = Sam[uu][ra], mA1 = Sam[uu][rb];
+      float sB0 = Sa1[uu][ra], sB1 = Sa1[uu][rb];
+      #pragma unroll
+      for (int nt = 0; nt < 16; nt++) {
+        int tb = nt * 8 + g;
+        int b0 = Bs[uu][tb][t], b1 = Bs[uu][tb][t + 4];
+        int cc[4] = {0, 0, 0, 0}, c2[4] = {0, 0, 0, 0};
+        float d0 = Sbd[uu][nt * 8 + 2 * t], d1 = Sbd[uu][nt * 8 + 2 * t + 1];
+        float x0 = Sbs[uu][nt * 8 + 2 * t], x1 = Sbs[uu][nt * 8 + 2 * t + 1];
+        if (HALF) {
+          mma16(cc, a0, a1, b0); mma16(c2, a2, a3, b1);
+          acc[nt][0] += d0 * (sA0 * cc[0] + sB0 * c2[0]); acc[nt][1] += d1 * (sA0 * cc[1] + sB0 * c2[1]);
+          acc[nt][2] += d0 * (sA1 * cc[2] + sB1 * c2[2]); acc[nt][3] += d1 * (sA1 * cc[3] + sB1 * c2[3]);
+        } else {
+          mma32(cc, a0, a1, a2, a3, b0, b1);
+          acc[nt][0] += d0 * (sA0 * cc[0] - mA0 * x0); acc[nt][1] += d1 * (sA0 * cc[1] - mA0 * x1);
+          acc[nt][2] += d0 * (sA1 * cc[2] - mA1 * x0); acc[nt][3] += d1 * (sA1 * cc[3] - mA1 * x1);
+        }
+      }
+    }
+    __syncthreads();
+  }
+  #pragma unroll
+  for (int nt = 0; nt < 16; nt++)
+    #pragma unroll
+    for (int i = 0; i < 4; i++) {
+      int r = r0 + wm + g + ((i >> 1) ? 8 : 0), tkn = t0 + nt * 8 + 2 * t + (i & 1);
+      if (r < rows && tkn < n) { int ob = off[z] + tkn; int orow = out_idx ? out_idx[ob] : ob; out[(size_t)orow * rows + r] = acc[nt][i]; }
+    }
+}
+
+#define MMQ128R(TY, H) extern "C" __global__ void __launch_bounds__(256, 1) mmq128r_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128r_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
+MMQ128R(2, false) MMQ128R(8, false) MMQ128R(11, true) MMQ128R(12, false) MMQ128R(13, false) MMQ128R(14, true)
+
 #define MMQ128(TY, H) extern "C" __global__ void __launch_bounds__(256, 2) mmq128_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
 MMQ128(2, false) MMQ128(8, false) MMQ128(11, true) MMQ128(12, false) MMQ128(13, false) MMQ128(14, true)
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
