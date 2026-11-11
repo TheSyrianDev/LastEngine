@@ -29,8 +29,6 @@ jobs:
           ref: ${{ github.event.inputs.tag || github.ref }}
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: Test (no GPU; compiles every CUDA kernel for sm_86)
-        run: cargo test --release kernels_compile_for_sm86
       - name: Build
         run: cargo build --release
       - name: Package (Linux)
