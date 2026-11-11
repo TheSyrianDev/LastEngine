@@ -12,7 +12,8 @@ pub struct Cli {
 pub enum Cmd {
     Serve(ServeArgs),
     /// Print hardware facts as stable JSON on stdout (for launchers / model recommendation).
-    Probe,
+    /// --json is accepted for launchers; output is always JSON.
+    Probe { #[arg(long)] json: bool },
     /// Measure candidate kv/chunk settings on this machine and cache the best for `serve`.
     Tune { model: String, #[arg(long, default_value_t = 8192)] ctx: usize },
     /// Print GGUF header metadata.

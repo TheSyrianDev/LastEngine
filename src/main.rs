@@ -238,7 +238,7 @@ async fn main() {
             println!("{}", String::from_utf8_lossy(&tk.decode_bytes(&out)));
         }
         cli::Cmd::Tune { model, ctx } => tune::run(&model, ctx),
-        cli::Cmd::Probe => println!("{}", probe::probe_json()),
+        cli::Cmd::Probe { .. } => println!("{}", probe::probe_json()),
         cli::Cmd::H2d { path } => gpu::h2d_bench(&path),
         cli::Cmd::Serve(a) => {
             if let Err(e) = server::run(a).await {
