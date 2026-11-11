@@ -19,9 +19,9 @@ jobs:
       matrix:
         include:
           - os: ubuntu-24.04
-            asset: lastengine-linux-x86_64.tar.gz
+            asset: lastengine-linux-x86_64-cuda.tar.gz
           - os: windows-latest
-            asset: lastengine-windows-x86_64.zip
+            asset: lastengine-windows-x86_64-cuda.zip
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
