@@ -100,3 +100,21 @@ Two binaries, run back to back with the same script (/tmp/claude-1000/bench_bin.
 Prefill +5% at 4K, +4% at 16K; decode unchanged. The second 4K prefill run in each build (about 70 tok/s) is a prefix-cache hit on the repeated prompt, not prefill; use the first run.
 dense-cmp 15/15 argmax: MiniCPM5 (mean |dlogprob| 0.0032, max 0.0169), LFM3 (0.0018, max 0.0091).
 llama.cpp b12182 (same card): 4K pp 3376, 16K pp 2374, tg ~102.
+
+## Sage-A1.5 APEX MiniPlus, same-session rerun (2026-11-11, RTX 3050 Laptop 4 GB)
+Model: /home/omar/AI/Models/sage-a15/Sage-A1.5.APEX-I-MiniPlus-V2.1.gguf (14.17 GiB as read by llama-bench; llama-bench labels it qwen35moe 35B.A3B Q4_0).
+Lock: ~/AI/.machine-busy held for the run. llama-swap had no models loaded (/running empty); the /unload call returned 405, so no unload was needed.
+
+| engine | version | flags | pp4096 tok/s | pp16384 tok/s | decode tok/s |
+|---|---|---|---|---|---|
+| llama.cpp | b12182 (fd27b2034) | llama-bench -ngl 99 -fa 1 -ncmoe 99 -p 4096,16384 -n 128 -r 1 | 326.0 ± 0 | 313.8 ± 0 | tg128 23.5 |
+| LastEngine | 40969d3 | serve --ctx 17000 (auto-tune: kv q8, chunk 2048, 992 expert slots, 12480 MiB pinned expert store) | 763.3 (prompt_n 3043) | 748.3 (prompt_n 12110) | 31.4–31.8 (4K), 29.0 (16K) |
+
+Caveats (read before quoting):
+- Token counts do not match. llama-bench processes exactly 4096 / 16384 tokens. LastEngine's prompts were built from characters and tokenized to 3043 / 12110, so its numbers are a rate on a shorter prompt. Not a matched-token comparison.
+- One run each (llama-bench -r 1; LastEngine 2 requests at 4K, 1 at 16K). No error bars for llama.cpp.
+- LastEngine's second 4K request had prompt_n 7 (prefix cache hit); only the first 4K request is a prefill measurement.
+- The llama.cpp decode column is from llama-bench tg128 with no prompt context; LastEngine decode is measured after its prompt.
+- Earlier LastEngine Sage numbers (817 prefill / 31.7 decode, not re-run) are superseded by this run for the 4K row.
+
+Result: LastEngine beats llama.cpp b12182 on this MoE model in this session: about 2.3x on prefill and about 1.35x on decode. The MoE win holds, with the token-count caveat above.
