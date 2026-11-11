@@ -118,3 +118,18 @@ Caveats (read before quoting):
 - Earlier LastEngine Sage numbers (817 prefill / 31.7 decode, not re-run) are superseded by this run for the 4K row.
 
 Result: LastEngine beats llama.cpp b12182 on this MoE model in this session: about 2.3x on prefill and about 1.35x on decode. The MoE win holds, with the token-count caveat above.
+
+## Sage fixed-token-count repeat (2026-11-11, LastEngine 8355d33, llama.cpp b12182 fd27b2034)
+Same flags as above; llama-bench -r 3. LastEngine prompts calibrated to prompt_n 4096 and 16384 (chat template adds a few tokens; a unique random prefix per run defeats the prefix cache).
+
+| engine | prompt | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| llama.cpp b12182 | pp4096 | 151.35 ± 24.96 | tg128 16.45 ± 11.89 |
+| llama.cpp b12182 | pp16384 | 202.30 ± 139.64 | (same run) |
+| LastEngine | 4096 (prompt_n 4095/4147/4141) | 875.7 / 815.4 / 808.7 | 34.5 / 36.1 / 35.4 |
+| LastEngine | 16384 (prompt_n 16320/16301/16238) | 663.8 / 662.4 / 673.6 | 26.7 / 29.0 / 0.0 (third value is a timing artifact, not a real 0) |
+
+Caveats:
+- The llama.cpp r=3 run is unusable: the spread (±25 to ±140 tok/s) is far above the single-run values (326 / 314 / 23.5) from earlier the same day. GPU was idle at 2 MiB before the run and at 0 % after. Cause not found; treat the llama.cpp numbers from this run as invalid and re-run before quoting.
+- LastEngine prompts match the target token counts within about 1 %, so prefill is comparable in size. Its three 16K decode values also show run-to-run variance.
+- LastEngine's 4K prefill is higher here than in the earlier single run (763 with 3043 tokens), probably because the calibrated prompts are longer and the earlier run was shorter; not a like-for-like comparison with that row.
