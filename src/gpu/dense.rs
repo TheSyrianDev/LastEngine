@@ -10,7 +10,7 @@ unsafe impl Send for GraphBox {}
 struct DL {
     attn_norm: Dp, ffn_norm: Dp, post_attn: Dp, post_ffw: Dp, swa: bool, conv: bool,
     wq: W, wk: W, wv: W, wo: W, wg: W, qn: Dp, kn: Dp, in_proj: W, out_proj: W, conv_w: Dp,
-    gate: W, up: W, down: W,
+    gu: W, down: W, // gu = gate and up rows concatenated (rows = 2*ffn), one GEMM/matvec for both
 }
 
 pub struct DenseGpu {
@@ -23,7 +23,7 @@ pub struct DenseGpu {
     /// CUDA graphs of the decode layer loop, keyed by the per-layer split-K choice.
     graphs: HashMap<Vec<bool>, GraphBox>,
     kc: Vec<Dp>, vc: Vec<Dp>, conv: Vec<Dp>, pos: usize, ctx_len: usize,
-    bx: Dp, bh: Dp, bq: Dp, bk: Dp, bv: Dp, bg: Dp, bo: Dp, bt1: Dp, bt2: Dp, bu: Dp, ba: Dp, bxq: Dp, bxd: Dp, bxs: Dp, boff: Dp,
+    bx: Dp, bh: Dp, bq: Dp, bk: Dp, bv: Dp, bg: Dp, bo: Dp, bt1: Dp, bt2: Dp, bgu: Dp, ba: Dp, bxq: Dp, bxd: Dp, bxs: Dp, boff: Dp,
 }
 const CH: usize = 512;
 
@@ -53,10 +53,18 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
+        // Gate and up share cols and quant type, so their row-major bytes concatenate into one matrix with 2*ffn rows.
+        let gate_up = |g: &str, u: &str| -> W {
+            let (tg, bg) = m.bytes(g); let (tu, bu) = m.bytes(u);
+            assert!(tg.ty == tu.ty && tg.dims == tu.dims, "dense gpu: gate/up type or shape differ, cannot fuse ({g}, {u})");
+            let mut cat = Vec::with_capacity(bg.len() + bu.len()); cat.extend_from_slice(bg); cat.extend_from_slice(bu);
+            let d = dup(&cat);
+            W { cell: dup(&[d]), ty: tg.ty, rows: 2 * tg.dims[1], cols: tg.dims[0], raw: d }
+        };
         let none = W { cell: 0, ty: 0, rows: 0, cols: 0, raw: 0 };
         let vecd = |name: &str| -> Dp { dup(&m.vec_f32(name)) };
         let has = |n: &str| m.t.contains_key(n);
@@ -69,7 +77,7 @@ impl DenseGpu {
             let swa = matches!(m.layers[l], LayerKind::Attn { swa: true });
             let mut d = DL { attn_norm: vecd(&p("attn_norm.weight")), ffn_norm: vecd(&p("ffn_norm.weight")), post_attn: 0, post_ffw: 0, swa, conv: is_conv,
                 wq: none, wk: none, wv: none, wo: none, wg: none, qn: 0, kn: 0, in_proj: none, out_proj: none, conv_w: 0,
-                gate: mat(&p("ffn_gate.weight")), up: mat(&p("ffn_up.weight")), down: mat(&p("ffn_down.weight")) };
+                gu: gate_up(&p("ffn_gate.weight"), &p("ffn_up.weight")), down: mat(&p("ffn_down.weight")) };
             if lfm { d.post_attn = vecd(&p("post_attention_norm.weight")); d.post_ffw = vecd(&p("post_ffw_norm.weight")); }
             if is_conv {
                 d.in_proj = mat(&p("shortconv.in_proj.weight")); d.out_proj = mat(&p("shortconv.out_proj.weight")); d.conv_w = vecd(&p("shortconv.conv.weight"));
@@ -92,17 +100,17 @@ impl DenseGpu {
         for l in 0..m.n_layer { if !lay[l].conv { let n = ctx_len * nkv * hd * 2; kc[l] = dalloc(n); vc[l] = dalloc(n); } }
         let ff = if has("rope_freqs.weight") { vecd("rope_freqs.weight") } else { 0 };
         let wide = m.n_embd.max(m.n_head * hd).max(8192 * 2);
-        let ffn = lay[0].gate.rows;
+        let ffn = lay[0].gu.rows / 2;
         let big = wide.max(ffn * 2).max(m.n_embd * 3);
         let wide_cols = m.n_embd.max(m.n_head * hd).max(ffn);
         let fb = |n: usize| dalloc(n * 4);
         DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
-            x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(ffn), logits: fb(m.vocab),
+            x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(2 * ffn), logits: fb(m.vocab),
             part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
             kc, vc, conv, pos: 0, ctx_len, lay,
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
-            bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bu: dalloc(CH * ffn * 4), ba: dalloc(CH * ffn * 4),
+            bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bgu: dalloc(CH * 2 * ffn * 4), ba: dalloc(CH * ffn * 4),
             bxq: dalloc(CH * wide_cols), bxd: dalloc(CH * wide_cols / 8), bxs: dalloc(CH * wide_cols / 8), boff: dalloc(8), m,
         }
     }
@@ -200,9 +208,9 @@ impl DenseGpu {
             self.add(self.bx, self.bt2, t * n);
             self.brms(self.bx, d.ffn_norm, self.bh, t);
             self.bqx(self.bh, t, n);
-            self.bmm(d.gate, self.ba, t); self.bmm(d.up, self.bu, t);
-            let ffn = d.gate.rows;
-            self.launch("swiglu", (t * ffn).div_ceil(256) as u32, 256, 0, &[P(self.ba), P(self.bu), P(self.ba), I((t * ffn) as i32)]);
+            self.bmm(d.gu, self.bgu, t);
+            let ffn = d.gu.rows / 2;
+            self.launch("swiglu_gu", (t * ffn).div_ceil(256) as u32, 256, 0, &[P(self.bgu), P(self.ba), I(ffn as i32), I((t * ffn) as i32)]);
             self.bqx(self.ba, t, ffn);
             self.bmm(d.down, self.bt2, t);
             if lfm { self.brms(self.bt2, d.post_ffw, self.bt2, t); }
@@ -260,10 +268,10 @@ impl DenseGpu {
             self.add(self.x, self.t2, n);
             self.rms(self.x, d.ffn_norm, self.h, n);
             self.qx(self.h, n);
-            self.mvq(d.gate, self.a); self.mvq(d.up, self.u);
-            let ffn = d.gate.rows;
-            self.launch("swiglu", ffn.div_ceil(256) as u32, 256, 0, &[P(self.a), P(self.u), P(self.a), I(ffn as i32)]);
-            self.mv(d.down, self.a, self.t2);
+            self.mvq(d.gu, self.a);
+            let ffn = d.gu.rows / 2;
+            self.launch("swiglu_gu", ffn.div_ceil(256) as u32, 256, 0, &[P(self.a), P(self.u), I(ffn as i32), I(ffn as i32)]);
+            self.mv(d.down, self.u, self.t2);
             if lfm { self.rms(self.t2, d.post_ffw, self.t2, n); }
             self.add(self.x, self.t2, n);
         }

@@ -426,6 +426,12 @@ extern "C" __global__ void add_rmsnorm(float* x, const float* y, const float* w,
 }
 extern "C" __global__ void add_inplace(float* x, const float* y, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) x[i] += y[i]; }
 extern "C" __global__ void swiglu(const float* g, const float* u, float* o, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) o[i] = silu_f(g[i]) * u[i]; }
+// Fused gate/up: gu[t][2*ffn] holds gate in [0,ffn) and up in [ffn,2*ffn) per token. o[t][ffn] = silu(gate) * up.
+extern "C" __global__ void swiglu_gu(const float* gu, float* o, int ffn, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+  int tok = i / ffn, j = i - tok * ffn; const float* r = gu + (size_t)tok * 2 * ffn;
+  o[i] = silu_f(r[j]) * r[ffn + j];
+}
 
 // Router: softmax over n experts, top-k, renormalise. One block of 256 threads, n <= 1024.
 extern "C" __global__ void router_topk(const float* logits, int n, int k, int* idx_out, float* w_out) {
