@@ -140,7 +140,7 @@ impl DenseGpu {
         if let Some(e) = ev { self.ev_end(name, e); }
         if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
-    fn rms_q(&self, x: Dp, w: Dp, o: Dp, n: usize) { self.launch("rms_quant", 1, 256, 0, &[P(x), P(w), P(o), P(self.xqb), P(self.xdb), P(self.xsb), I(n as i32), F(self.m.eps)]); }
+    fn rms_q(&self, x: Dp, w: Dp, o: Dp, n: usize) { self.launch("rms_quant", (n / 32).div_ceil(8).min(64) as u32, 256, 0, &[P(x), P(w), P(o), P(self.xqb), P(self.xdb), P(self.xsb), I(n as i32), F(self.m.eps)]); }
     fn qx(&self, x: Dp, n: usize) { let u = n / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.xqb), P(self.xdb), P(self.xsb), I(u as i32)]); }
     /// out = W · x, with x quantised first.
     fn mv(&self, w: W, x: Dp, out: Dp) {
