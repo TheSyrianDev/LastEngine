@@ -33,7 +33,7 @@ fn dn_split_env() -> (usize, bool, usize) {
     *V.get_or_init(|| (
         std::env::var("LE_DN_SPLIT_MIN").ok().and_then(|v| v.parse().ok()).unwrap_or(512usize),
         std::env::var("LE_DN_SPLIT").map_or(true, |v| v != "0"),
-        std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or(16usize),
+        std::env::var("LE_DN_SP").ok().and_then(|v| v.parse().ok()).unwrap_or(32usize),
     ))
 }
 
@@ -114,7 +114,7 @@ impl DenseGpu {
         DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
             x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(2 * ffn), logits: fb(m.vocab),
-            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), fused_qkv: std::env::var("LE_DN_QKV").map_or(true, |v| v != "0"), rmsq: std::env::var("LE_RMSQ").map_or(false, |v| v == "1"), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
+            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), fused_qkv: std::env::var("LE_DN_QKV").map_or(true, |v| v != "0"), rmsq: std::env::var("LE_RMSQ").map_or(true, |v| v != "0"), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
             kc, vc, conv, pos: 0, ctx_len, lay,
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
             bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bgu: dalloc(CH * 2 * ffn * 4), ba: dalloc(CH * ffn * 4),
@@ -262,7 +262,7 @@ impl DenseGpu {
     fn layers(&self, split: &[bool]) {
         let m = &self.m; let (n, hd, nh, nkv) = (m.n_embd, m.head_dim, m.n_head, m.n_kv);
         let lfm = m.kind == Kind::Lfm3;
-        let gqa = nh / nkv == 8 && hd == 128 && std::env::var("LE_DN_GQA").map_or(false, |v| v == "1");
+        let gqa = nh / nkv == 8 && hd == 128 && std::env::var("LE_DN_GQA").map_or(true, |v| v != "0");
         for l in 0..m.n_layer {
             let d = &self.lay[l];
             let fused_attn = self.rmsq && !d.conv;

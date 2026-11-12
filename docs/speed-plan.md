@@ -140,3 +140,11 @@ Notes:
 - Best opt-in combo is about 1.5% behind llama decode at this prompt (93.5 vs 94.9). Default is about 7% behind (88.6 vs 94.9).
 - Earlier llama CPU-only run (copy in /tmp without ggml-cuda) gave 14 tok/s and is not valid. Use the CUDA build at /home/omar/AI/engines/llama-prebuilt-b12182/full/llama-b12182/llama-server.
 - The "parity" wording earlier in this doc refers to kernel-sum comparison only. Wall decode is the number to use.
+
+## Default flipped: GQA on, SP 32, rms_quant on (2026-11-12, peer decision projects-45)
+
+- Defaults now: LE_DN_GQA on (=0 off), LE_DN_SP 32 (was 16), LE_RMSQ on (=0 off). LE_DN_QKV unchanged (default on).
+- Gate (tools/dense_cmp_gate.sh, under lock): "The capital of France is" 14/15 argmax, mean |dlogprob| 0.0098, max 0.0760; "Explain in one sentence why the sky is blue." 15/15, mean 0.0166, max 0.0560.
+- Graph decode r=3, same 2594-token prompt, 128 gen, default build: 93.2 / 93.2 / 93.1 tok/s (old default 88.6; llama.cpp b12182 94.9).
+- Output differs from the old default at one near-tie token (char 326 of 545). Accepted by peer decision.
+- Gap to llama decode at this prompt: about 1.8% (93.2 vs 94.9).
