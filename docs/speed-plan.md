@@ -181,3 +181,14 @@ dense_cmp_gate on the current build (default): "The capital of France is" 14/15,
 
 Decision: no flip. Default (128-row tile, no split-K) is the fastest of the four. LE_MMQR=0 is 3% slower. Split-K is slower at both S=2 (-5%) and S=4 (-11%). The split-K kernel is kept opt-in and off; its atomicAdd epilogue is also not bit-stable, so it should not be used without a reason.
 Caveat: the wall times include the tail of the chunked prefill and the first-request warmup; a per-run 2-request order is not used for the prefill comparison.
+
+## Real prefill gap on the 5023-token prompt, and ncu attempt (2026-11-12, under lock)
+
+- llama.cpp b12182 llama-server (CUDA, -ngl 99, -np 1, -c 20000), prefill tok/s on the same 5023-token prompt (`pp_req.json`), r=3: 3162.5 / 3215.1 / 3207.7 (about 3200).
+- LastEngine default (mmq128r on, LE_EVT wall): about 2051 tok/s (2448 ms). Real gap is about 1.56x on prefill.
+- Config check, same prompt: LE_MMQR=0 1991 tok/s; LE_MMQSK=2 1943; LE_MMQSK=4 1826. Default stays.
+
+ncu on mmq128r_12 (not completed):
+- `sudo ncu --section SpeedOfLight --section MemoryWorkloadAnalysis --section Occupancy --section WarpStateStats -k regex:mmq128r_12 -c 1 --csv lastengine serve ...` connects to the process, but no kernel result was written. The run hit the 600 s timeout (exit 124) and the CSV holds only the ncu PROF lines.
+- Likely causes not verified: the chat request may not have reached prefill, or ncu replay on a 5K prefill is too slow. Next attempt: profile with `--launch-count` on a short request, or use `ncu -o report` and import, with the server started with `LE_EVT=0`.
+- No limiter (memory, latency, occupancy, bank conflicts) is established yet. No fix is proposed from counters.
