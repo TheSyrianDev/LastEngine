@@ -123,3 +123,20 @@ Ranked remaining work:
 4. Prefill (unchanged this round): Q4_K GEMM and attention still about 1.6x and 1.5x behind llama (see LE_MMQ2 plan above).
 
 Defaults unchanged: LE_DN_GQA off, LE_RMSQ off, LE_DN_QKV on. Nothing pushed.
+
+## Matched wall decode, llama.cpp vs best opt-in (2026-11-12, measured under lock)
+
+Prompt: same_req.json (2594 prompt tokens after chat template), 128 generated, temperature 0, ctx 4096, graph mode, r=3.
+
+| Engine | Config | Decode tok/s (r=1 / r=2 / r=3) |
+|---|---|---|
+| llama.cpp b12182 (llama-server, CUDA, -ngl 99, -np 1) | default | 94.85 / 94.86 / 94.86 |
+| LastEngine | default (be73cd8) | 88.6 (earlier session, not re-measured here) |
+| LastEngine | LE_DN_GQA=1 LE_DN_SP=32 LE_RMSQ=1 | 93.5 / 93.5 / 93.4 |
+
+Notes:
+- The llama decode numbers come from server timings (`predicted_per_second`) with 128 tokens each. The second request reused the prompt cache, so its prefill figure is meaningless; decode is valid.
+- The earlier estimate of llama at about 88 tok/s (from nsys kernel sums) was wrong. Measured llama wall decode is about 94.9 tok/s at this prompt.
+- Best opt-in combo is about 1.5% behind llama decode at this prompt (93.5 vs 94.9). Default is about 7% behind (88.6 vs 94.9).
+- Earlier llama CPU-only run (copy in /tmp without ggml-cuda) gave 14 tok/s and is not valid. Use the CUDA build at /home/omar/AI/engines/llama-prebuilt-b12182/full/llama-b12182/llama-server.
+- The "parity" wording earlier in this doc refers to kernel-sum comparison only. Wall decode is the number to use.
