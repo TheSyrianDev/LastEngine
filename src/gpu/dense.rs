@@ -46,6 +46,7 @@ fn prof_dump() { let mut v = PROF.lock().unwrap(); v.sort_by(|a, b| b.1.partial_
 
 /// LE_EVT=1: per-launch CUDA events on the stream (no host sync); summed at end of prefill.
 fn evt_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| std::env::var("LE_EVT").is_ok()) }
+thread_local! { static DEC: std::cell::RefCell<std::collections::BTreeMap<String,(f64,usize)>> = std::cell::RefCell::new(Default::default()); static DEC_WALL: std::cell::RefCell<(f64,f64,f64,usize)> = std::cell::RefCell::new((0.0,0.0,0.0,0)); }
 thread_local! { static EVT: std::cell::RefCell<Vec<(String, std::sync::Arc<cudarc::driver::CudaEvent>, std::sync::Arc<cudarc::driver::CudaEvent>)>> = std::cell::RefCell::new(Vec::new()); }
 
 impl DenseGpu {
@@ -328,7 +329,27 @@ impl DenseGpu {
         unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut out, self.logits).unwrap() };
         out
     }
-    pub fn forward(&mut self, t: u32) -> Vec<f32> { self.bind(); self.step(t, true) }
+    /// LE_EVT=1 decode: per-kernel event sums and host wall per token, printed every 64 tokens.
+    /// Per-kernel times need LE_DN_GRAPH=0 (graph capture records events as graph nodes, not timings).
+    pub fn forward(&mut self, t: u32) -> Vec<f32> { self.bind();
+        if !evt_on() { return self.step(t, true); }
+        EVT.with(|v| v.borrow_mut().clear());
+        let w0 = std::time::Instant::now();
+        let w0e = self.ev_begin();
+        let out = self.step(t, true);
+        let host_ms = w0.elapsed().as_secs_f64() * 1e3;
+        let g_ms = match w0e { Some(a) => { let b = self._ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).expect("event"); b.record(&self.st).expect("record"); b.synchronize().expect("sync"); a.elapsed_ms(&b).expect("elapsed") as f64 } None => host_ms };
+        let mut ksum = 0f64;
+        EVT.with(|v| for (n, a, b) in v.borrow().iter() { let ms = a.elapsed_ms(b).expect("elapsed") as f64; ksum += ms; DEC.with(|d| { let mut d = d.borrow_mut(); let e = d.entry(n.clone()).or_insert((0.0, 0)); e.0 += ms; e.1 += 1; }); });
+        DEC_WALL.with(|d| { let mut d = d.borrow_mut(); d.0 += g_ms; d.1 += host_ms; d.2 += ksum; d.3 += 1; });
+        let (n_done, wall_sum) = DEC_WALL.with(|d| { let d = d.borrow(); (d.3, d.0) });
+        if n_done % 64 == 0 {
+            DEC_WALL.with(|d| { let mut d = d.borrow_mut(); let (gw, hw, ks, n) = (d.0, d.1, d.2, d.3 as f64); eprintln!("evtdec {} tok: gpu wall {:.3} ms/tok, host {:.3} ms/tok, kernel sum {:.3} ms/tok, idle {:.3} ms/tok, {:.1} tok/s", n, gw / n, hw / n, ks / n, (gw - ks) / n, 1e3 * n / gw); d.0 = 0.0; d.1 = 0.0; d.2 = 0.0; d.3 = 0; });
+            DEC.with(|d| { let mut rows: Vec<_> = d.borrow().iter().map(|(k, v)| (k.clone(), *v)).collect(); rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap()); let tot: f64 = rows.iter().map(|r| r.1 .0).sum(); for (n, (ms, c)) in rows.iter().take(12) { eprintln!("evtdec {:>20} {:>8.3} ms/tok {:>6.2} launches/tok {:>5.1}%", n, ms / 64.0, *c as f64 / 64.0, 100.0 * ms / tot); } d.borrow_mut().clear(); });
+        }
+        let _ = wall_sum;
+        out
+    }
     pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> { self.bind();
         let mut l = vec![];
         if std::env::var("LE_DENSE_SERIAL").is_ok() { for (i, &t) in ids.iter().enumerate() { l = self.step(t, i + 1 == ids.len()); } return l; }
