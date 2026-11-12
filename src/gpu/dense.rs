@@ -181,7 +181,7 @@ impl DenseGpu {
             (2, true) => "mmq128_2", (8, true) => "mmq128_8", (11, true) => "mmq128_11", (12, true) => "mmq128_12", (13, true) => "mmq128_13", (14, true) => "mmq128_14",
             (t, _) => panic!("dense gpu: no mmq kernel for type {t}") };
         let tile = if wide { 128 } else { 64 };
-        let rtile = wide && std::env::var("LE_MMQR").map_or(false, |v| v == "1");
+        let rtile = wide && std::env::var("LE_MMQR").map_or(true, |v| v != "0");
         let name_r = format!("mmq128r_{}", &name["mmq128_".len()..]);
         let (name, rrows) = if rtile { (name_r.as_str(), 128) } else { (name, 64) };
         self.launch3(name, (w.rows.div_ceil(rrows) as u32, t.div_ceil(tile) as u32, 1), 256, &[P(w.cell), P(self.boff), P(0), P(0), P(self.bxq), P(self.bxd), P(self.bxs), P(out), I(w.rows as i32), I(w.cols as i32)]);
