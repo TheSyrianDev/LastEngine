@@ -78,3 +78,20 @@ Kernel reading: `mv_impl` (src/cuda/kernels.cu:372) runs one row per warp for co
 
 `mv_impl` handles two rows per lane group, both weight streams issued before reduction, rpb 8→16 in dense.rs and gpu.rs. Kernel test gpu_matvec_matches_cpu_dequant passed.
 Bench (bench_bin.sh, same settings): HEAD decode 73.0 / 73.0 tok/s, prefill 1705/1692 (4K), 1194 (16K). Two-row: decode 70.7 / 70.7, prefill 1695/1692, 1189. Slower on decode, reverted; not committed.
+
+## Q4_K GEMM rewrite plan (LE_MMQ2) — written 2026-11-12, before any code change
+
+Target: mmq128_12 (Q4_K), 61.7% of 4K prefill kernel time (LE_EVT, commit aa90476). Estimated real gap vs llama.cpp about 1.6x on this op.
+
+What already exists, so the rewrite does not repeat it:
+- 128-row x 128-token block tile with 8 warps (16 rows x 128 tokens per warp): `mmq128r_*` in src/cuda/kernels.cu (`LE_MMQR=1`). Measured +3% at 4K, not default. This is llama's Ampere tile shape already.
+- Scales pre-split per K-unit (Sa0/Sa1/Sam/Sbd/Sbs in smem), so x_dm-style precompute exists in part.
+- Tried and not winning: stream-K with atomicAdd (slower), wave-fit persistent (slower), 256-token tile (noise), double buffer (slower, smem over 48 KB).
+
+What is new in LE_MMQ2 (to be tested, not assumed to win):
+1. Stage Q4_K weights as pre-unpacked int8 nibble quads per K-unit (llama's `(qs>>0)&0x0F0F0F0F` / `(qs>>4)&0x0F0F0F0F` layout) and precompute dm*sc and -dmin*m per row and sub-block at load time, so the inner loop reads one int per mma operand and one float per sub-block.
+2. One `__syncthreads` per 4-unit step instead of two, by double-buffering the activation tile in registers (not smem).
+3. Keep the 128x128 tile; keep LE_MMQ2 default off unless r=3 A/B against HEAD wins.
+
+Gates: cargo test; dense-cmp MiniCPM5 15/15 (argmax); Sage correctness only if the MoE path uses mmq128 (check before claiming); r=3 A/B vs HEAD with matched prompts (ab.py); machine lock ~/AI/.machine-busy written for the run.
+Status: plan only. No kernel code written yet for LE_MMQ2.
