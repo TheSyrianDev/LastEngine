@@ -95,3 +95,31 @@ What is new in LE_MMQ2 (to be tested, not assumed to win):
 
 Gates: cargo test; dense-cmp MiniCPM5 15/15 (argmax); Sage correctness only if the MoE path uses mmq128 (check before claiming); r=3 A/B vs HEAD with matched prompts (ab.py); machine lock ~/AI/.machine-busy written for the run.
 Status: plan only. No kernel code written yet for LE_MMQ2.
+
+## Decode status (2026-11-12, after attention/fusion round)
+
+Measured on RTX 3050 Laptop, MiniCPM5-2B Q4_K_M, 2594-token chat prompt, 128 generated, ctx 4096, graph mode, r=3.
+
+| Config | Graph decode tok/s |
+|---|---|
+| HEAD baseline (before this round) | 87.8-88.6 |
+| Default now (fused q/k prep + v write, be73cd8) | 88.5-88.7 |
+| + LE_DN_GQA=1 LE_DN_SP=32 (1de9ee5) | 90.3-91.0 |
+| + LE_RMSQ=1 multi-block (605129d) | 90.7 |
+| llama.cpp b12182, same prompt | not measured as wall tok/s; estimated 88 from nsys kernel sum (10.3 ms/tok kernels, 11.3-11.4 ms/tok wall prediction) |
+
+Note: llama.cpp decode is about 102 tok/s on the older tg128 bench (b10330, short prompt). The 88 figure above is llama b12182 at the matched 2583-token prompt, so the two numbers are not directly comparable. Matched comparison here is an estimate only: LastEngine default 88.6 measured vs llama about 88 estimated. Measure llama graph wall tok/s before claiming parity.
+
+Eager per-token kernel times (LE_EVT, same prompt), ms/tok:
+- matvec_12 (Q4_K) 6.22 vs llama 6.19: parity.
+- matvec_14 (Q6_K) 2.73 vs llama 2.46: +0.3.
+- attention (split + comb + prep + cvt) 2.44 vs llama 1.04: +1.4. Largest gap.
+- rmsnorm + quant_x + add + swiglu about 1.5 vs llama norm/quant/rope about 0.6: +0.9.
+
+Ranked remaining work:
+1. Attention decode: GQA kernel is correct (per-layer diff 3.3e-7) but only +2.5%. The gap to llama's 1.04 ms is mostly split count and launch structure; not yet tuned beyond SP 16/32/64.
+2. Norm/quant/elementwise: multi-block rms_quant gives +2.6% but changes greedy output at a near-tie; decide with projects-45 whether to accept.
+3. Q6_K matvec +0.3 ms.
+4. Prefill (unchanged this round): Q4_K GEMM and attention still about 1.6x and 1.5x behind llama (see LE_MMQ2 plan above).
+
+Defaults unchanged: LE_DN_GQA off, LE_RMSQ off, LE_DN_QKV on. Nothing pushed.
