@@ -1390,3 +1390,101 @@ extern "C" __global__ void __launch_bounds__(128) attn_flash_256_nc(const float*
 extern "C" __global__ void __launch_bounds__(128) dn_flash_128(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, int win) {
   flash_impl<128>(q, kc, vc, gate, out, pos0, T, nh, nkv, nullptr, nullptr, 0, 0, win, gate ? 2 : 1);
 }
+
+// Dense prefill attention v2 (hd 128, f16 KV). Differences from dn_flash_128:
+//  - 64-key tiles (was 32) so each tile has 8 mma column blocks and half as many syncs/softmax rescales;
+//  - Q kept in registers (A fragments loaded once from global), so smem is only K and V;
+//  - V stored row-major like K, and its B fragments come from ldmatrix.trans (no scalar transpose stores).
+// Smem: 2 * 64 * (128+8) halves = 34816 B (dynamic). Same causal/window mask and sigmoid-gate semantics.
+__device__ __forceinline__ void ldsm_x4_t(const __half* p, unsigned& r0, unsigned& r1, unsigned& r2, unsigned& r3) {
+  unsigned a = (unsigned)__cvta_generic_to_shared(p);
+  asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];" : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(a));
+}
+extern "C" __global__ void __launch_bounds__(128) dn_flash_128b(const float* q, const void* kc, const void* vc, const float* gate, float* out, int pos0, int T, int nh, int nkv, int win) {
+  constexpr int HDc = 128, PQ = HDc + 8, KT = 64;
+  extern __shared__ __align__(16) __half fsm2[];
+  __half* ks = fsm2; __half* vs = ks + KT * PQ;
+  const int q0 = blockIdx.x * 64, h = blockIdx.y, kvh = h / (nh / nkv), kvd = nkv * HDc;
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t4 = lane & 3;
+  const float scale = rsqrtf((float)HDc);
+  const int rowA = q0 + warp * 16 + g, rowB = rowA + 8;
+  unsigned qf[8][4];
+  #pragma unroll
+  for (int kk = 0; kk < 8; kk++) {
+    int c0 = kk * 16 + 2 * t4, c1 = c0 + 8;
+    auto qpk = [&](int row, int c) -> unsigned { if (row >= T) return 0u; float2 v = *(const float2*)(q + (size_t)row * nh * HDc + h * HDc + c); return pack2h(v.x * scale, v.y * scale); };
+    qf[kk][0] = qpk(rowA, c0); qf[kk][1] = qpk(rowB, c0); qf[kk][2] = qpk(rowA, c1); qf[kk][3] = qpk(rowB, c1);
+  }
+  const int last = pos0 + min(q0 + 64, T) - 1;
+  const int qp0 = pos0 + q0 + warp * 16 + g, qp1 = qp0 + 8;
+  float o[HDc / 8][4];
+  #pragma unroll
+  for (int d = 0; d < HDc / 8; d++) { o[d][0] = o[d][1] = o[d][2] = o[d][3] = 0.f; }
+  float m0 = -1e30f, m1 = -1e30f, l0 = 0.f, l1 = 0.f;
+  const int kstart = win > 0 ? (max(0, pos0 + q0 - win + 1) & ~(KT - 1)) : 0;
+  for (int k0 = kstart; k0 <= last; k0 += KT) {
+    __syncthreads();
+    for (int i = tid; i < KT * HDc / 8; i += 128) {
+      int r = i / (HDc / 8), c = (i % (HDc / 8)) * 8;
+      uint4 kv = make_uint4(0, 0, 0, 0), vv = kv;
+      if (k0 + r <= last) { size_t off = (size_t)(k0 + r) * kvd + kvh * HDc + c; kv = *(const uint4*)((const __half*)kc + off); vv = *(const uint4*)((const __half*)vc + off); }
+      *(uint4*)(ks + r * PQ + c) = kv;
+      *(uint4*)(vs + r * PQ + c) = vv;
+    }
+    __syncthreads();
+    float s[8][4];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.f; }
+    #pragma unroll
+    for (int kk = 0; kk < 8; kk++) {
+      #pragma unroll
+      for (int nt = 0; nt < 8; nt++) {
+        const __half* kb = ks + (nt * 8 + g) * PQ + kk * 16 + 2 * t4;
+        mma16816h(s[nt], qf[kk][0], qf[kk][1], qf[kk][2], qf[kk][3], *(const unsigned*)kb, *(const unsigned*)(kb + 8));
+      }
+    }
+    float mx0 = m0, mx1 = m1;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+      int key = k0 + nt * 8 + 2 * t4;
+      if (key > qp0 || (win > 0 && key <= qp0 - win)) s[nt][0] = -1e30f; if (key + 1 > qp0 || (win > 0 && key + 1 <= qp0 - win)) s[nt][1] = -1e30f;
+      if (key > qp1 || (win > 0 && key <= qp1 - win)) s[nt][2] = -1e30f; if (key + 1 > qp1 || (win > 0 && key + 1 <= qp1 - win)) s[nt][3] = -1e30f;
+      mx0 = fmaxf(mx0, fmaxf(s[nt][0], s[nt][1])); mx1 = fmaxf(mx1, fmaxf(s[nt][2], s[nt][3]));
+    }
+    mx0 = fmaxf(mx0, __shfl_xor_sync(FULL, mx0, 1)); mx0 = fmaxf(mx0, __shfl_xor_sync(FULL, mx0, 2));
+    mx1 = fmaxf(mx1, __shfl_xor_sync(FULL, mx1, 1)); mx1 = fmaxf(mx1, __shfl_xor_sync(FULL, mx1, 2));
+    float c0 = __expf(m0 - mx0), c1 = __expf(m1 - mx1); m0 = mx0; m1 = mx1; l0 *= c0; l1 *= c1;
+    #pragma unroll
+    for (int nt = 0; nt < 8; nt++) {
+      s[nt][0] = __expf(s[nt][0] - m0); s[nt][1] = __expf(s[nt][1] - m0); s[nt][2] = __expf(s[nt][2] - m1); s[nt][3] = __expf(s[nt][3] - m1);
+      l0 += s[nt][0] + s[nt][1]; l1 += s[nt][2] + s[nt][3];
+    }
+    #pragma unroll
+    for (int d = 0; d < HDc / 8; d++) { o[d][0] *= c0; o[d][1] *= c0; o[d][2] *= c1; o[d][3] *= c1; }
+    const int lk = (lane >> 3) & 1, ld = lane & 7, lh = lane >> 4;
+    #pragma unroll
+    for (int kb = 0; kb < 4; kb++) {
+      unsigned a0 = pack2h(s[2 * kb][0], s[2 * kb][1]), a1 = pack2h(s[2 * kb][2], s[2 * kb][3]);
+      unsigned a2 = pack2h(s[2 * kb + 1][0], s[2 * kb + 1][1]), a3 = pack2h(s[2 * kb + 1][2], s[2 * kb + 1][3]);
+      #pragma unroll
+      for (int dp = 0; dp < HDc / 16; dp++) {
+        unsigned r0, r1, r2, r3;
+        ldsm_x4_t(vs + (kb * 16 + lk * 8 + ld) * PQ + dp * 16 + lh * 8, r0, r1, r2, r3);
+        mma16816h(o[2 * dp], a0, a1, a2, a3, r0, r1);
+        mma16816h(o[2 * dp + 1], a0, a1, a2, a3, r2, r3);
+      }
+    }
+  }
+  l0 += __shfl_xor_sync(FULL, l0, 1); l0 += __shfl_xor_sync(FULL, l0, 2);
+  l1 += __shfl_xor_sync(FULL, l1, 1); l1 += __shfl_xor_sync(FULL, l1, 2);
+  #pragma unroll
+  for (int r = 0; r < 2; r++) {
+    int t = q0 + warp * 16 + g + 8 * r; if (t >= T) continue;
+    float inv = 1.f / (r ? l1 : l0); size_t base = ((size_t)t * nh + h) * HDc;
+    float gm_ = gate ? sigm_f(gate[(size_t)t * nh + h]) : 1.f;
+    #pragma unroll
+    for (int d = 0; d < HDc / 8; d++) for (int e = 0; e < 2; e++) {
+      int col = d * 8 + 2 * t4 + e; out[base + col] = o[d][2 * r + e] * inv * gm_;
+    }
+  }
+}

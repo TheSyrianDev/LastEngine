@@ -53,7 +53,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -196,8 +196,10 @@ impl DenseGpu {
                 self.launch("dn_cvt_half", (t * nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.bv), P(self.vc[l] + (pos0 * nkv * hd * 2) as u64), I((t * nkv * hd) as i32)]);
                 let win = if d.swa { m.window } else { 0 };
                 if hd == 128 && std::env::var("LE_DN_FLASH").map_or(true, |v| v != "0") {
-                    let smem = ((64 + 32) * (hd + 8) + hd * 40) * 2;
-                    self.launch3s("dn_flash_128", (t.div_ceil(64) as u32, nh as u32, 1), 128, smem as u32, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), I(win as i32)]);
+                    let v2 = std::env::var("LE_DN_FLASH2").map_or(true, |v| v != "0");
+                    let smem = if v2 { 2 * 64 * (hd + 8) * 2 } else { ((64 + 32) * (hd + 8) + hd * 40) * 2 };
+                    let kname = if v2 { "dn_flash_128b" } else { "dn_flash_128" };
+                    self.launch3s(kname, (t.div_ceil(64) as u32, nh as u32, 1), 128, smem as u32, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(pos0 as i32), I(t as i32), I(nh as i32), I(nkv as i32), I(win as i32)]);
                 } else {
                 self.launch3("dn_attn", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I((pos0 + 1) as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(0)]);
                 }
