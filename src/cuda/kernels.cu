@@ -1125,6 +1125,9 @@ __device__ void mmq128_impl(const u8* const* ptrs, const int* off, const int* in
     }
 }
 
+// Zero a float buffer (used before split-K atomic accumulation).
+extern "C" __global__ void zero_f(float* p, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) p[i] = 0.f; }
+
 // 128-row x 128-token block tile (llama.cpp-style reuse): 8 warps, each 16 rows x 128 tokens. Selected by LE_MMQR=1.
 template <int TY, bool HALF>
 __device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* in_idx, const int* out_idx, const signed char* xq, const float* xd, const int* xs,
@@ -1133,8 +1136,11 @@ __device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* i
   __shared__ float Sa0[4][128], Sa1[4][128], Sam[4][128], Sbd[4][128], Sbs[4][128];
   int z = blockIdx.z, n = off[z + 1] - off[z], t0 = blockIdx.y * 128;
   if (t0 >= n) return;
-  int r0 = blockIdx.x * 128, tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+  int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
   int units = cols >> 5;
+  // Split-K over units (opt-in, LE_MMQSK=S): grid.x = row_blocks * S, block index = row_block * S + split. Requires units % 4 == 0.
+  int rb_count = (rows + 127) / 128, S = gridDim.x / rb_count; int split = blockIdx.x % S; int r0 = (blockIdx.x / S) * 128;
+  int steps = units / 4, s_lo = split * steps / S, s_hi = (split + 1) * steps / S;
   const int UB = Q<TY>::UB, BY = Q<TY>::BYTES;
   int la_row = tid >> 2, la_u = tid & 3;                     // weight rows la_row and la_row+64, unit la_u
   int lb_u = tid & 3; int lb_tok[2] = {tid >> 2, (tid >> 2) + 64};
@@ -1165,8 +1171,8 @@ __device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* i
       } else { q0[j] = make_int4(0, 0, 0, 0); q1[j] = q0[j]; bd[j] = 0.f; bs[j] = 0.f; }
     }
   };
-  fetch(0);
-  for (int u0 = 0; u0 < units; u0 += 4) {
+  fetch(s_lo * 4);
+  for (int u0 = s_lo * 4; u0 < s_hi * 4; u0 += 4) {
     #pragma unroll
     for (int k = 0; k < 2; k++) {
       int rw = la_row + 64 * k;
@@ -1180,7 +1186,7 @@ __device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* i
       Sbd[lb_u][lb_tok[j]] = bd[j]; Sbs[lb_u][lb_tok[j]] = bs[j];
     }
     __syncthreads();
-    if (u0 + 4 < units) fetch(u0 + 4);
+    if (u0 + 4 < s_hi * 4) fetch(u0 + 4);
     #pragma unroll
     for (int uu = 0; uu < 4; uu++) {
       int ra = wm + g, rb = wm + g + 8;
@@ -1212,7 +1218,7 @@ __device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* i
     #pragma unroll
     for (int i = 0; i < 4; i++) {
       int r = r0 + wm + g + ((i >> 1) ? 8 : 0), tkn = t0 + nt * 8 + 2 * t + (i & 1);
-      if (r < rows && tkn < n) { int ob = off[z] + tkn; int orow = out_idx ? out_idx[ob] : ob; out[(size_t)orow * rows + r] = acc[nt][i]; }
+      if (r < rows && tkn < n) { int ob = off[z] + tkn; int orow = out_idx ? out_idx[ob] : ob; if (S == 1) out[(size_t)orow * rows + r] = acc[nt][i]; else atomicAdd(&out[(size_t)orow * rows + r], acc[nt][i]); }
     }
 }
 

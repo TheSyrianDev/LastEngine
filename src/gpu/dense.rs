@@ -60,7 +60,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -187,6 +187,13 @@ impl DenseGpu {
         let rtile = wide && std::env::var("LE_MMQR").map_or(true, |v| v != "0");
         let name_r = format!("mmq128r_{}", &name["mmq128_".len()..]);
         let (name, rrows) = if rtile { (name_r.as_str(), 128) } else { (name, 64) };
+        // LE_MMQSK=S (opt-in, default 1): split-K over the 128-row kernel. Needs units % 4 == 0; output is zeroed then atomically accumulated.
+        let sk = if rtile && w.cols % 128 == 0 { std::env::var("LE_MMQSK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).max(1) } else { 1 };
+        if sk > 1 {
+            self.launch("zero_f", (t * w.rows).div_ceil(256) as u32, 256, 0, &[P(out), I((t * w.rows) as i32)]);
+            self.launch3(name, ((w.rows.div_ceil(rrows) * sk as usize) as u32, t.div_ceil(tile) as u32, 1), 256, &[P(w.cell), P(self.boff), P(0), P(0), P(self.bxq), P(self.bxd), P(self.bxs), P(out), I(w.rows as i32), I(w.cols as i32)]);
+            return;
+        }
         self.launch3(name, (w.rows.div_ceil(rrows) as u32, t.div_ceil(tile) as u32, 1), 256, &[P(w.cell), P(self.boff), P(0), P(0), P(self.bxq), P(self.bxd), P(self.bxs), P(out), I(w.rows as i32), I(w.cols as i32)]);
     }
     fn brms(&self, x: Dp, w: Dp, o: Dp, t: usize) { self.launch("rmsnorm_b", t as u32, 256, 0, &[P(x), P(w), P(o), I(self.m.n_embd as i32), F(self.m.eps)]); }
