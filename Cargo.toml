@@ -1,6 +1,6 @@
 [package]
 name = "lastengine"
-version = "0.0.1"
+version = "0.1.0"
 edition = "2021"
 license = "LicenseRef-PolyForm-Noncommercial-1.0.0"
 description = "Clean-room LLM inference engine for MoE models on small GPUs"
