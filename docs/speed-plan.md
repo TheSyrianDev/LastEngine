@@ -148,3 +148,20 @@ Notes:
 - Graph decode r=3, same 2594-token prompt, 128 gen, default build: 93.2 / 93.2 / 93.1 tok/s (old default 88.6; llama.cpp b12182 94.9).
 - Output differs from the old default at one near-tie token (char 326 of 545). Accepted by peer decision.
 - Gap to llama decode at this prompt: about 1.8% (93.2 vs 94.9).
+
+## Prefill Q4_K GEMM study and plan (2026-11-12, no GPU runs; machine busy per peer)
+
+Status: study done from llama.cpp source (`ggml/src/ggml-cuda/mmq-config-ampere.cuh`, `mmq.cuh`, `mmq-load-tiles.cuh`, `mmq-vec-dot.cuh`). No GPU measurement made in this step. A 4K prefill timing attempt printed nothing because the server does not log prefill unless LE_EVT is set; that run was not valid and is not used.
+
+llama.cpp Ampere config for Q4_K (`CASE(GGML_TYPE_Q4_K, nthreads, occupancy, I, J, layout, K, stream_k, fallback)`):
+- nthreads 256, occupancy 1, I (weight rows per block) 128, J (tokens) 8..128, layout Q8_1, MMQ_ITER_K 256, stream_k true on the fast path.
+- Our kernel (src/cuda/kernels.cu, `mmq128_impl` ~line 1045, `MMQ128` macro ~1222): 256 threads, `__launch_bounds__(256, 2)`, block tile 64 weight rows x 128 tokens (`r0 = blockIdx.x * 64`, `t0 = blockIdx.y * 128`). The 128-row variant (`mmq128r_*`, LE_MMQR, default on in src/gpu/dense.rs:184) is closest to llama's I=128.
+- Ours: occupancy 2 target; llama: occupancy 1 with a bigger per-block tile and stream-K to fill SMs.
+
+Ranked candidates (each gated by dense_cmp_gate, then r=3 4K prefill under lock):
+1. Occupancy 1 with a 128-row tile and a larger pipeline (launch_bounds(256,1)); earlier test at 64-row tile was slower (1581 vs 1674), so only try with the 128-row tile. Cheap to test.
+2. Stream-K on the 128-row tile: the earlier stream-K test (LE_MMQS, 64-row) was slower (1450 vs 1674). Retest on the 128-row tile, since llama's win depends on the combination.
+3. Epilogue: llama applies one float multiply per 32-weight sub-block (`sumf_d += ds8.x*(sc*sumi_d)`) like ours; our extra per-output float ops (acc += d_x*(sA*cc - mA*x)) are a few percent at most. Low priority.
+4. Measure with ncu when counters are allowed (sudo ncu approved by Omar): compare mmq128r_12 against llama `mul_mat_q<12>` on occupancy, DRAM/L2 throughput, bank conflicts (As[..][9] pad), stall reasons.
+
+Blocked: GPU use. Omar is gaming (peer projects-45 message); no benchmarks or ncu until the machine is declared free.
