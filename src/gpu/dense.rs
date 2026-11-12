@@ -46,6 +46,7 @@ fn prof_dump() { let mut v = PROF.lock().unwrap(); v.sort_by(|a, b| b.1.partial_
 
 /// LE_EVT=1: per-launch CUDA events on the stream (no host sync); summed at end of prefill.
 fn evt_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| std::env::var("LE_EVT").is_ok()) }
+thread_local! { static NO_EVT: std::cell::Cell<bool> = std::cell::Cell::new(false); }
 thread_local! { static DEC: std::cell::RefCell<std::collections::BTreeMap<String,(f64,usize)>> = std::cell::RefCell::new(Default::default()); static DEC_WALL: std::cell::RefCell<(f64,f64,f64,usize)> = std::cell::RefCell::new((0.0,0.0,0.0,0)); }
 thread_local! { static EVT: std::cell::RefCell<Vec<(String, std::sync::Arc<cudarc::driver::CudaEvent>, std::sync::Arc<cudarc::driver::CudaEvent>)>> = std::cell::RefCell::new(Vec::new()); }
 
@@ -121,7 +122,7 @@ impl DenseGpu {
         }
     }
     fn ev_begin(&self) -> Option<std::sync::Arc<cudarc::driver::CudaEvent>> {
-        if !evt_on() { return None; }
+        if !evt_on() || NO_EVT.with(|c| c.get()) { return None; }
         let e = self._ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).expect("event");
         e.record(&self.st).expect("record"); Some(std::sync::Arc::new(e))
     }
@@ -333,10 +334,14 @@ impl DenseGpu {
     /// Per-kernel times need LE_DN_GRAPH=0 (graph capture records events as graph nodes, not timings).
     pub fn forward(&mut self, t: u32) -> Vec<f32> { self.bind();
         if !evt_on() { return self.step(t, true); }
+        // Graph mode: events inside graph capture are nodes, not timings, so use host wall only.
+        let graph = std::env::var("LE_DN_GRAPH").map_or(true, |v| v != "0");
+        NO_EVT.with(|c| c.set(graph));
         EVT.with(|v| v.borrow_mut().clear());
         let w0 = std::time::Instant::now();
-        let w0e = self.ev_begin();
+        let w0e = if graph { None } else { self.ev_begin() };
         let out = self.step(t, true);
+        NO_EVT.with(|c| c.set(false));
         let host_ms = w0.elapsed().as_secs_f64() * 1e3;
         let g_ms = match w0e { Some(a) => { let b = self._ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).expect("event"); b.record(&self.st).expect("record"); b.synchronize().expect("sync"); a.elapsed_ms(&b).expect("elapsed") as f64 } None => host_ms };
         let mut ksum = 0f64;
