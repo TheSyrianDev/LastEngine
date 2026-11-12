@@ -60,7 +60,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_attn_split", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -261,6 +261,7 @@ impl DenseGpu {
     fn layers(&self, split: &[bool]) {
         let m = &self.m; let (n, hd, nh, nkv) = (m.n_embd, m.head_dim, m.n_head, m.n_kv);
         let lfm = m.kind == Kind::Lfm3;
+        let gqa = nh / nkv == 8 && hd == 128 && std::env::var("LE_DN_GQA").map_or(false, |v| v == "1");
         for l in 0..m.n_layer {
             let d = &self.lay[l];
             self.rms(self.x, d.attn_norm, self.h, n);
@@ -282,7 +283,8 @@ impl DenseGpu {
                 let win = if d.swa { m.window } else { 0 };
                 let (_, _, sp) = dn_split_env();
                 if split[l] {
-                    self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32), P(self.dpos + 4)]);
+                    if gqa { self.launch3("dn_attn_gqa", (nkv as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32), P(self.dpos + 4)]); } else {
+                        self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32), P(self.dpos + 4)]); }
                     self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp as i32)]);
                 } else {
                 self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(self.dpos + 4)]);

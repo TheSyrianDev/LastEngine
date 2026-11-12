@@ -115,6 +115,47 @@ extern "C" __global__ void dn_attn_split(const float* q, const __half* kc, const
   if (threadIdx.x == 0) { float L = 0.f; for (int i = 0; i < 8; i++) L += lw[i] * __expf(mw[i] - M); pp[0] = M; pp[1] = L; }
   for (int d = threadIdx.x; d < hd; d += blockDim.x) { float x = 0.f; for (int i = 0; i < 8; i++) x += ow[i][d] * __expf(mw[i] - M); pp[2 + d] = x; }
 }
+// GQA split-K decode attention: grid (nkv, S), block 256 = 8 warps, one warp per query head of the KV group (needs nh/nkv == 8, hd == 128).
+// K/V rows are read once per KV head instead of once per query head. Keys are processed in tiles of 32 staged in shared memory,
+// so the softmax max/sum reduce once per tile (not per key). Output layout matches dn_attn_split (dn_attn_comb merges it).
+extern "C" __global__ void dn_attn_gqa(const float* q, const __half* kc, const __half* vc, float* part, int win, int n, int nh, int nkv, int hd, int S, const int* ndev) {
+  if (ndev) n = ndev[0];
+  __shared__ float qs[8][128]; __shared__ float ks[32][129]; __shared__ __half vs[32][128]; __shared__ float sc[8][32];
+  const int G = nh / nkv; int kvh = blockIdx.x, s = blockIdx.y, tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
+  int h = kvh * G + w;
+  int t0 = (win > 0 && n > win) ? n - win : 0; int len = n - t0; int per_s = (len + S - 1) / S;
+  int a = t0 + s * per_s, b = min(n, a + per_s);
+  for (int i = tid; i < 8 * 128; i += 256) { int hh = i >> 7, d = i & 127; qs[hh][d] = q[(kvh * G + hh) * hd + d]; }
+  float m = -1e30f, l = 0.f, scale = rsqrtf((float)hd);
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int t = a; t < b; t += 32) {
+    int cnt = min(32, b - t);
+    __syncthreads();
+    for (int i = tid; i < 32 * 128; i += 256) {
+      int kk = i >> 7, d = i & 127;
+      if (kk < cnt) { size_t row = (size_t)(t + kk) * nkv + kvh; ks[kk][d] = __half2float(kc[row * hd + d]); vs[kk][d] = vc[row * hd + d]; }
+    }
+    __syncthreads();
+    { int hh = tid >> 5, kk = tid & 31; float v = -1e30f;
+      if (kk < cnt) { float dot = 0.f; for (int d = 0; d < 128; d++) dot += qs[hh][d] * ks[kk][d]; v = dot * scale; }
+      sc[hh][kk] = v; }
+    __syncthreads();
+    float sv = sc[w][lane], tm = sv;
+    for (int o = 16; o > 0; o >>= 1) tm = fmaxf(tm, __shfl_xor_sync(0xffffffff, tm, o));
+    float mn = fmaxf(m, tm), cr = __expf(m - mn);
+    float p = (lane < cnt) ? __expf(sv - mn) : 0.f;
+    l = l * cr + warp_sum(p);
+    for (int j = 0; j < 4; j++) acc[j] *= cr;
+    for (int k = 0; k < cnt; k++) {
+      float pk = __shfl_sync(0xffffffff, p, k);
+      for (int j = 0; j < 4; j++) acc[j] += pk * __half2float(vs[k][lane * 4 + j]);
+    }
+    m = mn;
+  }
+  float* pp = part + ((size_t)h * S + s) * (hd + 2);
+  if (lane == 0) { pp[0] = m; pp[1] = l; }
+  for (int j = 0; j < 4; j++) pp[2 + lane * 4 + j] = acc[j];
+}
 extern "C" __global__ void dn_attn_comb(const float* part, const float* gate, float* o, int hd, int S) {
   int h = blockIdx.x; const float* pp = part + (size_t)h * S * (hd + 2);
   float M = -1e30f; for (int s = 0; s < S; s++) M = fmaxf(M, pp[s * (hd + 2)]);
