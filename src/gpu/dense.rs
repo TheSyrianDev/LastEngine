@@ -43,6 +43,11 @@ static PROF: std::sync::Mutex<Vec<(String, f64, usize)>> = std::sync::Mutex::new
 fn prof_add(name: &str, secs: f64) { let mut v = PROF.lock().unwrap(); match v.iter_mut().find(|e| e.0 == name) { Some(e) => { e.1 += secs; e.2 += 1; } None => v.push((name.to_string(), secs, 1)) } }
 fn prof_dump() { let mut v = PROF.lock().unwrap(); v.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap()); let tot: f64 = v.iter().map(|e| e.1).sum(); for e in v.iter().take(25) { eprintln!("prof {:>22} {:>9.2} ms {:>6} calls {:>5.1}%", e.0, e.1 * 1e3, e.2, 100.0 * e.1 / tot); } eprintln!("prof total {:.2} ms", tot * 1e3); v.clear(); }
 
+
+/// LE_EVT=1: per-launch CUDA events on the stream (no host sync); summed at end of prefill.
+fn evt_on() -> bool { static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new(); *ON.get_or_init(|| std::env::var("LE_EVT").is_ok()) }
+thread_local! { static EVT: std::cell::RefCell<Vec<(String, std::sync::Arc<cudarc::driver::CudaEvent>, std::sync::Arc<cudarc::driver::CudaEvent>)>> = std::cell::RefCell::new(Vec::new()); }
+
 impl DenseGpu {
     pub fn new(m: Dense, ctx_len: usize) -> DenseGpu {
         let ctx = CudaContext::new(0).unwrap_or_else(|e| { eprintln!("lastengine: no usable CUDA device: {e:?}"); std::process::exit(1) });
@@ -114,11 +119,23 @@ impl DenseGpu {
             bxq: dalloc(CH * wide_cols), bxd: dalloc(CH * wide_cols / 8), bxs: dalloc(CH * wide_cols / 8), boff: dalloc(8), m,
         }
     }
+    fn ev_begin(&self) -> Option<std::sync::Arc<cudarc::driver::CudaEvent>> {
+        if !evt_on() { return None; }
+        let e = self._ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).expect("event");
+        e.record(&self.st).expect("record"); Some(std::sync::Arc::new(e))
+    }
+    fn ev_end(&self, name: &str, start: std::sync::Arc<cudarc::driver::CudaEvent>) {
+        let end = self._ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).expect("event");
+        end.record(&self.st).expect("record");
+        EVT.with(|v| v.borrow_mut().push((name.to_string(), start, std::sync::Arc::new(end))));
+    }
     fn launch(&self, name: &str, grid: u32, block: u32, smem: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        let ev = self.ev_begin();
         let t0 = std::time::Instant::now();
         unsafe { b.launch(LaunchConfig { grid_dim: (grid, 1, 1), block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
+        if let Some(e) = ev { self.ev_end(name, e); }
         if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
     fn qx(&self, x: Dp, n: usize) { let u = n / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.xqb), P(self.xdb), P(self.xsb), I(u as i32)]); }
@@ -140,15 +157,19 @@ impl DenseGpu {
     fn launch3(&self, name: &str, grid: (u32, u32, u32), block: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        let ev = self.ev_begin();
         let t0 = std::time::Instant::now();
         unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: 0 }).expect("launch"); }
+        if let Some(e) = ev { self.ev_end(name, e); }
         if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
     fn launch3s(&self, name: &str, grid: (u32, u32, u32), block: u32, smem: u32, args: &[A]) {
         let mut b = self.st.launch_builder(&self.f[name]);
         for a in args { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+        let ev = self.ev_begin();
         let t0 = std::time::Instant::now();
         unsafe { b.launch(LaunchConfig { grid_dim: grid, block_dim: (block, 1, 1), shared_mem_bytes: smem }).expect("launch"); }
+        if let Some(e) = ev { self.ev_end(name, e); }
         if prof_on() { self.st.synchronize().unwrap(); prof_add(name, t0.elapsed().as_secs_f64()); }
     }
     /// Quantise `t` rows of `cols` floats from `x` for the batched GEMMs.
@@ -311,8 +332,20 @@ impl DenseGpu {
     pub fn prefill(&mut self, ids: &[u32]) -> Vec<f32> { self.bind();
         let mut l = vec![];
         if std::env::var("LE_DENSE_SERIAL").is_ok() { for (i, &t) in ids.iter().enumerate() { l = self.step(t, i + 1 == ids.len()); } return l; }
+        let wall0 = if evt_on() { EVT.with(|v| v.borrow_mut().clear()); self.ev_begin() } else { None };
         let mut i = 0;
         while i < ids.len() { let e = (i + CH).min(ids.len()); l = self.chunk(&ids[i..e], e == ids.len()); i = e; }
+        if let Some(w0) = wall0 {
+            let w1 = self._ctx.new_event(Some(cudarc::driver::sys::CUevent_flags::CU_EVENT_DEFAULT)).expect("event");
+            w1.record(&self.st).expect("record"); w1.synchronize().expect("sync");
+            let wall = w0.elapsed_ms(&w1).expect("elapsed") as f64;
+            let mut agg: std::collections::BTreeMap<String, (f64, usize)> = Default::default(); let mut ksum = 0f64;
+            EVT.with(|v| for (n, a, b) in v.borrow().iter() { let ms = a.elapsed_ms(b).expect("elapsed") as f64; ksum += ms; let e = agg.entry(n.clone()).or_insert((0.0, 0)); e.0 += ms; e.1 += 1; });
+            let mut rows: Vec<_> = agg.into_iter().collect(); rows.sort_by(|a, b| b.1 .0.partial_cmp(&a.1 .0).unwrap());
+            eprintln!("evt wall {:.2} ms, kernel sum {:.2} ms, idle {:.2} ms ({:.1}%)", wall, ksum, wall - ksum, 100.0 * (wall - ksum) / wall);
+            for (n, (ms, c)) in rows.iter().take(25) { eprintln!("evt {:>22} {:>9.2} ms {:>6} calls {:>5.1}%", n, ms, c, 100.0 * ms / ksum); }
+            EVT.with(|v| v.borrow_mut().clear());
+        }
         if prof_on() { prof_dump(); }
         l
     }
