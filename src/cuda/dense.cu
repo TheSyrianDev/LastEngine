@@ -28,6 +28,42 @@ extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
 // Decode variant: destination row is pdev[0] (device-resident position), so the launch args do not change per token.
 extern "C" __global__ void dn_cvt_half_d(const float* in, __half* base, const int* pdev, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) base[(size_t)pdev[0] * n + i] = __float2half(in[i]); }
+// Fused decode prep for one token: blocks [0,nh) do q (norm+rope, in place); blocks [nh,nh+nkv) do k (norm+rope into the K cache row at pdev[0])
+// and copy v into the V cache row at pdev[0]. Same math as dn_prep (q) + dn_prep (k) + dn_cvt_half_d (v), one launch. Block 128 threads, hd <= 256.
+__device__ void dn_rot_load(const float* in, int hd, int rope_dim, int pos, float base, const float* ff, int neox, const float* nw, float eps, float* v, float* red) {
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = in[i];
+  __syncthreads();
+  float sc = 1.f;
+  if (nw) {
+    float s = 0.f; for (int i = threadIdx.x; i < hd; i += blockDim.x) s += v[i] * v[i];
+    s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+    float t = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += red[w];
+    sc = rsqrtf(t / hd + eps); __syncthreads();
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = v[i] * sc * nw[i];
+    __syncthreads();
+  }
+  int half = rope_dim / 2;
+  for (int i = threadIdx.x; i < half; i += blockDim.x) {
+    float th = pos * powf(base, -(2.f * i) / rope_dim); if (ff) th /= ff[i];
+    float s, c; sincosf(th, &s, &c);
+    int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
+    float a = v[ia], b = v[ib]; v[ia] = a * c - b * s; v[ib] = a * s + b * c;
+  }
+  __syncthreads();
+}
+extern "C" __global__ void dn_qkv_dec(float* q, const float* k, const float* v, __half* kc, __half* vc, const int* pdev, int pos0, int nh, int nkv, int hd, int rope_dim, float base, const float* ff, int neox, const float* qn, const float* kn, float eps) {
+  __shared__ float vb[256]; __shared__ float red[8];
+  if (blockIdx.x < nh) {
+    int h = blockIdx.x;
+    dn_rot_load(q + h * hd, hd, rope_dim, pdev[0], base, ff, neox, qn, eps, vb, red);
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) q[h * hd + i] = vb[i];
+  } else {
+    int kh = blockIdx.x - nh; int pos = pdev[0];
+    dn_rot_load(k + kh * hd, hd, rope_dim, pos, base, ff, neox, kn, eps, vb, red);
+    size_t ro = (size_t)pos * nkv * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) { kc[ro + kh * hd + i] = __float2half(vb[i]); vc[ro + kh * hd + i] = __float2half(v[kh * hd + i]); }
+  }
+}
 // Decode attention, one block (8 warps) per query head; warps split the keys, online softmax, merged through shared memory.
 extern "C" __global__ void dn_attn(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int win, int n, int nh, int nkv, int hd, const int* ndev) {
   if (ndev) n = ndev[0];
