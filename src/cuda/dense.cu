@@ -28,6 +28,28 @@ extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
 // Decode variant: destination row is pdev[0] (device-resident position), so the launch args do not change per token.
 extern "C" __global__ void dn_cvt_half_d(const float* in, __half* base, const int* pdev, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) base[(size_t)pdev[0] * n + i] = __float2half(in[i]); }
+// RMSNorm + activation quantisation in one launch (block 256). The norm is computed exactly as rmsnorm; the q8_1-style unit quantiser is quant_x's.
+// Writes the float normalised vector o (kept for residual/other uses) and xq/xd/xs for the next matvec. n % 32 == 0.
+extern "C" __global__ void rms_quant(const float* x, const float* w, float* o, signed char* xq, float* xd, int* xs, int n, float eps) {
+  __shared__ float red[32];
+  float s = 0.f; for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i] * x[i];
+  s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; v = warp_sum(v); if (threadIdx.x == 0) red[0] = v; }
+  __syncthreads();
+  float r = rsqrtf(red[0] / n + eps);
+  for (int i = threadIdx.x; i < n; i += blockDim.x) o[i] = x[i] * r * w[i];
+  __syncthreads();
+  int lane = threadIdx.x & 31;
+  for (int u = threadIdx.x >> 5; u < n / 32; u += blockDim.x >> 5) {
+    float v = o[u * 32 + lane], a = fabsf(v);
+    for (int off = 16; off; off >>= 1) a = fmaxf(a, __shfl_xor_sync(0xffffffff, a, off));
+    float d = a / 127.f, id = d > 0.f ? 1.f / d : 0.f;
+    int q = __float2int_rn(v * id);
+    xq[u * 32 + lane] = (signed char)q;
+    int sm = q; for (int off = 16; off; off >>= 1) sm += __shfl_xor_sync(0xffffffff, sm, off);
+    if (lane == 0) { xd[u] = d; xs[u] = sm; }
+  }
+}
 // Fused decode prep for one token: blocks [0,nh) do q (norm+rope, in place); blocks [nh,nh+nkv) do k (norm+rope into the K cache row at pdev[0])
 // and copy v into the V cache row at pdev[0]. Same math as dn_prep (q) + dn_prep (k) + dn_cvt_half_d (v), one launch. Block 128 threads, hd <= 256.
 __device__ void dn_rot_load(const float* in, int hd, int rope_dim, int pos, float base, const float* ff, int neox, const float* nw, float eps, float* v, float* red) {
