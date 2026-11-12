@@ -165,3 +165,19 @@ Ranked candidates (each gated by dense_cmp_gate, then r=3 4K prefill under lock)
 4. Measure with ncu when counters are allowed (sudo ncu approved by Omar): compare mmq128r_12 against llama `mul_mat_q<12>` on occupancy, DRAM/L2 throughput, bank conflicts (As[..][9] pad), stall reasons.
 
 Blocked: GPU use. Omar is gaming (peer projects-45 message); no benchmarks or ncu until the machine is declared free.
+
+## Prefill queue on the GPU (2026-11-12, peer projects-45, lock held)
+
+Prompt: 5023 tokens (the repeated-word chat prompt in /tmp/claude-1000/pp4k.sh; it is 5K, not 4K). Timing = the first `evt wall` line of each run (LE_EVT=1, ctx 20000), 3 starts. tok/s = 5023 / wall.
+
+| Config | wall ms (r1 / r2 / r3) | prefill tok/s (approx) |
+|---|---|---|
+| default (mmq128r on) | 2448.2 / 2448.1 / 2451.7 | 2051 |
+| LE_MMQR=0 (64-row tile) | 2535.7 / 2513.2 / 2519.3 | 1991 |
+| LE_MMQSK=2 (split-K, atomicAdd) | 2586.8 / 2585.9 / 2583.0 | 1943 |
+| LE_MMQSK=4 | 2736.9 / 2759.7 / 2756.5 | 1826 |
+
+dense_cmp_gate on the current build (default): "The capital of France is" 14/15, max |dlogprob| 0.0760; "Explain..." 15/15, max 0.0560. Unchanged.
+
+Decision: no flip. Default (128-row tile, no split-K) is the fastest of the four. LE_MMQR=0 is 3% slower. Split-K is slower at both S=2 (-5%) and S=4 (-11%). The split-K kernel is kept opt-in and off; its atomicAdd epilogue is also not bit-stable, so it should not be used without a reason.
+Caveat: the wall times include the tail of the chunked prefill and the first-request warmup; a per-run 2-request order is not used for the prefill comparison.
