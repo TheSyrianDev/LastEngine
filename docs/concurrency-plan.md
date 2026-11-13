@@ -103,3 +103,5 @@ Reference: github.com/satellitedown/cinference (NInfer fork) reports ~450 tok/s 
 - Not caused by LE_MMQR (128-row GEMM tile) or LE_ROWS toggles.
 - Interim: batched_eligible route caps rows at BATCH_ROW_CAP = 6 (src/batchplan.rs). Rows above 6 must stay on the single path.
 - Suspects: row kernels dn_prep_rows, dn_attn_rows, dn_cvt_rows (src/cuda/dense.cu) and decode_batch metadata (src/gpu/dense.rs:279). First read of the kernels found no obvious bug.
+
+Correction (2026-11-13 14:05): the 'rows 7-8' bug is prompt-specific, not row-specific. 'Say hello in French.' fails at N=1 (max logit diff 19.8 at step 4) and at N=6 with identical prompts. Other prompts pass at N=1-6. The 6-row cap rationale is wrong; the batched decode path itself differs from solo forward for that prompt. LE_DN_GQA=0 does not change it. The batched route must not ship as default until this is fixed.
