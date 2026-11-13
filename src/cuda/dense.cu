@@ -25,6 +25,34 @@ extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int
   if (out_half) { __half* o = (__half*)out + ob + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
   else { float* o = (float*)out + ob + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
 }
+// Row-batched variant of dn_prep (phase 2 step 3): row r (blockIdx.y) takes its position from rpos[r]; K/V rows land at rpos[r]*rstride.
+// Grid (heads, rows). Same math as dn_prep; for rows=1 with rpos[0]=pos it must equal dn_prep(pdev=[pos]).
+extern "C" __global__ void dn_prep_rows(const float* in, void* out, int out_half, int hd, int rope_dim, float base, const float* ff, int neox, const float* nw, float eps, const int* rpos, int rstride) {
+  __shared__ float v[256]; __shared__ float red[8];
+  int h = blockIdx.x; int r = blockIdx.y; int pos = rpos[r];
+  size_t tb = (size_t)r * gridDim.x * hd; size_t ob = (size_t)pos * rstride; in += tb + (size_t)h * hd;
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = in[i];
+  __syncthreads();
+  float sc = 1.f;
+  if (nw) {
+    float s = 0.f; for (int i = threadIdx.x; i < hd; i += blockDim.x) s += v[i] * v[i];
+    s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+    float t = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += red[w];
+    sc = rsqrtf(t / hd + eps); __syncthreads();
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = v[i] * sc * nw[i];
+    __syncthreads();
+  }
+  int half = rope_dim / 2;
+  for (int i = threadIdx.x; i < half; i += blockDim.x) {
+    float th = pos * powf(base, -(2.f * i) / rope_dim); if (ff) th /= ff[i];
+    float s, c; sincosf(th, &s, &c);
+    int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
+    float a = v[ia], b = v[ib]; v[ia] = a * c - b * s; v[ib] = a * s + b * c;
+  }
+  __syncthreads();
+  if (out_half) { __half* o = (__half*)out + ob + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
+  else { float* o = (float*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
+}
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
 // Decode variant: destination row is pdev[0] (device-resident position), so the launch args do not change per token.
 extern "C" __global__ void dn_cvt_half_d(const float* in, __half* base, const int* pdev, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) base[(size_t)pdev[0] * n + i] = __float2half(in[i]); }
