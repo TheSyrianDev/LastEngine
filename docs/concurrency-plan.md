@@ -49,3 +49,26 @@ Rule: slots × ctx × KV-bytes-per-token + scratch must fit in measured free mem
 - Per-token KV bytes for MiniCPM5 (read from GGUF metadata, not assumed).
 - Whether the server should return 429 or queue indefinitely by default. Proposal: queue with a timeout, then 503 JSON error.
 - Whether Last AI needs per-request slot priority.
+
+## Phase 2 design: continuous batching for decode (MiniCPM5 dense), not started
+
+Gate (projects-45): each sequence's greedy output equals its single-sequence output token for token, and aggregate tok/s at 1/2/4/8 clients beats `llama-server -np` at the same settings.
+
+What the code does today (src/gpu/dense.rs):
+- One KV buffer per layer, `kc[l]`/`vc[l]` sized `ctx_len * nkv * hd * 2` (f16), one sequence only.
+- Decode position is a device scalar (`dpos`/`pdev`), and attention kernels (`dn_attn`, `dn_attn_gqa`, `dn_attn_split`) take a single `nk`.
+- The linear layers already have a multi-token GEMM path (`bmm`, mmq128r) used by prefill. That path can serve N decode rows at once for the projections.
+
+Steps, each a separate commit with its own gate:
+1. Per-sequence KV regions: allocate `slots × ctx × KV` per layer, with a slot index passed to every KV write and attention kernel. Gate: N=1 output unchanged vs HEAD (dense_cmp gate).
+2. Batched projections: decode N rows through the existing bmm path (rows = sequences). Gate: N=1 unchanged; N=2 rows equal to two single decodes (dense_cmp per row).
+3. Per-sequence attention: a kernel that takes per-slot `nk` and `pos`, so sequences of different lengths share one launch. Gate: per-row logits equal single-sequence logits within the dense_cmp tolerance.
+4. Scheduler: each iteration picks active sequences, runs one batched step, samples per sequence, admits new requests and retires finished ones. Gate: token-for-token match to single-sequence greedy at 1/2/4/8 clients.
+5. Benchmark vs `llama-server -np 1/2/4/8` on the same prompts, under machine-lock, with power mode recorded.
+
+Blocker to flag: step 1 touches every KV kernel and the graph capture. It is multi-session work, not a single change.
+
+## Later phases (added by projects-45)
+
+- **Grammar-constrained decoding for tool calls.** Small models need it: constrain sampling to the tool-call JSON schema from the tool definitions. Gate: tool-call output parses on every try at temperature 0 and at a sampled temperature.
+- **Sage tool-call check.** Run the tool-call tests (forced, natural, stream) on Sage once RAM is free. Not possible now (RAM in use by other jobs).
