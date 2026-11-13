@@ -43,10 +43,13 @@ impl Local {
             let (tx, rx) = std::sync::mpsc::channel::<crate::reqsched::Request>();
             let owner = gpu.clone();
             std::thread::spawn(move || {
+                let mut seed_ctr: u64 = 1;
                 crate::reqsched::run(rx, move |req, on| {
                     let mut e = owner.lock().unwrap();
+                    seed_ctr = seed_ctr.wrapping_add(1);
+                    let mut pk = crate::batchgen::Picker::new(req.sampling.temperature, req.sampling.top_p, seed_ctr);
                     match &mut *e {
-                        Eng::Dense(crate::dense::DenseEng::Cuda(gp)) => crate::batchgen::generate_stream(gp, &req.prompt_ids, req.max_tokens, &eos_ids, on),
+                        Eng::Dense(crate::dense::DenseEng::Cuda(gp)) => crate::batchgen::generate_stream_sampled(gp, &req.prompt_ids, req.max_tokens, &eos_ids, &mut pk, on),
                         _ => 0,
                     }
                 })
@@ -239,7 +242,6 @@ impl Backend for Local {
         if let Some(tx) = &self.batch {
             let max_pos = self.n_ctx.saturating_sub(1);
             let ids = if ids.len() > max_pos { ids[ids.len() - max_pos..].to_vec() } else { ids };
-            if req.sampling.temperature > 0.0 { emit(Delta::Content("[lastengine: LE_BATCH sampling not yet supported (S5)]".into())); return Usage { prompt_tokens: ids.len(), completion_tokens: 0, cached_tokens: 0, prefill_ms: 0.0, tool_calls: vec![], finish_reason: "error" }; }
             let budget = req.max_tokens.min(max_pos.saturating_sub(ids.len()));
             let (rtx, rrx) = std::sync::mpsc::channel();
             let sampling = crate::reqsched::Sampling { temperature: req.sampling.temperature, top_p: req.sampling.top_p };
