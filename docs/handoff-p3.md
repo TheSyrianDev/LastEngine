@@ -45,3 +45,11 @@ Branch `concurrency-p3`, local only, nothing pushed. Last commit `c740d84`.
   - Shared memory at nslot=8, cols=2560: ~24 KB + scales, under the 48 KB default.
 - Gates before dispatch: (a) GPU kernel output vs gemv_batch_ref within float tolerance per slot; (b) solo-equality: N=1 output bitwise equal to existing matvec_12; (c) batch invariance N=1/2/4/6/7/8 through tools/batch_invariance_gate.sh.
 - Known: unverified until GPU run. The existing bmm launches mmq128r_* over the whole batch (src/gpu/dense.rs:193-211), so the new kernel would replace bmm only for t <= 8.
+
+## Public fresh copy (prepared 2026-11-13, not pushed)
+- Path: /home/omar/Projects/public/LastEngine-fresh. One commit "Initial commit", author = committer = TheSyrianDev <215098066+TheSyrianDev@users.noreply.github.com>. 59 files tracked.
+- Source: local main tree (a3e5ebc = GitHub 2b9c2dc + 29 tested main-line commits). concurrency-p3 excluded (ungated).
+- Scrubbed: NOTICE real name -> TheSyrianDev; /home/omar paths -> ~ in docs; one "approved by Omar" phrase reworded in docs/speed-plan.md.
+- Diff vs GitHub main file set: added docs/concurrency-plan.md, HANDOFF.md, tests/api_integration.sh, tools/dense_cmp_gate.sh.
+- Tests: cargo test --release 8/8 pass; release build OK (fresh target dir). GPU gates NOT run for this copy.
+- CEO does GitHub deletes and the push.
