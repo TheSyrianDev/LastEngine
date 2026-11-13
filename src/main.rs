@@ -140,6 +140,25 @@ async fn main() {
                 pos += bs; gen.extend(&ar);
             }
         }
+        cli::Cmd::DenseBench { path, prompt, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let ctx: usize = std::env::var("LE_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(4096);
+            let m = dense::Dense::load(&path, &g);
+            let key = format!("{}|{}-{}-{}|{}", tune::gpu_name(), m.n_layer, m.n_embd, 0, ctx);
+            eprintln!("tunekey {key}");
+            let mut gp = gpu::dense::DenseGpu::new(m, ctx);
+            let ids = tk.encode(&prompt);
+            let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0 as u32;
+            let t0 = std::time::Instant::now();
+            let mut lg = gp.prefill(&ids);
+            let pf = t0.elapsed().as_secs_f32();
+            println!("prefill {} tok in {:.2}s", ids.len(), pf);
+            let t1 = std::time::Instant::now();
+            for _ in 0..n { let t = am(&lg); lg = gp.forward(t); }
+            let dt = t1.elapsed().as_secs_f32();
+            println!("decode {} tok in {:.2}s = {:.1} tok/s", n, dt, n as f32 / dt);
+        }
         cli::Cmd::DenseCmp { path, prompt, n } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");

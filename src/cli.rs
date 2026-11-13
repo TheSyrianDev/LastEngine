@@ -26,6 +26,8 @@ pub enum Cmd {
     CloverDraft { path: String, prompt: String, #[arg(default_value_t = 1)] blocks: usize },
     /// Dense model: CPU greedy for N tokens, GPU teacher-forced on the same tokens; report first logit/argmax divergences
     DenseCmp { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
+    /// Dense model GPU timing for tune: prints "prefill N tok in Xs" and "decode N tok in Xs = Y tok/s" (stdout), tunekey (stderr).
+    DenseBench { path: String, prompt: String, #[arg(default_value_t = 48)] n: usize },
     /// Two-slot independence: greedy-decode two prompts solo, then interleaved in slots 0 and 1 (run with LE_SLOTS=2); token streams must match.
     SlotTest { path: String, a: String, b: String, #[arg(default_value_t = 30)] n: usize },
     /// Phase 2 step 2 gate: greedy N tokens for two prompts, solo vs decode_batch over both slots (LE_SLOTS=2). Prints per-slot match counts.

@@ -17,7 +17,7 @@ pub fn gpu_name() -> String {
 }
 
 fn trial(exe: &str, model: &str, ctx: usize, kv: &str, chunk: usize, prompt: &str) -> Option<(f32, f32, Option<String>)> {
-    let o = Command::new(exe).args(["gpu", model, prompt, "1"]).env("LE_CTX", ctx.to_string()).env("LE_KV", kv).env("LE_TMAX", chunk.to_string()).env("LE_NOTUNE", "1").env("LE_N", "48").output().ok()?;
+    let o = Command::new(exe).args(["dense-bench", model, prompt, "48"]).env("LE_CTX", ctx.to_string()).env("LE_KV", kv).env("LE_TMAX", chunk.to_string()).env("LE_NOTUNE", "1").output().ok()?;
     let out = String::from_utf8_lossy(&o.stdout).to_string(); let err = String::from_utf8_lossy(&o.stderr).to_string();
     let key = err.lines().find_map(|l| l.strip_prefix("tunekey ")).map(|s| s.to_string());
     let pf = out.lines().find(|l| l.starts_with("prefill "))?; let w: Vec<&str> = pf.split_whitespace().collect();
