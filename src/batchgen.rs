@@ -24,3 +24,19 @@ pub fn generate(gp: &mut DenseGpu, prompts: &[Vec<u32>], max_tokens: usize, eos:
     }, |_, _| {});
     outs
 }
+
+/// Streaming single-request greedy generation (S2): prefill into slot 0, then emit each token via `on`.
+/// `on` returns false to stop early. Returns the number of tokens emitted (eos is emitted, then generation stops).
+pub fn generate_stream(gp: &mut DenseGpu, ids: &[u32], max_tokens: usize, eos: &[u32], on: &mut dyn FnMut(u32) -> bool) -> usize {
+    gp.reset(); gp.set_slot(0);
+    let mut lg = gp.prefill(ids);
+    let mut n = 0;
+    while n < max_tokens {
+        let t = batchplan::greedy_rows(&[lg.clone()])[0];
+        n += 1;
+        let keep = on(t);
+        if !keep || eos.contains(&t) || n >= max_tokens { break; }
+        lg = gp.forward(t);
+    }
+    n
+}

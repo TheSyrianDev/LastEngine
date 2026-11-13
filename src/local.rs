@@ -16,8 +16,8 @@ impl Eng {
     fn export_state(&mut self) -> Result<Vec<u8>, String> { match self { Eng::Gpu(g) => Ok(g.export_state()), Eng::Dense(d) => d.export_state() } }
     fn import_state(&mut self, b: &[u8]) -> Result<(), String> { match self { Eng::Gpu(g) => g.import_state(b), Eng::Dense(d) => d.import_state(b) } }
 }
-struct Inner { gpu: Eng, hist: Vec<u32>, rng: u64, snap: Option<(Vec<u32>, Vec<u8>)> }
-pub struct Local { inner: Mutex<Inner>, tok: Tokenizer, tmpl: String, name: String, n_ctx: usize, n_params: u64, bos: String, eos: String }
+struct Inner { gpu: Arc<Mutex<Eng>>, hist: Vec<u32>, rng: u64, snap: Option<(Vec<u32>, Vec<u8>)> }
+pub struct Local { batch: Option<Mutex<std::sync::mpsc::Sender<crate::reqsched::Request>>>, inner: Mutex<Inner>, tok: Tokenizer, tmpl: String, name: String, n_ctx: usize, n_params: u64, bos: String, eos: String }
 
 impl Local {
     pub fn load(path: &str, ctx: usize, margin: usize, tmpl_file: Option<&str>) -> Result<Local, String> {
@@ -35,7 +35,26 @@ impl Local {
                   else { Eng::Gpu(Gpu::new(Arc::new(Model::load(path, &g)), ctx, margin)) };
         let s = |id: Option<u32>| id.map(|i| tok.tokens[i as usize].clone()).unwrap_or_default();
         let (bos, eos) = (s(tok.bos), s(tok.eos));
-        Ok(Local { inner: Mutex::new(Inner { gpu, hist: vec![], rng: 0x9E3779B97F4A7C15, snap: None }), tok, tmpl, name, n_ctx: ctx, n_params, bos, eos })
+        let mut eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|t| tok.tokens.iter().position(|x| x == t).map(|i| i as u32)).collect();
+        if let Some(e) = tok.eos { if !eos_ids.contains(&e) { eos_ids.push(e); } }
+        let gpu = Arc::new(Mutex::new(gpu));
+        // LE_BATCH=1 (S2): one scheduler thread owns the GPU; requests arrive over a channel (see reqsched).
+        let batch = if std::env::var("LE_BATCH").map_or(false, |v| v == "1") && matches!(&*gpu.lock().unwrap(), Eng::Dense(crate::dense::DenseEng::Cuda(_))) {
+            let (tx, rx) = std::sync::mpsc::channel::<crate::reqsched::Request>();
+            let owner = gpu.clone();
+            std::thread::spawn(move || {
+                crate::reqsched::run(rx, move |req, on| {
+                    let mut e = owner.lock().unwrap();
+                    match &mut *e {
+                        Eng::Dense(crate::dense::DenseEng::Cuda(gp)) => crate::batchgen::generate_stream(gp, &req.prompt_ids, req.max_tokens, &eos_ids, on),
+                        _ => 0,
+                    }
+                })
+            });
+            eprintln!("LE_BATCH=1: scheduler thread owns the GPU (greedy requests only in S2)");
+            Some(Mutex::new(tx))
+        } else { None };
+        Ok(Local { batch, inner: Mutex::new(Inner { gpu, hist: vec![], rng: 0x9E3779B97F4A7C15, snap: None }), tok, tmpl, name, n_ctx: ctx, n_params, bos, eos })
     }
 }
 
@@ -164,8 +183,8 @@ impl Backend for Local {
     fn slot_save(&self, path: &std::path::Path) -> Result<(usize, usize), String> {
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
-        if g.hist.len() != g.gpu.pos() { return Err("context in flux".into()); }
-        let st = g.gpu.export_state()?;
+        if g.hist.len() != g.gpu.lock().unwrap().pos() { return Err("context in flux".into()); }
+        let st = g.gpu.lock().unwrap().export_state()?;
         let mut out = Vec::with_capacity(st.len() + g.hist.len() * 4 + 16);
         out.extend_from_slice(b"LESLOT01");
         out.extend_from_slice(&(g.hist.len() as u64).to_le_bytes());
@@ -185,8 +204,8 @@ impl Backend for Local {
         let hist: Vec<u32> = (0..n).map(|i| u32::from_le_bytes(b[16 + i * 4..20 + i * 4].try_into().unwrap())).collect();
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
-        g.gpu.import_state(&b[16 + n * 4..])?;
-        if g.gpu.pos() != n { return Err("token/state mismatch".into()); }
+        g.gpu.lock().unwrap().import_state(&b[16 + n * 4..])?;
+        if g.gpu.lock().unwrap().pos() != n { return Err("token/state mismatch".into()); }
         g.hist = hist;
         Ok((n, b.len()))
     }
@@ -217,6 +236,39 @@ impl Backend for Local {
             }
         };
         let ids = self.tok.encode(&prompt);
+        if let Some(tx) = &self.batch {
+            let max_pos = self.n_ctx.saturating_sub(1);
+            let ids = if ids.len() > max_pos { ids[ids.len() - max_pos..].to_vec() } else { ids };
+            if req.sampling.temperature > 0.0 { emit(Delta::Content("[lastengine: LE_BATCH sampling not yet supported (S5)]".into())); return Usage { prompt_tokens: ids.len(), completion_tokens: 0, cached_tokens: 0, prefill_ms: 0.0, tool_calls: vec![], finish_reason: "error" }; }
+            let budget = req.max_tokens.min(max_pos.saturating_sub(ids.len()));
+            let (rtx, rrx) = std::sync::mpsc::channel();
+            let sampling = crate::reqsched::Sampling { temperature: req.sampling.temperature, top_p: req.sampling.top_p };
+            tx.lock().unwrap().send(crate::reqsched::Request { prompt_ids: ids.clone(), max_tokens: budget, sampling, tx: rtx }).expect("scheduler down");
+            let mut sp = Splitter { buf: String::new(), mode: 0, tool: String::new() };
+            let mut bytes: Vec<u8> = vec![]; let mut n = 0; let mut alive = true; let mut reason = "length";
+            let eos_ok = |t: u32| self.tok.eos == Some(t) || self.tok.tokens.get(t as usize).map_or(false, |x| x == "<|im_end|>" || x == "<|endoftext|>");
+            for m in rrx.iter() {
+                match m {
+                    crate::reqsched::Token::Tok(t) => {
+                        if eos_ok(t) { reason = "stop"; continue; }
+                        n += 1;
+                        bytes.extend(self.tok.decode_bytes(&[t]));
+                        let valid = match std::str::from_utf8(&bytes) { Ok(_) => bytes.len(), Err(e) => e.valid_up_to() };
+                        if valid > 0 {
+                            let text = String::from_utf8_lossy(&bytes[..valid]).to_string(); bytes.drain(..valid);
+                            let mut out = vec![]; sp.push(&text, &mut out);
+                            for d in out { if alive && !emit(d) { alive = false; } }
+                        }
+                    }
+                    crate::reqsched::Token::Done { .. } => break,
+                }
+            }
+            let mut out = vec![]; sp.finish(&mut out);
+            for d in out { if alive { alive = emit(d); } }
+            let tool_calls = parse_tools(&sp.tool);
+            if !tool_calls.is_empty() && reason == "stop" { reason = "tool_calls"; }
+            return Usage { prompt_tokens: ids.len(), completion_tokens: n, cached_tokens: 0, prefill_ms: 0.0, tool_calls, finish_reason: reason };
+        }
         let mut g = self.inner.lock().unwrap();
         let g = &mut *g;
         let max_pos = self.n_ctx.saturating_sub(1);
@@ -228,18 +280,18 @@ impl Backend for Local {
         let mut cached = live;
         if snap_n > live {
             let (t, b) = g.snap.take().unwrap();
-            g.gpu.restore_recurrent(&b, t.len());
+            g.gpu.lock().unwrap().restore_recurrent(&b, t.len());
             g.snap = Some((t, b)); cached = snap_n;
-        } else if live == 0 { g.gpu.reset(); }
+        } else if live == 0 { g.gpu.lock().unwrap().reset(); }
         // Snapshot at the last turn start so the next request (which re-renders this reply differently) can resume there.
         let im = self.tok.special("<|im_start|>");
         let split = im.and_then(|im| ids.iter().rposition(|&t| t == im)).filter(|&p| p > cached + 16).unwrap_or(0);
         let mut logits = if split > 0 {
-            g.gpu.prefill(&ids[cached..split]);
-            let b = g.gpu.snap_recurrent();
+            g.gpu.lock().unwrap().prefill(&ids[cached..split]);
+            let b = g.gpu.lock().unwrap().snap_recurrent();
             g.snap = Some((ids[..split].to_vec(), b));
-            g.gpu.prefill(&ids[split..])
-        } else { g.gpu.prefill(&ids[cached..]) };
+            g.gpu.lock().unwrap().prefill(&ids[split..])
+        } else { g.gpu.lock().unwrap().prefill(&ids[cached..]) };
         g.hist = ids.clone();
         let prefill_ms = t0.elapsed().as_secs_f64() * 1000.0;
         let start_in_think = prompt.trim_end().ends_with("<think>");
@@ -263,7 +315,7 @@ impl Backend for Local {
                 if !alive { break; }
             }
             if n >= budget { break; }
-            logits = g.gpu.forward(t); g.hist.push(t);
+            logits = g.gpu.lock().unwrap().forward(t); g.hist.push(t);
         }
         // hist holds exactly the tokens fed to the model.
         let mut out = vec![]; sp.finish(&mut out);
