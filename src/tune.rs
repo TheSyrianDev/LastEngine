@@ -120,3 +120,50 @@ mod profile_tests {
         assert!(p.to_string_lossy().ends_with("nvidia-geforce-rtx-3050-laptop-abc-8192.json"));
     }
 }
+
+/// Cheap model identity: FNV-1a over the first 1 MiB of the file plus its size. Not cryptographic; only for cache keys.
+pub fn model_sha(path: &str) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    let mut buf = vec![0u8; 1 << 20];
+    let n = f.read(&mut buf)?;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &b in &buf[..n] { h ^= b as u64; h = h.wrapping_mul(0x100000001b3); }
+    Ok(format!("{:016x}{:x}", h, len))
+}
+
+/// Serve-side load: returns the applied settings (env vars that were unset before). Never overrides explicit env.
+/// LE_PROFILE=off disables. Any failure is reported as a reason and serving proceeds with defaults.
+pub fn apply_profile_env(model: &str, ctx: usize) -> Result<Option<Profile>, String> {
+    if std::env::var("LE_PROFILE").map_or(false, |v| v == "off") { return Ok(None); }
+    let sha = model_sha(model).map_err(|e| format!("model sha: {e}"))?;
+    let dev = gpu_name();
+    let p = profile_path(&dev, &sha, ctx);
+    let prof = match read_profile(&p, env!("CARGO_PKG_VERSION"), &sha) {
+        Ok(p) => p,
+        Err(why) => { eprintln!("profile: not applied ({why})"); return Ok(None); }
+    };
+    for (k, v) in &prof.settings {
+        if std::env::var_os(k).is_none() { std::env::set_var(k, v); }
+    }
+    eprintln!("profile: applied {} setting(s) from {}", prof.settings.len(), p.display());
+    Ok(Some(prof))
+}
+
+#[cfg(test)]
+mod apply_tests {
+    use super::*;
+    #[test]
+    fn model_sha_changes_with_content() {
+        let d = std::env::temp_dir().join(format!("le-sha-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("m.bin");
+        std::fs::write(&f, b"abc").unwrap();
+        let a = model_sha(f.to_str().unwrap()).unwrap();
+        std::fs::write(&f, b"abd").unwrap();
+        let b = model_sha(f.to_str().unwrap()).unwrap();
+        assert_ne!(a, b);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+}

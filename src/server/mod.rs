@@ -32,6 +32,7 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         if let Some(k) = &a.kv { std::env::set_var("LE_KV", k); }
         let (ctx, margin) = (a.ctx.unwrap_or(8192), a.vram_margin.unwrap_or(128));
         let tf = a.chat_template_file.clone();
+        if let Err(e) = crate::tune::apply_profile_env(&path, ctx).map(|_| ()) { eprintln!("profile: {e}"); }
         let l = tokio::task::spawn_blocking(move || crate::local::Local::load(&path, ctx, margin, tf.as_deref())).await.map_err(|e| e.to_string())??;
         Arc::new(l)
     };
