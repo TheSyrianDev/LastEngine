@@ -50,3 +50,73 @@ pub fn run(model: &str, ctx: usize) {
     std::fs::write(&p, serde_json::to_string_pretty(&m).unwrap()).expect("write cache");
     println!("{}", serde_json::json!({"key": k, "kv": e.kv, "chunk": e.chunk, "prefill_tps": e.prefill_tps, "decode_tps": e.decode_tps, "cache": p}));
 }
+
+/// Per-device profile (docs/autotune-plan.md, schema 1). Written by `tune`, read by `serve` (wiring pending).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Profile {
+    pub schema: u32,
+    pub engine: String,
+    pub device: String,
+    pub model_sha: String,
+    pub ctx: usize,
+    pub settings: BTreeMap<String, String>,
+    pub prefill_tps: f32,
+    pub decode_tps: f32,
+    pub tuned_at: String,
+}
+
+pub const PROFILE_SCHEMA: u32 = 1;
+
+/// Path: $XDG_CACHE_HOME/lastengine/profiles/<device>-<model_sha>-<ctx>.json (device sanitised to [a-z0-9-]).
+pub fn profile_path(device: &str, model_sha: &str, ctx: usize) -> std::path::PathBuf {
+    let dev: String = device.to_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
+    let base = std::env::var("XDG_CACHE_HOME").map(std::path::PathBuf::from).unwrap_or_else(|_| std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".cache"));
+    base.join("lastengine").join("profiles").join(format!("{dev}-{model_sha}-{ctx}.json"))
+}
+
+pub fn write_profile(p: &std::path::Path, prof: &Profile) -> std::io::Result<()> {
+    if let Some(d) = p.parent() { std::fs::create_dir_all(d)?; }
+    std::fs::write(p, serde_json::to_string_pretty(prof).unwrap())
+}
+
+/// Load and validate. Returns None (with a reason) if the file is missing, unparsable, or from another schema/engine/model.
+pub fn read_profile(p: &std::path::Path, engine: &str, model_sha: &str) -> Result<Profile, String> {
+    let t = std::fs::read_to_string(p).map_err(|e| format!("profile missing: {e}"))?;
+    let prof: Profile = serde_json::from_str(&t).map_err(|e| format!("profile unparsable: {e}"))?;
+    if prof.schema != PROFILE_SCHEMA { return Err(format!("profile schema {} != {}", prof.schema, PROFILE_SCHEMA)); }
+    if prof.engine != engine { return Err(format!("profile engine {} != {}", prof.engine, engine)); }
+    if prof.model_sha != model_sha { return Err("profile model_sha mismatch".into()); }
+    Ok(prof)
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    fn sample() -> Profile {
+        let mut s = BTreeMap::new(); s.insert("chunk".into(), "512".into());
+        Profile { schema: 1, engine: "0.1.0".into(), device: "RTX 3050".into(), model_sha: "abc123".into(), ctx: 8192, settings: s, prefill_tps: 2000.0, decode_tps: 93.0, tuned_at: "2026-11-13T00:00:00Z".into() }
+    }
+    #[test]
+    fn roundtrip_and_validate() {
+        let d = std::env::temp_dir().join(format!("le-prof-{}", std::process::id()));
+        let p = d.join("p.json");
+        write_profile(&p, &sample()).unwrap();
+        assert_eq!(read_profile(&p, "0.1.0", "abc123").unwrap(), sample());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+    #[test]
+    fn rejects_mismatch_and_missing() {
+        let d = std::env::temp_dir().join(format!("le-prof2-{}", std::process::id()));
+        let p = d.join("p.json");
+        write_profile(&p, &sample()).unwrap();
+        assert!(read_profile(&p, "0.2.0", "abc123").unwrap_err().contains("engine"));
+        assert!(read_profile(&p, "0.1.0", "zzz").unwrap_err().contains("model_sha"));
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(read_profile(&p, "0.1.0", "abc123").unwrap_err().contains("missing"));
+    }
+    #[test]
+    fn path_sanitises_device() {
+        let p = profile_path("NVIDIA GeForce RTX 3050 Laptop", "abc", 8192);
+        assert!(p.to_string_lossy().ends_with("nvidia-geforce-rtx-3050-laptop-abc-8192.json"));
+    }
+}
