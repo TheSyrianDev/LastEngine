@@ -1,0 +1,14 @@
+Required Notice: Copyright (c) 2026 TheSyrianDev (https://github.com/TheSyrianDev)
+
+The IQ3_XXS lattice table in src/quant_iq3xxs_grid.rs is a format constant extracted
+(via tools/gen_iq3xxs_grid.py) from gguf-py of llama.cpp (MIT, Copyright (c) 2023-2026 The ggml authors).
+
+Trellis-coded KV cache (--kv tcq3): the encoder/decoder design, the trained codebooks (assets/tcq3_cb_k.bin, tcq3_cb_v.bin) and the
+Walsh-Hadamard sign arrays (assets/tcq3_signs*.bin) are adapted from spiritbuun's buun-llama-cpp (MIT License, Copyright (c) 2023-2026
+The ggml authors; TCQ work by spiritbuun). The CUDA kernels in src/cuda/kernels.cu (tcq_encode, tcq_rot, tcq_dec) are a Rust/NVRTC re-adaptation.
+
+assets/webui/ — web UI taken from the llama.cpp project (https://github.com/ggml-org/llama.cpp), MIT License, Copyright (c) 2023-2026 The ggml authors. Rebranded: product name strings replaced, logo/icon replaced, PWA assets removed.
+
+IQ quantization formats (src/quant_ik.rs, src/quant_ik_tables.rs, GPU kernels for them in src/cuda/kernels.cu): dequantization routines and lattice tables are
+translated to Rust/CUDA from ik_llama.cpp (https://github.com/ikawrakow/ik_llama.cpp) and ggml, MIT License, Copyright (c) 2023-2024 The ggml authors and Iwan Kawrakow.
+Verified bit-for-bit against ik_llama's libggml with tools/oracle.
