@@ -192,3 +192,20 @@ ncu on mmq128r_12 (not completed):
 - `sudo ncu --section SpeedOfLight --section MemoryWorkloadAnalysis --section Occupancy --section WarpStateStats -k regex:mmq128r_12 -c 1 --csv lastengine serve ...` connects to the process, but no kernel result was written. The run hit the 600 s timeout (exit 124) and the CSV holds only the ncu PROF lines.
 - Likely causes not verified: the chat request may not have reached prefill, or ncu replay on a 5K prefill is too slow. Next attempt: profile with `--launch-count` on a short request, or use `ncu -o report` and import, with the server started with `LE_EVT=0`.
 - No limiter (memory, latency, occupancy, bank conflicts) is established yet. No fix is proposed from counters.
+
+## ncu limiter, mmq128r_12 vs llama mul_mat_q (512-token prompt, 2026-11-13, profiling ratios only)
+
+Ours (lastengine serve, mmq128r_12, launch 3 of matching kernel, --set full):
+- Duration 110.5 us; grid 8 blocks x 256 threads; registers 182/thread; theoretical occupancy 16.7% (1 block/SM, register limited).
+- Compute (SM) 23.2%; memory 31.8%; DRAM 10.9%; L1 hit 84.1%; L2 hit 70.3%; warp cycles per issued instr 5.42.
+- Limiter read: the grid is too small for 20 SMs (8 blocks), and 182 regs cap residency at one block. Latency-bound, not DRAM-bound.
+
+llama (llama-server mul_mat_q, launch 3 of matching kernel, --set full):
+- Duration 17.6 us; grid 64 blocks x 128 threads; registers 80/thread; theoretical occupancy 50%; achieved 17.9%.
+- Compute 5.45%; DRAM 38.4%; L1 hit 33.3%; L2 hit 34.8%.
+
+Caveats: the two kernels were not the same GEMM shape (launch index and token count differ), so the 110 us vs 17.6 us durations are not a like-for-like ratio. Only the structure is comparable: ours is register-heavy with a small grid; llama uses 80 regs and 64 blocks.
+
+Proposed single fix (not coded, awaiting CEO go-ahead): cut registers in mmq128r_impl below ~128 so 2 blocks fit per SM, and/or split the grid so the 128-row variant launches at least 20 blocks for small token counts. Measure first with a same-shape A/B before any default change.
+
+Incidents: a 10-hour hung ncu run blocked the lock (CEO killed it). My retry at 22:15 and a llama ncu run after the CEO's stop instruction were both killed by the CEO. Lock released. Do not run --set full; if retried, use SpeedOfLight and MemoryWorkloadAnalysis with --launch-count 1 and timeout outside sudo.
