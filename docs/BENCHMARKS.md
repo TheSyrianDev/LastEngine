@@ -5,6 +5,22 @@ llama.cpp: version 0.8.0-dev (build 1064, commit 0893ec9), `llama-bench -p N -n 
 LastEngine: this repo, `lastengine serve --ctx N+400`, f16 KV, one chat request with an N-token prompt (prefix cache cold), 128 generated tokens, temperature 0, thinking off; numbers from the server's `timings`.
 Tool: `tools/bench_vs_llamacpp.py`. One run per cell for LastEngine, mean of 2 for llama.cpp. LastEngine streams experts from RAM through a VRAM slot cache on the MoE model; `-ncmoe 99` is the closest llama.cpp setting that fits the card.
 
+## Current numbers (2026-11-13, read this first)
+Older sections below are kept as history; the ones marked STALE are superseded.
+
+MiniCPM5-2B Q4_K_M, RTX 3050 Laptop 4 GB, LastEngine HEAD of main (085ede9) and default flags on concurrency-p2 (GQA, SP 32, RMSQ on, commit 0907348):
+| prompt | LastEngine prefill | llama.cpp b10330 prefill | LastEngine decode | llama.cpp decode |
+|---|---|---|---|---|
+| 4096 | 1690–1705 tok/s | 3196 ± 6 | 73.0 (bench) / 93.2 (graph r=3, 128 tok) | 102.0 ± 0.3 (tg128) / 94.9 (CUDA llama-server, wall) |
+| 16384 | 1187–1194 tok/s | 2290 ± 3 | not re-run | not re-run |
+| 5023 (r=3) | ~2051 tok/s | 3162 / 3215 / 3208 (llama-server) | | |
+
+Gap: prefill about 1.6–1.9x behind llama.cpp; decode about 1.0–1.4x behind depending on method (the two decode numbers use different harnesses; the llama.cpp wall figure is the fairer one for our server).
+
+Sage-A1.5 APEX MiniPlus (35B-A3B MoE): LastEngine 826 / 678 / 34 tok/s (prefill 4K / 16K, decode) vs llama.cpp 275 / 227 / 21. These figures came from the CEO queue (2026-11-13); the source run is not in this repo yet, so treat them as unverified until a matched run is logged here.
+
+Stale: the "MiniCPM5-2B Q4_K_M (dense ... SLOWER here)" table, the "after flash prefill + split-K decode" section, the "Dense split-K tuning" and earlier MiniCPM5 tables (all before the 2026-11-12 llama b12182 rebuild and the mmq128r default), and the "Sage fixed-token-count repeat" llama.cpp row (its own caveat says invalid).
+
 ## Sage-A1.5 APEX MiniPlus (35B-A3B MoE, 14 GiB)
 | prompt | LastEngine prefill | llama.cpp prefill | LastEngine decode | llama.cpp decode |
 |---|---|---|---|---|
@@ -12,7 +28,7 @@ Tool: `tools/bench_vs_llamacpp.py`. One run per cell for LastEngine, mean of 2 f
 | 4096 | 817 | 336 | 31.7 | 27.4 |
 | 16384 | 639 | 321 | 29.3 | 26.0 |
 
-## MiniCPM5-2B Q4_K_M (dense, fits in VRAM) — LastEngine is SLOWER here
+## STALE (2026-11-06): MiniCPM5-2B Q4_K_M (dense, fits in VRAM) — LastEngine is SLOWER here
 | prompt | LastEngine prefill | llama.cpp prefill | LastEngine decode | llama.cpp decode |
 |---|---|---|---|---|
 | 512 | 995 tok/s | 3472 | 70.4 tok/s | 95.0 |
@@ -21,7 +37,7 @@ Tool: `tools/bench_vs_llamacpp.py`. One run per cell for LastEngine, mean of 2 f
 
 Cause: the dense attention kernels (`dn_attn` in src/cuda/dense.cu) are a simple one-block-per-head loop with a warp reduction per key; no flash-style tiling or split-K. Fixing this is the next dense-model task.
 
-## MiniCPM5-2B Q4_K_M after flash prefill + split-K decode (2026-11-07, LastEngine only)
+## STALE (2026-11-07): MiniCPM5-2B Q4_K_M after flash prefill + split-K decode (LastEngine only)
 llama.cpp could not be re-run: its build directory (~/AI/engines/llama-mainline) is no longer on disk, so no matched llama.cpp numbers exist for this section.
 | prompt | prefill tok/s | decode tok/s (128 tokens) |
 |---|---|---|
@@ -29,7 +45,7 @@ llama.cpp could not be re-run: its build directory (~/AI/engines/llama-mainline)
 | ~16K (16359) | 1071 | 44.5 |
 Earlier llama.cpp numbers in this file (prefill 3400/2890 at 512/4K, decode ~90) are from the earlier session and should be re-measured before any claim.
 
-## Dense split-K tuning (2026-11-07, LastEngine only, MiniCPM5 Q4_K_M, 128 generated tokens)
+## STALE (2026-11-07): Dense split-K tuning (LastEngine only, MiniCPM5 Q4_K_M, 128 generated tokens)
 Default split count changed from span/64 to a fixed 16 (`LE_DN_SP` still overrides).
 | split count | 4K decode tok/s | 16K decode tok/s |
 |---|---|---|
@@ -119,7 +135,7 @@ Caveats (read before quoting):
 
 Result: LastEngine beats llama.cpp b12182 on this MoE model in this session: about 2.3x on prefill and about 1.35x on decode. The MoE win holds, with the token-count caveat above.
 
-## Sage fixed-token-count repeat (2026-11-11, LastEngine 8355d33, llama.cpp b12182 fd27b2034)
+## STALE for llama.cpp row (2026-11-11): Sage fixed-token-count repeat (LastEngine 8355d33, llama.cpp b12182 fd27b2034)
 Same flags as above; llama-bench -r 3. LastEngine prompts calibrated to prompt_n 4096 and 16384 (chat template adds a few tokens; a unique random prefix per run defeats the prefix cache).
 
 | engine | prompt | prefill tok/s | decode tok/s |
