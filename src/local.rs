@@ -43,6 +43,13 @@ impl Local {
             let (tx, rx) = std::sync::mpsc::channel::<crate::reqsched::Request>();
             let owner = gpu.clone();
             std::thread::spawn(move || {
+                // LE_CHUNK>0 (step 1): interleaved serving with chunked prefill and a per-round token budget.
+                if let Some(chunk) = std::env::var("LE_CHUNK").ok().and_then(|v| v.parse::<usize>().ok()).filter(|&c| c > 0) {
+                    let budget = std::env::var("LE_BUDGET").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(256);
+                    let mut e = owner.lock().unwrap();
+                    if let Eng::Dense(crate::dense::DenseEng::Cuda(gp)) = &mut *e { crate::batchgen::serve_interleaved(gp, rx, &eos_ids, chunk, budget); }
+                    return;
+                }
                 let mut seed_ctr: u64 = 1;
                 crate::reqsched::run(rx, move |req, on| {
                     let mut e = owner.lock().unwrap();

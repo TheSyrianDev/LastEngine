@@ -275,6 +275,13 @@ impl DenseGpu {
     pub fn pos(&self) -> usize { self.pos }
     /// Number of KV slots allocated (LE_SLOTS, default 1).
     pub fn slots(&self) -> usize { self.slots }
+    /// Prefill `ids` into `slot` starting at absolute position `pos` (earlier chunks already in its KV). Returns logits of the last token when `want`.
+    pub fn prefill_at(&mut self, slot: usize, pos: usize, ids: &[u32], want: bool) -> Vec<f32> { self.bind();
+        self.set_slot(slot); self.pos = pos;
+        let mut l = vec![]; let mut i = 0;
+        while i < ids.len() { let e = (i + CH).min(ids.len()); l = self.chunk(&ids[i..e], want && e == ids.len()); i = e; }
+        l
+    }
     pub fn ctx_len(&self) -> usize { self.ctx_len }
     /// Batched decode (phase 2 step 2): one token per row, row i in KV slot slots[i] at position poss[i]
     /// (poss[i] = tokens already in that slot). Returns logits per row. Does not touch self.pos or slot_pos.

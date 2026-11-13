@@ -1,6 +1,6 @@
 //! Batched greedy generation over DenseGpu slots (phase 2 step 3 refactor). Shared by the CLI gates and, later, the server.
 //! Each prompt is prefilled into its own KV slot, then all live sequences decode together via batchplan::run_loop.
-use crate::batchplan::{self, Seq};
+use crate::batchplan::{self, budget_step, Seq};
 use crate::gpu::dense::DenseGpu;
 
 /// Greedy-generate `max_tokens` (or until eos) for each prompt. Requires prompts.len() <= gp.slots().
@@ -92,5 +92,69 @@ mod tests {
         let ys: Vec<u32> = (0..20).map(|_| b.pick(&l)).collect();
         assert_eq!(xs, ys);
         assert!(xs.iter().all(|&t| t < 4));
+    }
+}
+
+/// Interleaved serving loop (step 1): many requests share the GPU. Each round spends one token budget:
+/// decodes of running sequences first (batchplan::budget_step), then prefill chunks of at most `chunk` tokens
+/// for requests still ingesting their prompt. A long prompt therefore no longer stalls running decodes.
+/// Greedy output is identical to generate_stream because decode_batch rows are batch-invariant (gate: tools/batch_invariance_gate.sh).
+pub fn serve_interleaved(gp: &mut DenseGpu, rx: std::sync::mpsc::Receiver<crate::reqsched::Request>, eos: &[u32], chunk: usize, budget: usize) {
+    use crate::reqsched::{Request, Token};
+    struct Act { req: Request, ids: Vec<u32>, done: usize, slot: usize, pos: usize, next: Option<u32>, n: usize, max: usize, pk: Picker }
+    let nslots = gp.slots(); let ctx = gp.ctx_len();
+    let mut waiting: std::collections::VecDeque<Request> = Default::default();
+    let mut act: Vec<Act> = vec![];
+    let mut seed: u64 = 1;
+    loop {
+        if act.is_empty() && waiting.is_empty() { match rx.recv() { Ok(r) => waiting.push_back(r), Err(_) => return } }
+        while let Ok(r) = rx.try_recv() { waiting.push_back(r); }
+        // Admit into free slots.
+        while act.len() < nslots {
+            let Some(req) = waiting.pop_front() else { break };
+            let max_pos = ctx.saturating_sub(1);
+            let ids = if req.prompt_ids.len() > max_pos { req.prompt_ids[req.prompt_ids.len() - max_pos..].to_vec() } else { req.prompt_ids.clone() };
+            let slot = (0..nslots).find(|s| !act.iter().any(|a| a.slot == *s)).unwrap();
+            seed = seed.wrapping_add(1);
+            let pk = Picker::new(req.sampling.temperature, req.sampling.top_p, seed);
+            let max = req.max_tokens.min(max_pos.saturating_sub(ids.len()));
+            if ids.is_empty() || max == 0 { let _ = req.tx.send(Token::Done { n: 0 }); continue; }
+            act.push(Act { req, ids, done: 0, slot, pos: 0, next: None, n: 0, max, pk });
+        }
+        let mut finished: Vec<usize> = vec![];
+        // Decode phase: emit each decoding sequence's pending token, then feed the survivors as one batch.
+        let decoding: Vec<usize> = (0..act.len()).filter(|&i| act[i].next.is_some()).collect();
+        let prefilling: Vec<usize> = (0..act.len()).filter(|&i| act[i].next.is_none()).collect();
+        let mut feed: Vec<(usize, u32)> = vec![];
+        for &i in &decoding {
+            let a = &mut act[i]; let t = a.next.unwrap();
+            if eos.contains(&t) { finished.push(i); continue; }
+            a.n += 1;
+            if a.req.tx.send(Token::Tok(t)).is_err() { finished.push(i); continue; }
+            if a.n >= a.max { finished.push(i); continue; }
+            feed.push((i, t));
+        }
+        // Budget: decodes spend one token each; the rest goes to prefill chunks in admission order.
+        let (_, admits) = budget_step(&feed.iter().map(|x| x.0).collect::<Vec<_>>(), &prefilling.iter().map(|&i| (i, (act[i].ids.len() - act[i].done).min(chunk))).collect::<Vec<_>>(), budget, |_, _| true);
+        if !feed.is_empty() {
+            let toks: Vec<u32> = feed.iter().map(|x| x.1).collect();
+            let slots: Vec<usize> = feed.iter().map(|x| act[x.0].slot).collect();
+            let poss: Vec<usize> = feed.iter().map(|x| act[x.0].pos).collect();
+            let logits = gp.decode_batch(&toks, &slots, &poss);
+            for (k, &(i, _)) in feed.iter().enumerate() { let a = &mut act[i]; a.pos += 1; a.next = Some(a.pk.pick(&logits[k])); }
+        }
+        let mut left = budget.saturating_sub(feed.len());
+        for &i in &admits {
+            let a = &mut act[i];
+            let take = (a.ids.len() - a.done).min(chunk).min(left);
+            if take == 0 { break; }
+            left -= take;
+            let end = a.done + take; let last = end == a.ids.len();
+            let lg = gp.prefill_at(a.slot, a.pos, &a.ids[a.done..end], last);
+            a.pos += take; a.done = end;
+            if last { a.next = Some(a.pk.pick(&lg)); }
+        }
+        finished.sort_unstable(); finished.dedup();
+        for &i in finished.iter().rev() { let a = act.remove(i); let _ = a.req.tx.send(Token::Done { n: a.n }); }
     }
 }
