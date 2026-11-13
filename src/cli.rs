@@ -30,6 +30,8 @@ pub enum Cmd {
     SlotTest { path: String, a: String, b: String, #[arg(default_value_t = 30)] n: usize },
     /// Phase 2 step 2 gate: greedy N tokens for two prompts, solo vs decode_batch over both slots (LE_SLOTS=2). Prints per-slot match counts.
     BatchTest { path: String, a: String, b: String, #[arg(default_value_t = 30)] n: usize },
+    /// Step-4 gate: run prompts through batchplan::run_loop (decode_batch + greedy_rows, one slot each) and compare with solo greedy decode. Prompts separated by '|'.
+    BatchLoop { path: String, prompts: String, #[arg(default_value_t = 30)] n: usize },
     /// Greedy-decode N tokens on the GPU and print JSON {prompt_ids,gen_ids,top} (top = per step top-5 [id,logprob]) for teacher-forced comparison with another engine
     TfDump { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },

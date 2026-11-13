@@ -215,6 +215,46 @@ async fn main() {
             println!("batch A {}/{} tokens match solo; batch B {}/{} match solo", oa.iter().zip(&ra).filter(|(x, y)| x == y).count(), n, ob.iter().zip(&rb).filter(|(x, y)| x == y).count(), n);
             if oa == ra && ob == rb { println!("BATCH DECODE OK"); } else { println!("BATCH DECODE FAIL"); std::process::exit(1); }
         }
+        cli::Cmd::BatchLoop { path, prompts, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0 as u32;
+            let ps: Vec<Vec<u32>> = prompts.split('|').map(|p| tk.encode(p)).collect();
+            let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
+            assert!(gp.slots() >= ps.len(), "run with LE_SLOTS>={}", ps.len());
+            // Solo reference per prompt, slot 0.
+            let mut refs = vec![];
+            for ids in &ps {
+                gp.reset(); gp.set_slot(0);
+                let mut lg = gp.prefill(ids); let mut out = vec![];
+                for _ in 0..n { let t = am(&lg); out.push(t); lg = gp.forward(t); }
+                refs.push(out);
+            }
+            // Batched via run_loop: prefill each prompt into its own slot, then loop.
+            gp.reset();
+            let mut seqs = vec![];
+            for (i, ids) in ps.iter().enumerate() {
+                gp.set_slot(i); let lg = gp.prefill(ids);
+                seqs.push((i as u64, batchplan::Seq { slot: i, pos: ids.len(), next_tok: am(&lg), generated: 0, max_tokens: n }));
+            }
+            let mut outs: Vec<Vec<u32>> = vec![vec![]; ps.len()];
+            let mut pending: Vec<(usize, u32)> = vec![];
+            let steps = batchplan::run_loop(&mut seqs, &[], 4096, gp.slots(), |plan| {
+                // Record the token each row is about to consume, then run one batched decode.
+                for (k, &tok) in plan.toks.iter().enumerate() { outs[plan.slots[k]].push(tok); pending.push((plan.slots[k], tok)); }
+                let logits = gp.decode_batch(&plan.toks, &plan.slots, &plan.poss);
+                batchplan::greedy_rows(&logits)
+            }, |_, _| {});
+            let mut ok = true;
+            for i in 0..ps.len() {
+                // outs[i] holds tokens fed in, which equal the greedy choices the solo run emitted at each step.
+                let m = outs[i].iter().zip(&refs[i]).filter(|(a, b)| a == b).count();
+                println!("slot {i}: {m}/{} tokens match solo", refs[i].len());
+                if outs[i] != refs[i] { ok = false; }
+            }
+            println!("steps {steps}");
+            if ok { println!("BATCH LOOP OK"); } else { println!("BATCH LOOP FAIL"); std::process::exit(1); }
+        }
         cli::Cmd::TfDump { path, prompt, n } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
