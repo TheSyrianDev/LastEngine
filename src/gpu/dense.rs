@@ -68,7 +68,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_prep_rows_bt", "dn_cvt_rows_bt", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "mmq128r2_2", "mmq128r2_8", "mmq128r2_11", "mmq128r2_12", "mmq128r2_13", "mmq128r2_14", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_prep_rows", "dn_attn_rows", "dn_cvt_rows", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_prep_rows_bt", "dn_cvt_rows_bt", "dn_attn_rows_bt", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "mmq128r2_2", "mmq128r2_8", "mmq128r2_11", "mmq128r2_12", "mmq128r2_13", "mmq128r2_14", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_prep_rows", "dn_attn_rows", "dn_cvt_rows", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -326,7 +326,7 @@ impl DenseGpu {
             self.launch3("dn_cvt_rows", ((t * nkv * hd).div_ceil(128) as u32, 1, 1), 128, &[P(self.bv), P(self.kv_base[l].1), P(dpos), P(dslot), I(slot_stride), I((nkv * hd) as i32), I((t * nkv * hd) as i32)]);
             }
             let win = if d.swa { m.window } else { 0 };
-            self.launch3("dn_attn_rows", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kv_base[l].0), P(self.kv_base[l].1), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(dlen), P(dslot), I(slot_stride)]);
+            if self.bt { self.launch3("dn_attn_rows_bt", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kv_base[l].0), P(self.kv_base[l].1), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(dlen), P(dbtab), I(mb as i32)]); } else { self.launch3("dn_attn_rows", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kv_base[l].0), P(self.kv_base[l].1), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(dlen), P(dslot), I(slot_stride)]); }
             self.bqx(self.bo, t, nh * hd);
             self.bmm(d.wo, self.bt2, t);
             if lfm { self.brms(self.bt2, d.post_attn, self.bt2, t); }

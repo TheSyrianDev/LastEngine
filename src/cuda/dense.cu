@@ -85,6 +85,36 @@ extern "C" __global__ void dn_attn_rows(const float* q, const __half* kc, const 
     o[h * hd + d] = a / L * g;
   }
 }
+
+extern "C" __global__ void dn_attn_rows_bt(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int win, int nh, int nkv, int hd, const int* rnk, const int* btab, int mb) {
+  __shared__ float mw[8], lw[8]; __shared__ float ow[8][256];
+  int r = blockIdx.y; int n = rnk[r]; const int* bt = btab + (size_t)r * mb;
+  int h = blockIdx.x, kvh = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int t0 = (win > 0 && n > win) ? n - win : 0;
+  q += (size_t)r * nh * hd; o += (size_t)r * nh * hd; if (gate) gate += (size_t)r * nh;
+  int per = hd / 32; float qv[8], acc[8];
+  for (int j = 0; j < per; j++) { qv[j] = q[h * hd + lane + 32 * j]; acc[j] = 0.f; }
+  float m = -1e30f, l = 0.f, scale = rsqrtf((float)hd);
+  for (int t = t0 + w; t < n; t += 8) {
+    size_t phys = (size_t)bt[t / 16] * 16 + (t & 15); const __half* kp = kc + (phys * nkv + kvh) * hd; const __half* vp = vc + (phys * nkv + kvh) * hd;
+    float s = 0.f; for (int j = 0; j < per; j++) s += qv[j] * __half2float(kp[lane + 32 * j]);
+    s = warp_sum(s) * scale;
+    float mn = fmaxf(m, s), cr = __expf(m - mn), p = __expf(s - mn);
+    l = l * cr + p;
+    for (int j = 0; j < per; j++) acc[j] = acc[j] * cr + p * __half2float(vp[lane + 32 * j]);
+    m = mn;
+  }
+  if (lane == 0) { mw[w] = m; lw[w] = l; }
+  for (int j = 0; j < per; j++) ow[w][lane + 32 * j] = acc[j];
+  __syncthreads();
+  float M = -1e30f; for (int i = 0; i < 8; i++) M = fmaxf(M, mw[i]);
+  float L = 0.f; for (int i = 0; i < 8; i++) L += lw[i] * __expf(mw[i] - M);
+  float g = gate ? sigm_f(gate[h]) : 1.f;
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+    float a = 0.f; for (int i = 0; i < 8; i++) a += ow[i][d] * __expf(mw[i] - M);
+    o[h * hd + d] = a / L * g;
+  }
+}
 // Row-batched V write (phase 2 step 2): row r holds n_row values at slot rslot[r], position rpos[r]. i indexes N*n_row.
 extern "C" __global__ void dn_cvt_rows(const float* in, __half* base, const int* rpos, const int* rslot, int slot_stride, int n_row, int n) {
   int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
