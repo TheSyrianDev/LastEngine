@@ -1225,6 +1225,10 @@ __device__ void mmq128r_impl(const u8* const* ptrs, const int* off, const int* i
 #define MMQ128R(TY, H) extern "C" __global__ void __launch_bounds__(256, 1) mmq128r_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128r_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
 MMQ128R(2, false) MMQ128R(8, false) MMQ128R(11, true) MMQ128R(12, false) MMQ128R(13, false) MMQ128R(14, true)
 
+// Same 128-row kernel with a 2-blocks-per-SM register cap (opt-in LE_MMQR2=1). Register use is capped at 128 by launch_bounds(256,2).
+#define MMQ128R2(TY, H) extern "C" __global__ void __launch_bounds__(256, 2) mmq128r2_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128r_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
+MMQ128R2(2, false) MMQ128R2(8, false) MMQ128R2(11, true) MMQ128R2(12, false) MMQ128R2(13, false) MMQ128R2(14, true)
+
 #define MMQ128(TY, H) extern "C" __global__ void __launch_bounds__(256, 2) mmq128_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq128_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
 MMQ128(2, false) MMQ128(8, false) MMQ128(11, true) MMQ128(12, false) MMQ128(13, false) MMQ128(14, true)
 #define MMQ(TY, H) extern "C" __global__ void __launch_bounds__(256) mmq_##TY(const u8* const* p, const int* off, const int* ii, const int* oi, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols) { mmq_impl<TY, H>(p, off, ii, oi, xq, xd, xs, o, rows, cols); }
