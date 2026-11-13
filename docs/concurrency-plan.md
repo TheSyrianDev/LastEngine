@@ -68,6 +68,8 @@ Steps, each a separate commit with its own gate:
 
 Progress (2026-11-13): step 1 done (6651df4, slot test passes). Step 3a/3b done behind LE_ROWS=1 (9e67797, e044661; per-row position, slot and length in dn_prep_rows / dn_attn_rows; gates identical). Step 4 bookkeeping done: src/sched.rs (FIFO admit, retire promotes, cancel; 3 unit tests, a2654e9). Still open: decode_batch (step 2 proper, N=1 and N=2 gates), wiring the scheduler into the server loop, and the 1/2/4/8 token-identity gate and benchmark.
 
+Update (2026-11-13, later): step 2 gates pass: batch-test N=2 30/30 both slots, dense_cmp N=1 unchanged (commit 0a3c15a fixed a KV slot stride units bug: stride is in f16 elements, ctx*nkv*hd). Remaining: step 4 wiring. Design note: the server currently calls backend.generate per request inside spawn_blocking, so the scheduler needs a single batched generation loop owned by the GPU backend (one thread steps all active slots with decode_batch, emits per-request Deltas through per-request channels). Until that loop exists, concurrent requests are serialized by the backend mutex and the 1/2/4/8 baseline is flat aggregate throughput; tools/conc_bench.sh measures it.
+
 Blocker to flag: step 1 touches every KV kernel and the graph capture. It is multi-session work, not a single change.
 
 ## Later phases (added by projects-45)
