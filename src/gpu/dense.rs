@@ -64,7 +64,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "mmq128r2_2", "mmq128r2_8", "mmq128r2_11", "mmq128r2_12", "mmq128r2_13", "mmq128r2_14", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_prep_rows", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "mmq128r2_2", "mmq128r2_8", "mmq128r2_11", "mmq128r2_12", "mmq128r2_13", "mmq128r2_14", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_prep_rows", "dn_attn_rows", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -321,7 +321,8 @@ impl DenseGpu {
                         self.launch3("dn_attn_split", (nh as u32, sp as u32, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(self.part), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(sp as i32), P(self.dpos + 4)]); }
                     self.launch("dn_attn_comb", nh as u32, 128, 0, &[P(self.part), P(if lfm { self.g } else { 0 }), P(self.o), I(hd as i32), I(sp as i32)]);
                 } else {
-                self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(self.dpos + 4)]);
+                if self.rows { self.launch3("dn_attn_rows", (nh as u32, 1, 1), 256, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(self.drow + 4), P(self.drow + 8), I((self.ctx_len * nkv * hd * 2) as i32)]); } else {
+                self.launch("dn_attn", nh as u32, 256, 0, &[P(self.q), P(self.kc[l]), P(self.vc[l]), P(if lfm { self.g } else { 0 }), P(self.o), I(win as i32), I(nk as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(self.dpos + 4)]); }
                 }
                 self.mv(d.wo, self.o, self.t2);
             }
@@ -343,7 +344,7 @@ impl DenseGpu {
         let pos = self.pos as i32;
         let mut e = vec![0f32; n];
         { let (t, b) = m.bytes("token_embd.weight"); let rb = crate::quant::row_bytes(t.ty, n); crate::quant::dequant_row(t.ty, &b[token as usize * rb..(token as usize + 1) * rb], &mut e); }
-        unsafe { result::memcpy_htod_sync(self.x, &e).unwrap(); result::memcpy_htod_sync(self.dpos, &[self.pos as i32, (self.pos + 1) as i32]).unwrap(); result::memcpy_htod_sync(self.drow, &[self.pos as i32]).unwrap() };
+        unsafe { result::memcpy_htod_sync(self.x, &e).unwrap(); result::memcpy_htod_sync(self.dpos, &[self.pos as i32, (self.pos + 1) as i32]).unwrap(); result::memcpy_htod_sync(self.drow, &[self.pos as i32, (self.pos + 1) as i32, 0]).unwrap() };
         let lfm = m.kind == Kind::Lfm3;
         let (split_min, split_on, _) = dn_split_env();
         let nk = self.pos + 1;

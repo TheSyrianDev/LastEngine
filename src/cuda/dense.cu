@@ -53,6 +53,38 @@ extern "C" __global__ void dn_prep_rows(const float* in, void* out, int out_half
   if (out_half) { __half* o = (__half*)out + ob + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
   else { float* o = (float*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
 }
+// Row-batched decode attention (phase 2 step 3b): row r (blockIdx.y) attends over its own length rnk[r] in KV slot rslot[r].
+// Slot base = kc + rslot[r]*slot_stride (elements). Grid (heads, rows). For one row with rnk=pos+1, rslot=0 it equals dn_attn.
+extern "C" __global__ void dn_attn_rows(const float* q, const __half* kc, const __half* vc, const float* gate, float* o, int win, int nh, int nkv, int hd, const int* rnk, const int* rslot, int slot_stride) {
+  __shared__ float mw[8], lw[8]; __shared__ float ow[8][256];
+  int r = blockIdx.y; int n = rnk[r]; size_t sb = (size_t)rslot[r] * (size_t)slot_stride;
+  kc += sb; vc += sb;
+  int h = blockIdx.x, kvh = h / (nh / nkv), w = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int t0 = (win > 0 && n > win) ? n - win : 0;
+  q += (size_t)r * nh * hd; o += (size_t)r * nh * hd; if (gate) gate += (size_t)r * nh;
+  int per = hd / 32; float qv[8], acc[8];
+  for (int j = 0; j < per; j++) { qv[j] = q[h * hd + lane + 32 * j]; acc[j] = 0.f; }
+  float m = -1e30f, l = 0.f, scale = rsqrtf((float)hd);
+  for (int t = t0 + w; t < n; t += 8) {
+    const __half* kp = kc + ((size_t)t * nkv + kvh) * hd; const __half* vp = vc + ((size_t)t * nkv + kvh) * hd;
+    float s = 0.f; for (int j = 0; j < per; j++) s += qv[j] * __half2float(kp[lane + 32 * j]);
+    s = warp_sum(s) * scale;
+    float mn = fmaxf(m, s), cr = __expf(m - mn), p = __expf(s - mn);
+    l = l * cr + p;
+    for (int j = 0; j < per; j++) acc[j] = acc[j] * cr + p * __half2float(vp[lane + 32 * j]);
+    m = mn;
+  }
+  if (lane == 0) { mw[w] = m; lw[w] = l; }
+  for (int j = 0; j < per; j++) ow[w][lane + 32 * j] = acc[j];
+  __syncthreads();
+  float M = -1e30f; for (int i = 0; i < 8; i++) M = fmaxf(M, mw[i]);
+  float L = 0.f; for (int i = 0; i < 8; i++) L += lw[i] * __expf(mw[i] - M);
+  float g = gate ? sigm_f(gate[h]) : 1.f;
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) {
+    float a = 0.f; for (int i = 0; i < 8; i++) a += ow[i][d] * __expf(mw[i] - M);
+    o[h * hd + d] = a / L * g;
+  }
+}
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
 // Decode variant: destination row is pdev[0] (device-resident position), so the launch args do not change per token.
 extern "C" __global__ void dn_cvt_half_d(const float* in, __half* base, const int* pdev, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) base[(size_t)pdev[0] * n + i] = __float2half(in[i]); }
