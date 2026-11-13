@@ -102,4 +102,11 @@ c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"Name three colours.\"}
 c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"Name three colours.\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":40,\"temperature\":0}" "$T/ct")
 [ "$c" = 200 ] && [ "$(pyk $T/ct "len(d['choices'][0]['message']['content'])>0")" = True ] && ok "chat_template_kwargs enable_thinking=false -> content" || bad "enable_thinking false" "$c $(head -c 300 $T/ct)"
 
+# 11 queue: 12 concurrent requests against default LE_MAX_QUEUE=8 -> every reply is 200 or 429 server_busy, server stays healthy
+rm -f $T/q*; for i in $(seq 1 12); do (curl -s -m 600 -o $T/q$i.json -w '%{http_code}' "$B/v1/chat/completions" -H 'Content-Type: application/json' -d "{\"messages\":[{\"role\":\"user\",\"content\":\"Write a long story about a fox number $i.\"}],\"max_tokens\":120,\"temperature\":0,$NOTH}" > $T/q$i.code &) ; done; sleep 60; while pgrep -f "api_integration.sh" >/dev/null 2>&1 && [ "$(ls $T/q*.code 2>/dev/null | wc -l)" -lt 12 ]; do sleep 2; done
+for i in $(seq 1 12); do for _ in $(seq 1 300); do [ -s $T/q$i.code ] && break; sleep 1; done; done
+codes=$(cat $T/q*.code | tr '\n' ' ')
+ok_n=$(cat $T/q*.code | grep -o 200 | wc -l); busy=$(for f in $T/q*.json; do python3 -c "import json,sys;d=json.load(open('$f'));print(d.get('error',{}).get('code',''))" 2>/dev/null; done | grep -c server_busy)
+[ "$ok_n" -ge 1 ] && [ $((ok_n + busy)) -eq 12 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' $B/health)" = 200 ] && ok "queue: 12 concurrent -> $ok_n x 200, $busy x 429 server_busy, server healthy" || bad "queue" "codes: $codes"
+
 echo "----"; echo "passed $PASS, failed $FAIL"; rm -rf "$T"; [ "$FAIL" = 0 ]

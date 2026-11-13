@@ -1,6 +1,8 @@
 # Concurrency plan (Beta as backend for Last AI)
 
-Status: plan only, written before coding (requested by projects-45). Nothing here is implemented yet.
+Status: phase 1 implemented (LE_MAX_QUEUE, default 8: one active generation, bounded queue, 429 server_busy when full; tested by api_integration.sh "queue"). Other phases not started.
+
+KV bytes per token (MiniCPM5-2B, from GGUF metadata): 42 layers x 2 KV heads x 128 head dim x (K+V) x f16 2 bytes = 43,008 B = 42 KiB per token. Engine KV is f16 (src/gpu/dense.rs:100).
 
 ## Current behaviour (measured or read from code)
 
@@ -15,15 +17,15 @@ Budget: about 1.9 GB free for KV plus scratch at ctx 20000 with MiniCPM5. Per-to
 
 | Model | Context | Concurrent slots | KV per slot | Fits? |
 |---|---|---|---|---|
-| MiniCPM5-2B Q4_K_M | 4K | TBD | TBD | TBD |
-| MiniCPM5-2B Q4_K_M | 16K | TBD | TBD | TBD |
+| MiniCPM5-2B Q4_K_M | 4K | 1 (queue behind) | 42 KiB x 4096 = 172 MiB | yes (measured free 1.9 GB at ctx 20000) |
+| MiniCPM5-2B Q4_K_M | 16K | 1 | 42 KiB x 16384 = 672 MiB | yes, tight with 2+ slots |
 | Sage (if used) | 4K / 16K | TBD | TBD | TBD |
 
 Rule: slots × ctx × KV-bytes-per-token + scratch must fit in measured free memory. Prefer one slot at 16K over several slots at 4K unless the workload says otherwise.
 
 ## Phases, smallest first
 
-1. **Request queue with bounded concurrency (1 active slot).** Keep one active generation; queue the rest with a cap (e.g. 8) and return 429 with a JSON error when full. Exit criterion: no crashes under 16 parallel clients; every request gets 200 or a clean 429.
+1. **Request queue with bounded concurrency (1 active slot).** DONE (LE_MAX_QUEUE). Keep one active generation; queue the rest with a cap (e.g. 8) and return 429 with a JSON error when full. Exit criterion: no crashes under 16 parallel clients; every request gets 200 or a clean 429.
 2. **Fair scheduling.** FIFO across clients so one long prompt does not starve short ones. Exit: p99 TTFT of short requests bounded while a long prefill runs.
 3. **Chunked prefill interleaved with decode.** Split prefill into chunks so decode steps for active sessions run between chunks. Needs the chunk size tuned for the 4 GB card. Exit: decode token gaps stay under a fixed bound during another client's prefill.
 4. **Multiple KV slots (static).** Partition the KV buffer into N fixed slots sized from the memory math above. Exit: N concurrent generations produce output identical to running them one at a time (dense_cmp style check).

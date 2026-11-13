@@ -35,7 +35,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         let l = tokio::task::spawn_blocking(move || crate::local::Local::load(&path, ctx, margin, tf.as_deref())).await.map_err(|e| e.to_string())??;
         Arc::new(l)
     };
-    let st = Arc::new(App { be, slot_dir: a.slot_save_path.clone().map(std::path::PathBuf::from), stats: Stats::new() });
+    let max_queue = std::env::var("LE_MAX_QUEUE").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize);
+    let st = Arc::new(App { be, slot_dir: a.slot_save_path.clone().map(std::path::PathBuf::from), stats: Stats::new(), pending: std::sync::atomic::AtomicUsize::new(0), max_queue });
     let app = Router::new()
         .route("/", get(web_index))
         .route("/index.html", get(web_index))
@@ -64,7 +65,15 @@ pub struct App {
     be: Shared,
     slot_dir: Option<std::path::PathBuf>,
     stats: Stats,
+    // Requests admitted (waiting for or running a generation). Phase 1 of docs/concurrency-plan.md: one active
+    // generation, a bounded queue behind it, 429 when full.
+    pending: std::sync::atomic::AtomicUsize,
+    max_queue: usize,
 }
+
+/// Releases one admitted-request slot when the generation task finishes (or is dropped).
+struct QueueGuard(Arc<App>);
+impl Drop for QueueGuard { fn drop(&mut self) { self.0.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst); } }
 
 fn model_info(be: &Shared) -> Value {
     json!({"id": be.model_id(), "n_ctx": be.n_ctx(), "n_params": be.n_params(), "engine": "lastengine", "version": env!("CARGO_PKG_VERSION")})
@@ -175,6 +184,10 @@ async fn chat(State(app): State<Arc<App>>, raw: axum::body::Bytes) -> axum::resp
         enable_thinking: body["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(think_default),
     };
     if let Err(e) = app.be.check(&req) { return api_error(e.status, "invalid_request_error", e.code, &e.message); }
+    if app.pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= app.max_queue {
+        app.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        return api_error(429, "rate_limit_error", "server_busy", &format!("server is busy: {} requests already queued or running; retry later", app.max_queue));
+    }
     let stream = body["stream"].as_bool().unwrap_or(false);
     let include_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
     let id = "chatcmpl-lastengine";
@@ -189,6 +202,7 @@ async fn chat(State(app): State<Arc<App>>, raw: axum::body::Bytes) -> axum::resp
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut guard = CancelOnDrop(cancel.clone(), true);
         let h = tokio::task::spawn_blocking(move || {
+            let _q = QueueGuard(app2.clone());
             let (mut text, mut reasoning) = (String::new(), String::new());
             let mut ttft = None; let mut sf = StopFilter::new(stops.clone()); let mut sfr = StopFilter::new(stops); let mut hit = false;
             let mut u = be.generate(&req, &mut |d| {
@@ -216,6 +230,7 @@ async fn chat(State(app): State<Arc<App>>, raw: axum::body::Bytes) -> axum::resp
     }
     let (tx, rx) = mpsc::channel::<Event>(64);
     tokio::task::spawn_blocking(move || {
+        let _q = QueueGuard(app.clone());
         let ev = |v: Value| Event::default().data(v.to_string());
         let chunk = |delta: Value, fin: Value| json!({"id":id,"object":"chat.completion.chunk","model":model,
             "choices":[{"index":0,"delta":delta,"finish_reason":fin}]});
