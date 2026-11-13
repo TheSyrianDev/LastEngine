@@ -81,7 +81,7 @@ async fn stats_requests(State(a): State<Arc<App>>, Query(q): Query<std::collecti
 
 async fn models(State(a): State<Arc<App>>) -> Json<Value> {
     let be = &a.be;
-    Json(json!({"object":"list","data":[{"id":be.model_id(),"object":"model","owned_by":"lastengine","meta":{"n_params":be.n_params()}}]}))
+    Json(json!({"object":"list","data":[{"id":be.model_id(),"object":"model","created":0,"owned_by":"lastengine","meta":{"n_params":be.n_params()}}]}))
 }
 
 async fn props(State(a): State<Arc<App>>) -> Json<Value> {
@@ -136,8 +136,27 @@ fn tool_calls_json(u: &crate::backend::Usage) -> Value {
     Value::Array(u.tool_calls.iter().enumerate().map(|(i, c)| json!({"index":i,"id":format!("call_{i}"),"type":"function","function":{"name":c.name,"arguments":c.arguments}})).collect())
 }
 
-async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::response::Response {
+/// OpenAI-style error body: {"error":{"message","type","code","param"}} with the given HTTP status.
+fn api_error(status: u16, typ: &str, code: &str, message: &str) -> axum::response::Response {
     use axum::response::IntoResponse;
+    let st = axum::http::StatusCode::from_u16(status).unwrap_or(axum::http::StatusCode::BAD_REQUEST);
+    (st, Json(json!({"error": {"message": message, "type": typ, "code": code, "param": null}}))).into_response()
+}
+
+async fn chat(State(app): State<Arc<App>>, raw: axum::body::Bytes) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let body: Value = match serde_json::from_slice(&raw) {
+        Ok(v) => v,
+        Err(e) => return api_error(400, "invalid_request_error", "invalid_json", &format!("request body is not valid JSON: {e}")),
+    };
+    if !body.is_object() { return api_error(400, "invalid_request_error", "invalid_body", "request body must be a JSON object"); }
+    match body.get("messages").and_then(|m| m.as_array()) {
+        Some(m) if !m.is_empty() => {}
+        _ => return api_error(400, "invalid_request_error", "missing_messages", "'messages' must be a non-empty array"),
+    }
+    if let Some(t) = body["temperature"].as_f64() { if !(0.0..=2.0).contains(&t) { return api_error(400, "invalid_request_error", "invalid_temperature", "'temperature' must be between 0 and 2"); } }
+    if let Some(p) = body["top_p"].as_f64() { if !(p > 0.0 && p <= 1.0) { return api_error(400, "invalid_request_error", "invalid_top_p", "'top_p' must be in (0, 1]"); } }
+    if let Some(m) = body["max_tokens"].as_u64().or(body["max_completion_tokens"].as_u64()) { if m == 0 { return api_error(400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be at least 1"); } }
     let req = GenRequest {
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
         tools: body.get("tools").filter(|t| t.as_array().map_or(false, |a| !a.is_empty())).cloned(),
@@ -145,6 +164,7 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
         sampling: sampling_of(&body),
         enable_thinking: body["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(true),
     };
+    if let Err(e) = app.be.check(&req) { return api_error(e.status, "invalid_request_error", e.code, &e.message); }
     let stream = body["stream"].as_bool().unwrap_or(false);
     let include_usage = body["stream_options"]["include_usage"].as_bool().unwrap_or(false);
     let id = "chatcmpl-lastengine";
@@ -160,13 +180,16 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
         let mut guard = CancelOnDrop(cancel.clone(), true);
         let h = tokio::task::spawn_blocking(move || {
             let (mut text, mut reasoning) = (String::new(), String::new());
-            let mut ttft = None; let mut sf = StopFilter::new(stops); let mut hit = false;
+            let mut ttft = None; let mut sf = StopFilter::new(stops.clone()); let mut sfr = StopFilter::new(stops); let mut hit = false;
             let mut u = be.generate(&req, &mut |d| {
                 ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
-                match d { Delta::Content(s) => { let (o, h) = sf.push(&s); text.push_str(&o); if h { hit = true; return false; } } Delta::Reasoning(s) => reasoning.push_str(&s) }
+                match d {
+                    Delta::Content(s) => { let (o, h) = sf.push(&s); text.push_str(&o); if h { hit = true; return false; } }
+                    Delta::Reasoning(s) => { let (o, h) = sfr.push(&s); reasoning.push_str(&o); if h { hit = true; return false; } }
+                }
                 !cancel.load(std::sync::atomic::Ordering::Relaxed)
             });
-            if !hit { text.push_str(&sf.flush()); } else { u.finish_reason = "stop"; }
+            if !hit { text.push_str(&sf.flush()); reasoning.push_str(&sfr.flush()); } else { u.finish_reason = "stop"; }
             let st = record(rid, started_unix_ms, t0, ttft, &u, true);
             app2.stats.finish(st.clone());
             (text, reasoning, u, st)
@@ -175,7 +198,7 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
         guard.1 = false;
         return Json(json!({
             "id": id, "object": "chat.completion", "model": model,
-            "choices": [{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":tool_calls_json(&u)},"finish_reason":u.finish_reason}],
+            "choices": [{"index":0,"message":{"role":"assistant","content":text,"reasoning_content":reasoning,"tool_calls":if u.tool_calls.is_empty() { Value::Null } else { tool_calls_json(&u) }},"finish_reason":u.finish_reason}],
             "usage": {"prompt_tokens":u.prompt_tokens,"completion_tokens":u.completion_tokens,"total_tokens":u.prompt_tokens+u.completion_tokens,
                       "prompt_tokens_details":{"cached_tokens":u.cached_tokens}},
             "timings": timings(&st)
@@ -190,17 +213,20 @@ async fn chat(State(app): State<Arc<App>>, Json(body): Json<Value>) -> axum::res
         // emit returns false when the receiver is dropped (client closed the socket): generation stops.
         let mut ttft = None;
         let mut alive = true;
-        let mut sf = StopFilter::new(stops); let mut hit = false;
+        let mut sf = StopFilter::new(stops.clone()); let mut sfr = StopFilter::new(stops); let mut hit = false;
         let mut u = be.generate(&req, &mut |d| {
             ttft.get_or_insert_with(|| t0.elapsed().as_secs_f64() * 1000.0);
             let delta = match d {
-                Delta::Content(s) => { let (o, h) = sf.push(&s); if h { hit = true; } if o.is_empty() { if hit { return false; } return true; } json!({"content":o}) }
-                Delta::Reasoning(s) => json!({"reasoning_content":s}),
+                Delta::Content(s) => { let (o, h) = sf.push(&s); if h { hit = true; } if o.is_empty() { None } else { Some(json!({"content":o})) } }
+                Delta::Reasoning(s) => { let (o, h) = sfr.push(&s); if h { hit = true; } if o.is_empty() { None } else { Some(json!({"reasoning_content":o})) } }
             };
-            alive = tx.blocking_send(ev(chunk(delta, Value::Null))).is_ok();
+            if let Some(delta) = delta { alive = tx.blocking_send(ev(chunk(delta, Value::Null))).is_ok(); }
             alive && !hit
         });
-        if !hit { let rest = sf.flush(); if !rest.is_empty() { alive = tx.blocking_send(ev(chunk(json!({"content":rest}), Value::Null))).is_ok(); } } else { u.finish_reason = "stop"; }
+        if !hit {
+            let rest = sf.flush(); if !rest.is_empty() { alive = tx.blocking_send(ev(chunk(json!({"content":rest}), Value::Null))).is_ok(); }
+            let rr = sfr.flush(); if !rr.is_empty() { alive = tx.blocking_send(ev(chunk(json!({"reasoning_content":rr}), Value::Null))).is_ok(); }
+        } else { u.finish_reason = "stop"; }
         if !u.tool_calls.is_empty() { let _ = tx.blocking_send(ev(chunk(json!({"tool_calls":tool_calls_json(&u)}), Value::Null))); }
         let st = record(rid, started_unix_ms, t0, ttft, &u, alive);
         app.stats.finish(st.clone());

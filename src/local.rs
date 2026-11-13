@@ -191,6 +191,18 @@ impl Backend for Local {
     fn n_ctx(&self) -> usize { self.n_ctx }
     fn n_params(&self) -> u64 { self.n_params }
     fn supports_tools(&self) -> bool { self.tmpl.contains("tool_call") }
+    fn check(&self, req: &GenRequest) -> Result<(), crate::backend::ApiError> {
+        use crate::backend::ApiError;
+        let msgs = fix_messages(&req.messages);
+        let prompt = template::render(&self.tmpl, &msgs, req.tools.as_ref(), true, &self.bos, &self.eos, req.enable_thinking)
+            .map_err(|e| ApiError { status: 400, code: "template_error", message: format!("chat template error: {e}") })?;
+        let n = self.tok.encode(&prompt).len();
+        if n >= self.n_ctx {
+            return Err(ApiError { status: 400, code: "context_length_exceeded",
+                message: format!("This model's maximum context length is {} tokens, but the prompt is {} tokens. Reduce the input.", self.n_ctx, n) });
+        }
+        Ok(())
+    }
     fn generate(&self, req: &GenRequest, emit: &mut dyn FnMut(Delta) -> bool) -> Usage {
         let t0 = std::time::Instant::now();
         let msgs = fix_messages(&req.messages);
