@@ -156,6 +156,32 @@ async fn main() {
             }
             println!("{agree}/{n} argmax agree, mean |dlogprob| {:.4}, max {:.4}", sumd / n as f32, maxd);
         }
+        cli::Cmd::SlotTest { path, a, b, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0 as u32;
+            let (ia, ib) = (tk.encode(&a), tk.encode(&b));
+            let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
+            assert!(gp.slots() >= 2, "run with LE_SLOTS=2");
+            // Solo reference: slot 0 only, one sequence at a time.
+            let mut solo = |ids: &[u32], gp: &mut gpu::dense::DenseGpu| -> Vec<u32> {
+                gp.reset(); gp.set_slot(0);
+                let mut lg = gp.prefill(ids); let mut out = vec![];
+                for _ in 0..n { let t = am(&lg); out.push(t); lg = gp.forward(t); }
+                out
+            };
+            let ra = solo(&ia, &mut gp); let rb = solo(&ib, &mut gp);
+            // Interleaved: A in slot 0, B in slot 1, one token each per round.
+            gp.reset();
+            gp.set_slot(0); let mut la = gp.prefill(&ia); let mut oa = vec![];
+            gp.set_slot(1); let mut lb = gp.prefill(&ib); let mut ob = vec![];
+            for _ in 0..n {
+                gp.set_slot(0); let t = am(&la); oa.push(t); la = gp.forward(t);
+                gp.set_slot(1); let t = am(&lb); ob.push(t); lb = gp.forward(t);
+            }
+            println!("slot A {}/{} tokens match solo; slot B {}/{} match solo", oa.iter().zip(&ra).filter(|(x, y)| x == y).count(), n, ob.iter().zip(&rb).filter(|(x, y)| x == y).count(), n);
+            if oa == ra && ob == rb { println!("SLOT INDEPENDENCE OK"); } else { println!("SLOT INDEPENDENCE FAIL"); std::process::exit(1); }
+        }
         cli::Cmd::TfDump { path, prompt, n } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
