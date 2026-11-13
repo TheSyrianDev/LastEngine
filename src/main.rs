@@ -13,6 +13,7 @@ mod quant;
 mod sched;
 mod batchplan;
 mod blockalloc;
+mod blocktable;
 mod batchworker;
 mod quant_ik;
 #[path = "quant_ik_tables.rs"]
