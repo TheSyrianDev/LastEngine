@@ -196,7 +196,7 @@ impl DenseGpu {
         let tile = if wide { 128 } else { 64 };
         let rtile = wide && std::env::var("LE_MMQR").map_or(true, |v| v != "0");
         let r2 = std::env::var("LE_MMQR2").map_or(false, |v| v == "1");
-        let name_r = format!("mmq128r{}_{}", if r2 { "2" } else { "" }, &name["mmq128_".len()..]);
+        let name_r = if wide { format!("mmq128r{}_{}", if r2 { "2" } else { "" }, &name["mmq128_".len()..]) } else { String::new() };
         let (name, rrows) = if rtile { (name_r.as_str(), 128) } else { (name, 64) };
         // LE_MMQSK=S (opt-in, default 1): split-K over the 128-row kernel. Needs units % 4 == 0; output is zeroed then atomically accumulated.
         let sk = if rtile && w.cols % 128 == 0 { std::env::var("LE_MMQSK").ok().and_then(|v| v.parse::<u32>().ok()).unwrap_or(1).max(1) } else { 1 };
