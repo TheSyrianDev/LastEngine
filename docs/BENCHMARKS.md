@@ -174,3 +174,17 @@ MiniCPM5-2B Q4_K_M, llama-server b12182, -ngl 42, q8_0 KV, 8K ctx per slot, ~4.3
 | 4 | 51.4 | 9.9 s |
 | 6 | 52.6 | 14.5 s |
 Raw: bench/results/np-scale/ (ai-8c). Compare with LastEngine rows above only after matching prompt length and context settings; these numbers are not yet matched to our conc_bench.
+
+## Concurrency, LE_BATCH=1 vs llama-server -np 8 (concurrency-p3, 2026-11-13, under machine lock)
+MiniCPM5-2B Q4_K_M, RTX 3050 Laptop, ctx 4096, 64 gen tokens per request, greedy, tools/np8_bench.sh.
+| system | N | agg tok/s |
+|---|---|---|
+| LastEngine LE_BATCH=1 | 4 | 96.1 |
+| LastEngine LE_BATCH=1 | 8 | 96.2 (invalid: rows above 6 diverge, see Known bug) |
+| llama-server -np 8 | 1 | 88.4 |
+| llama-server -np 8 | 2 | 177.4 |
+| llama-server -np 8 | 4 | 246.4 |
+| llama-server -np 8 | 8 | 336.3 |
+- LE_BATCH N=1 and N=2 rows were lost from the captured output (tail cut); rerun tools/np8_bench.sh to fill them.
+- LastEngine is ~flat at 96 tok/s from N=4, so it does not scale with batch size. llama-server scales to 336 at N=8. Beating llama here is not yet true.
+- Gates: S3 (N=1 greedy LE_BATCH=1 equals LE_BATCH=0) passed. S4 (4 concurrent greedy requests equal solo) passed, tools/s4_concurrent_gate.sh. S5 smoke (sampled temperature 0.8 / top_p 0.9) returns non-empty output, tools/s5_sampling_smoke.sh.

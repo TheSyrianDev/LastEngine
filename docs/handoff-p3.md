@@ -1,6 +1,6 @@
 # Handoff: concurrency-p3 (continue from here)
 
-Branch `concurrency-p3`, local only, nothing pushed. Last commit `673ee06`.
+Branch `concurrency-p3`, local only, nothing pushed. Last commit `c740d84`.
 
 ## Done
 - 3a `92e6136`: `batchgen::generate` library, `batch-gen` CLI; tokens equal `batch-loop` (6 prompts, N=20, under lock).
@@ -23,3 +23,10 @@ Branch `concurrency-p3`, local only, nothing pushed. Last commit `673ee06`.
 ## Rules
 - GPU only via `tools/gpu-run.sh <tag> <cmd>`. A refused take means wait, not run.
 - Commit each step only after the full test suite and gate pass.
+
+## Update (later session)
+- S3 PASS: LE_BATCH=1 greedy equals LE_BATCH=0 (tools/gpu-run.sh s3-serve bash /tmp/claude-1000/s3.sh; out_0 == out_1).
+- S4 PASS: 4 concurrent greedy requests equal solo (tools/s4_concurrent_gate.sh, commit c7eb9d3).
+- S5 DONE: per-request sampler `batchgen::Picker` (temperature/top_p, xorshift per request), commit c740d84; unit test 47/47; smoke tools/s5_sampling_smoke.sh non-empty. Determinism across restarts not yet gated (seed is a per-request counter).
+- -np 8 bench: docs/BENCHMARKS.md section added. Our batch path flat at ~96 tok/s from N=4; llama -np 8 reaches 336 at N=8. Known bug: batched rows >6 diverge (BATCH_ROW_CAP=6), so the N=8 LE number is invalid. N=1/2 LE rows lost; rerun tools/np8_bench.sh.
+- Open next: fix rows 7-8 divergence, then scale-up of batch throughput; determinism gate for sampling; push needs Omar's approval.
