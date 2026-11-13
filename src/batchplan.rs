@@ -260,3 +260,30 @@ mod budget_tests {
         assert_eq!(a, vec![1]); // 2 fails, 3 must not jump the queue
     }
 }
+
+/// Chunked prefill (pure): split a prompt of `len` tokens into chunks of at most `chunk` tokens, each chunk
+/// starting at the previous end. Chunks cover [0, len) exactly once, in order.
+pub fn prefill_chunks(len: usize, chunk: usize) -> Vec<(usize, usize)> {
+    assert!(chunk > 0, "chunk must be > 0");
+    let mut out = vec![]; let mut s = 0;
+    while s < len { let e = (s + chunk).min(len); out.push((s, e)); s = e; }
+    out
+}
+
+#[cfg(test)]
+mod chunk_tests {
+    use super::*;
+    #[test]
+    fn chunks_cover_prompt_exactly() {
+        let c = prefill_chunks(1000, 256);
+        assert_eq!(c.first(), Some(&(0, 256)));
+        assert_eq!(c.last(), Some(&(768, 1000)));
+        assert_eq!(c.iter().map(|(a, b)| b - a).sum::<usize>(), 1000);
+        for w in c.windows(2) { assert_eq!(w[0].1, w[1].0); }
+    }
+    #[test]
+    fn empty_and_exact_multiple() {
+        assert!(prefill_chunks(0, 8).is_empty());
+        assert_eq!(prefill_chunks(16, 8), vec![(0, 8), (8, 16)]);
+    }
+}
