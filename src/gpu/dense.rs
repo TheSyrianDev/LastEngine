@@ -23,6 +23,8 @@ pub struct DenseGpu {
     /// CUDA graphs of the decode layer loop, keyed by the per-layer split-K choice.
     graphs: HashMap<Vec<bool>, GraphBox>,
     kc: Vec<Dp>, vc: Vec<Dp>, conv: Vec<Dp>, pos: usize, ctx_len: usize,
+    /// Per-slot KV (phase 2 step 1): kv_base[l] holds the slot-0 base; kc[l]/vc[l] point at the active slot. slots=1 is HEAD behaviour.
+    kv_base: Vec<(Dp, Dp)>, slots: usize, slot: usize, slot_pos: Vec<usize>,
     bx: Dp, bh: Dp, bq: Dp, bk: Dp, bv: Dp, bg: Dp, bo: Dp, bt1: Dp, bt2: Dp, bgu: Dp, ba: Dp, bxq: Dp, bxd: Dp, bxs: Dp, boff: Dp,
 }
 const CH: usize = 512;
@@ -101,10 +103,14 @@ impl DenseGpu {
         let n_attn = lay.iter().filter(|l| !l.conv).count();
         let (free, _) = result::mem_get_info().expect("meminfo");
         let per_tok = n_attn * nkv * hd * 2 * 2;
-        let fit = if per_tok == 0 { ctx_len } else { free.saturating_sub(160 << 20) / per_tok };
+        let slots = std::env::var("LE_SLOTS").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(1).max(1);
+        let has_conv = lay.iter().any(|l| l.conv);
+        let slots = if slots > 1 && has_conv { eprintln!("LE_SLOTS>1 unsupported for hybrid/conv models; using 1"); 1 } else { slots };
+        let fit = if per_tok == 0 { ctx_len } else { free.saturating_sub(160 << 20) / (per_tok * slots) };
         let ctx_len = ctx_len.min(fit).max(256);
         eprintln!("dense gpu: {} layers, kv ctx {} ({} MiB free after weights)", m.n_layer, ctx_len, free >> 20);
-        for l in 0..m.n_layer { if !lay[l].conv { let n = ctx_len * nkv * hd * 2; kc[l] = dalloc(n); vc[l] = dalloc(n); } }
+        for l in 0..m.n_layer { if !lay[l].conv { let n = ctx_len * nkv * hd * 2 * slots; kc[l] = dalloc(n); vc[l] = dalloc(n); } }
+        let kv_base: Vec<(Dp, Dp)> = (0..m.n_layer).map(|l| (kc[l], vc[l])).collect();
         let ff = if has("rope_freqs.weight") { vecd("rope_freqs.weight") } else { 0 };
         let wide = m.n_embd.max(m.n_head * hd).max(8192 * 2);
         let ffn = lay[0].gu.rows / 2;
@@ -115,7 +121,7 @@ impl DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
             x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(2 * ffn), logits: fb(m.vocab),
             part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), fused_qkv: std::env::var("LE_DN_QKV").map_or(true, |v| v != "0"), rmsq: std::env::var("LE_RMSQ").map_or(true, |v| v != "0"), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
-            kc, vc, conv, pos: 0, ctx_len, lay,
+            kc, vc, conv, pos: 0, ctx_len, lay, kv_base, slots, slot: 0, slot_pos: vec![0; slots],
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
             bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bgu: dalloc(CH * 2 * ffn * 4), ba: dalloc(CH * ffn * 4),
             bxq: dalloc(CH * wide_cols), bxd: dalloc(CH * wide_cols / 8), bxs: dalloc(CH * wide_cols / 8), boff: dalloc(8), m,
@@ -261,6 +267,19 @@ impl DenseGpu {
     }
     fn bind(&self) { self._ctx.bind_to_thread().expect("bind"); }
     pub fn pos(&self) -> usize { self.pos }
+    /// Number of KV slots allocated (LE_SLOTS, default 1).
+    pub fn slots(&self) -> usize { self.slots }
+    /// Make `s` the active KV slot. Saves/restores the sequence position and drops captured graphs, since they bake in KV pointers.
+    pub fn set_slot(&mut self, s: usize) {
+        assert!(s < self.slots, "slot {} out of range ({} slots)", s, self.slots);
+        if s == self.slot { return; }
+        self.slot_pos[self.slot] = self.pos;
+        let off = (self.ctx_len * self.m.n_kv * self.m.head_dim * 2 * s) as u64;
+        for l in 0..self.lay.len() { if !self.lay[l].conv { self.kc[l] = self.kv_base[l].0 + off; self.vc[l] = self.kv_base[l].1 + off; } }
+        self.graphs.clear();
+        self.slot = s;
+        self.pos = self.slot_pos[s];
+    }
     pub fn reset(&mut self) { self.bind();
         self.pos = 0;
         for l in 0..self.lay.len() { if self.lay[l].conv { dzero(self.conv[l], self.m.n_embd * (self.m.l_cache - 1) * 4); } }
