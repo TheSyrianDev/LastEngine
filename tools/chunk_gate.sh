@@ -8,7 +8,7 @@ LE_BATCH=1 LE_CHUNK=8 LE_BUDGET=16 LE_SLOTS=4 LE_NOTUNE=1 target/release/lasteng
 P=$!
 for i in $(seq 1 240); do curl -s 127.0.0.1:8471/health | grep -q ok && break; sleep 1; done
 ask() { curl -s 127.0.0.1:8471/v1/chat/completions -H 'content-type: application/json' -d "{\"messages\":[{\"role\":\"user\",\"content\":\"$1\"}],\"max_tokens\":200,\"temperature\":0}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"])'; }
-for k in 0 1 2 3; do ask "${Q[$k]}" > /tmp/claude-1000/chunk_$k.txt & done; wait
+PIDS=(); for k in 0 1 2 3; do ask "${Q[$k]}" > /tmp/claude-1000/chunk_$k.txt & PIDS+=($!); done; wait "${PIDS[@]}"
 kill $P; wait $P 2>/dev/null
 rc=0
 for k in 0 1 2 3; do if diff -q /tmp/claude-1000/solo_$k.txt /tmp/claude-1000/chunk_$k.txt >/dev/null; then echo "chunk req$k SAME"; else echo "chunk req$k DIFF"; rc=1; fi; done
