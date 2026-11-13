@@ -76,4 +76,30 @@ sleep 3
 last=$(curl -s -m 10 "$B/stats/requests?limit=1")
 if [ "$(echo "$last" | python3 -c "import json,sys;r=json.load(sys.stdin)['requests'];print(r and r[-1].get('completed') is False)" 2>/dev/null)" = True ]; then ok "disconnect cancels generation"; else bad "disconnect cancel" "last stat: $(echo "$last" | head -c 200)"; fi
 
+# 9 tool calls must-have: forced named tool_choice, natural call, streaming; tool_choice none hides tools
+WX='[{"type":"function","function":{"name":"get_weather","description":"Get current weather for a city","parameters":{"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}}}]'
+NOTH='"chat_template_kwargs":{"enable_thinking":false}'
+c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Paris?\"}],\"tools\":$WX,\"tool_choice\":{\"type\":\"function\",\"function\":{\"name\":\"get_weather\"}},\"max_tokens\":200,\"temperature\":0,$NOTH}" "$T/fc")
+[ "$c" = 200 ] && [ "$(pyk $T/fc "d['choices'][0]['finish_reason']=='tool_calls' and d['choices'][0]['message']['tool_calls'][0]['function']['name']=='get_weather' and 'city' in json.loads(d['choices'][0]['message']['tool_calls'][0]['function']['arguments'])")" = True ] && ok "forced tool_choice emits get_weather call" || bad "forced tool_choice" "$c $(head -c 300 $T/fc)"
+c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Paris right now? Use the tool.\"}],\"tools\":$WX,\"max_tokens\":200,\"temperature\":0,$NOTH}" "$T/nc")
+[ "$c" = 200 ] && [ "$(pyk $T/nc "d['choices'][0]['finish_reason']=='tool_calls' and d['choices'][0]['message']['tool_calls'][0]['function']['name']=='get_weather'")" = True ] && ok "natural tool call (non-stream)" || bad "natural tool call" "$c $(head -c 300 $T/nc)"
+curl -sN -m 120 "$B/v1/chat/completions" -H 'Content-Type: application/json' -d "{\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Paris right now? Use the tool.\"}],\"tools\":$WX,\"stream\":true,\"max_tokens\":200,\"temperature\":0,$NOTH}" > $T/sc
+[ "$(python3 -c "
+import json
+calls=[]
+for l in open('$T/sc'):
+    l=l.strip()
+    if l.startswith('data: ') and l!='data: [DONE]':
+        d=json.loads(l[6:])
+        for t in (d['choices'][0]['delta'].get('tool_calls') or []): calls.append(t)
+fin=[json.loads(l[6:])['choices'][0]['finish_reason'] for l in open('$T/sc') if l.startswith('data: {') and json.loads(l[6:])['choices'][0]['finish_reason']]
+print(bool(calls) and calls[0]['function']['name']=='get_weather' and 'tool_calls' in fin)" 2>/dev/null)" = True ] && ok "natural tool call (stream)" || bad "stream tool call" "$(head -c 300 $T/sc)"
+c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"What is the weather in Paris?\"}],\"tools\":$WX,\"tool_choice\":\"none\",\"max_tokens\":60,\"temperature\":0,$NOTH}" "$T/tn")
+[ "$c" = 200 ] && [ "$(pyk $T/tn "d['choices'][0]['message'].get('tool_calls') in (None,[]) and d['choices'][0]['finish_reason']!='tool_calls'")" = True ] && ok "tool_choice none hides tools" || bad "tool_choice none" "$c $(head -c 200 $T/tn)"
+# 10 thinking control: reasoning_effort none => no reasoning; short max_tokens yields content
+c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"Name three colours.\"}],\"reasoning_effort\":\"none\",\"max_tokens\":40,\"temperature\":0}" "$T/re")
+[ "$c" = 200 ] && [ "$(pyk $T/re "d['choices'][0]['message']['reasoning_content']=='' and len(d['choices'][0]['message']['content'])>0")" = True ] && ok "reasoning_effort none -> content within 40 tokens" || bad "reasoning_effort none" "$c $(head -c 300 $T/re)"
+c=$(post "{\"messages\":[{\"role\":\"user\",\"content\":\"Name three colours.\"}],\"chat_template_kwargs\":{\"enable_thinking\":false},\"max_tokens\":40,\"temperature\":0}" "$T/ct")
+[ "$c" = 200 ] && [ "$(pyk $T/ct "len(d['choices'][0]['message']['content'])>0")" = True ] && ok "chat_template_kwargs enable_thinking=false -> content" || bad "enable_thinking false" "$c $(head -c 300 $T/ct)"
+
 echo "----"; echo "passed $PASS, failed $FAIL"; rm -rf "$T"; [ "$FAIL" = 0 ]

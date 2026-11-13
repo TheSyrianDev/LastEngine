@@ -157,12 +157,22 @@ async fn chat(State(app): State<Arc<App>>, raw: axum::body::Bytes) -> axum::resp
     if let Some(t) = body["temperature"].as_f64() { if !(0.0..=2.0).contains(&t) { return api_error(400, "invalid_request_error", "invalid_temperature", "'temperature' must be between 0 and 2"); } }
     if let Some(p) = body["top_p"].as_f64() { if !(p > 0.0 && p <= 1.0) { return api_error(400, "invalid_request_error", "invalid_top_p", "'top_p' must be in (0, 1]"); } }
     if let Some(m) = body["max_tokens"].as_u64().or(body["max_completion_tokens"].as_u64()) { if m == 0 { return api_error(400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be at least 1"); } }
+    // tool_choice: "none" hides tools; a named function keeps only that tool, so the model can only call it.
+    let tc = &body["tool_choice"];
+    let all_tools = body.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
+    let tools_val: Option<Value> = if tc.as_str() == Some("none") { None } else {
+        let want = tc["function"]["name"].as_str();
+        let kept: Vec<Value> = all_tools.into_iter().filter(|t| want.map_or(true, |w| t["function"]["name"].as_str() == Some(w))).collect();
+        if kept.is_empty() { None } else { Some(Value::Array(kept)) }
+    };
+    // reasoning_effort "none" turns thinking off; chat_template_kwargs.enable_thinking wins when given.
+    let think_default = body["reasoning_effort"].as_str().map_or(true, |e| e != "none");
     let req = GenRequest {
         messages: body["messages"].as_array().cloned().unwrap_or_default(),
-        tools: body.get("tools").filter(|t| t.as_array().map_or(false, |a| !a.is_empty())).cloned(),
+        tools: tools_val,
         max_tokens: body["max_tokens"].as_u64().or(body["max_completion_tokens"].as_u64()).unwrap_or(4096) as usize,
         sampling: sampling_of(&body),
-        enable_thinking: body["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(true),
+        enable_thinking: body["chat_template_kwargs"]["enable_thinking"].as_bool().unwrap_or(think_default),
     };
     if let Err(e) = app.be.check(&req) { return api_error(e.status, "invalid_request_error", e.code, &e.message); }
     let stream = body["stream"].as_bool().unwrap_or(false);
