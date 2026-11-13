@@ -244,7 +244,7 @@ impl Backend for Local {
             let (rtx, rrx) = std::sync::mpsc::channel();
             let sampling = crate::reqsched::Sampling { temperature: req.sampling.temperature, top_p: req.sampling.top_p };
             tx.lock().unwrap().send(crate::reqsched::Request { prompt_ids: ids.clone(), max_tokens: budget, sampling, tx: rtx }).expect("scheduler down");
-            let mut sp = Splitter { buf: String::new(), mode: 0, tool: String::new() };
+            let mut sp = Splitter { buf: String::new(), mode: if prompt.trim_end().ends_with("<think>") && req.enable_thinking { 1 } else { 0 }, tool: String::new() };
             let mut bytes: Vec<u8> = vec![]; let mut n = 0; let mut alive = true; let mut reason = "length";
             let eos_ok = |t: u32| self.tok.eos == Some(t) || self.tok.tokens.get(t as usize).map_or(false, |x| x == "<|im_end|>" || x == "<|endoftext|>");
             for m in rrx.iter() {
