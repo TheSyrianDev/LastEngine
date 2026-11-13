@@ -136,18 +136,19 @@ pub fn model_sha(path: &str) -> std::io::Result<String> {
 /// Serve-side load: returns the applied settings (env vars that were unset before). Never overrides explicit env.
 /// LE_PROFILE=off disables. Any failure is reported as a reason and serving proceeds with defaults.
 pub fn apply_profile_env(model: &str, ctx: usize) -> Result<Option<Profile>, String> {
-    if std::env::var("LE_PROFILE").map_or(false, |v| v == "off") { return Ok(None); }
+    if std::env::var("LE_PROFILE").map_or(false, |v| v == "off") { let _ = LOADED.set(("".into(), None, "LE_PROFILE=off".into())); return Ok(None); }
     let sha = model_sha(model).map_err(|e| format!("model sha: {e}"))?;
     let dev = gpu_name();
     let p = profile_path(&dev, &sha, ctx);
     let prof = match read_profile(&p, env!("CARGO_PKG_VERSION"), &sha) {
-        Ok(p) => p,
-        Err(why) => { eprintln!("profile: not applied ({why})"); return Ok(None); }
+        Ok(pr) => pr,
+        Err(why) => { eprintln!("profile: not applied ({why})"); let _ = LOADED.set((p.display().to_string(), None, why)); return Ok(None); }
     };
     for (k, v) in &prof.settings {
         if std::env::var_os(k).is_none() { std::env::set_var(k, v); }
     }
     eprintln!("profile: applied {} setting(s) from {}", prof.settings.len(), p.display());
+    let _ = LOADED.set((p.display().to_string(), Some(prof.clone()), "applied".into()));
     Ok(Some(prof))
 }
 
@@ -165,5 +166,16 @@ mod apply_tests {
         let b = model_sha(f.to_str().unwrap()).unwrap();
         assert_ne!(a, b);
         let _ = std::fs::remove_dir_all(&d);
+    }
+}
+
+/// What serve loaded at startup (for GET /v1/profile). Set once by apply_profile_env.
+pub static LOADED: std::sync::OnceLock<(String, Option<Profile>, String)> = std::sync::OnceLock::new();
+
+/// Status JSON for GET /v1/profile: path, whether applied, and the profile contents if any.
+pub fn status_json() -> serde_json::Value {
+    match LOADED.get() {
+        Some((path, prof, why)) => serde_json::json!({"path": path, "applied": prof.is_some(), "reason": why, "profile": prof}),
+        None => serde_json::json!({"path": null, "applied": false, "reason": "serve did not check a profile", "profile": null}),
     }
 }

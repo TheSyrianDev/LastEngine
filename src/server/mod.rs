@@ -49,6 +49,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         .route("/stats/requests", get(stats_requests))
         .route("/v1/models", get(models))
         .route("/props", get(props))
+        .route("/v1/profile", get(|| async { Json(crate::tune::status_json()) }))
+        .route("/v1/tune", post(|| async { (axum::http::StatusCode::CONFLICT, Json(json!({"error":{"code":"tune_offline","message":"tuning runs outside serve: run `lastengine tune` under machine-lock, then restart serve"}}))) }))
         .route("/health", get(|| async { Json(json!({"status":"ok"})) }))
         .route("/v1/chat/completions", post(chat))
         .route("/slots/{id}", post(slot_action))
