@@ -70,6 +70,8 @@ Progress (2026-11-13): step 1 done (6651df4, slot test passes). Step 3a/3b done 
 
 Update (2026-11-13, later): step 2 gates pass: batch-test N=2 30/30 both slots, dense_cmp N=1 unchanged (commit 0a3c15a fixed a KV slot stride units bug: stride is in f16 elements, ctx*nkv*hd). Remaining: step 4 wiring. Design note: the server currently calls backend.generate per request inside spawn_blocking, so the scheduler needs a single batched generation loop owned by the GPU backend (one thread steps all active slots with decode_batch, emits per-request Deltas through per-request channels). Until that loop exists, concurrent requests are serialized by the backend mutex and the 1/2/4/8 baseline is flat aggregate throughput; tools/conc_bench.sh measures it.
 
+Update (2026-11-13, later): step 4 CPU pieces done and tested: src/batchplan.rs (plan_step, advance, run_loop, step_once, greedy_rows, batched_eligible), src/batchworker.rs (channel worker loop). GPU gate: batch-loop CLI, N=2 and N=4 30/30 identical to solo (commit 7a7715d). Remaining: hook the worker step to decode_batch in the server's Local backend (greedy requests only), route via batched_eligible, then the 1/2/4/8 server gate and llama-server -np comparison.
+
 Blocker to flag: step 1 touches every KV kernel and the graph capture. It is multi-session work, not a single change.
 
 ## Later phases (added by projects-45)
