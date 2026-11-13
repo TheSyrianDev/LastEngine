@@ -36,3 +36,12 @@ Branch `concurrency-p3`, local only, nothing pushed. Last commit `c740d84`.
 - Step 2 DONE (profile): tools/prof_decode_n4.sh (LE_PROF=1 batch-gen, N=4, 64 tokens). Per-kernel share of decode_batch: mmq128r_12 74%, mmq128r_14 16%, matvec_14 2%, quant_x 2%, dn_flash_128b 0.8%. dn_attn_rows was NOT the bottleneck; the earlier hypothesis (attention limits throughput) is wrong.
 - Finding: decode_batch runs its weight GEMM through the prefill-style mmq128r kernel even at 4 rows, so each weight is streamed with little reuse across rows. The next lever is a small-N Q4_K GEMV that reads each weight once and produces all N row outputs (N<=8). Step 3 = write and gate that kernel (batch-invariance and solo-equality gates).
 - Still open: rows above 6 diverge (BATCH_ROW_CAP=6); sampling determinism gate; beat llama.cpp (not met: N=8 LE 96 tok/s vs llama 337).
+
+## Step 3 design (no GPU; not built, not dispatched)
+- Reference oracle: src/gemv_ref.rs `gemv_batch_ref(ty, w, rows, cols, xs)` (CPU, dequant_row based). Test `slots_are_independent` passes (48/48).
+- Kernel spec: `mvn_TY(const u8* w, const signed char* xq, const float* xd, const int* xs, float* out, int rows, int cols, int nslot, int xstride)`.
+  - Grid: rows/8 blocks, 256 threads (8 warps), one warp per output row group as in mv_impl (src/cuda/kernels.cu:372).
+  - Difference from mv_impl: grid.y is NOT the slot. Each block loads the quantized activations for all `nslot` slots into shared memory (units*9 ints per slot, ~2.9 KB per slot at cols 2560), then each lane dots its weight block once against every slot's activations and writes nslot outputs. The weight bytes are read once instead of nslot times.
+  - Shared memory at nslot=8, cols=2560: ~24 KB + scales, under the 48 KB default.
+- Gates before dispatch: (a) GPU kernel output vs gemv_batch_ref within float tolerance per slot; (b) solo-equality: N=1 output bitwise equal to existing matvec_12; (c) batch invariance N=1/2/4/6/7/8 through tools/batch_invariance_gate.sh.
+- Known: unverified until GPU run. The existing bmm launches mmq128r_* over the whole batch (src/gpu/dense.rs:193-211), so the new kernel would replace bmm only for t <= 8.
