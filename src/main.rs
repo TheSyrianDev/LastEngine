@@ -12,6 +12,7 @@ mod server;
 mod quant;
 mod sched;
 mod batchplan;
+mod batchgen;
 mod blockalloc;
 mod blocktable;
 mod batchworker;
@@ -139,6 +140,15 @@ async fn main() {
                 for j in 0..bs { logits = m.forward(&mut st, ar[j], pos + j); }
                 pos += bs; gen.extend(&ar);
             }
+        }
+        cli::Cmd::BatchGen { path, prompts, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let ps: Vec<Vec<u32>> = prompts.split('|').map(|p| tk.encode(p)).collect();
+            let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
+            let eos: Vec<u32> = tk.special("<|im_end|>").into_iter().chain(tk.special("<|endoftext|>")).collect();
+            let outs = batchgen::generate(&mut gp, &ps, n, &eos);
+            for (i, o) in outs.iter().enumerate() { println!("toks {i}: {:?}", o); }
         }
         cli::Cmd::DenseBench { path, prompt, n } => {
             let g = gguf::Gguf::open(&path).expect("open");

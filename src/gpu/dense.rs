@@ -275,6 +275,7 @@ impl DenseGpu {
     pub fn pos(&self) -> usize { self.pos }
     /// Number of KV slots allocated (LE_SLOTS, default 1).
     pub fn slots(&self) -> usize { self.slots }
+    pub fn ctx_len(&self) -> usize { self.ctx_len }
     /// Batched decode (phase 2 step 2): one token per row, row i in KV slot slots[i] at position poss[i]
     /// (poss[i] = tokens already in that slot). Returns logits per row. Does not touch self.pos or slot_pos.
     /// Dense models only (no conv layers); each row must be in its own slot or a distinct position.

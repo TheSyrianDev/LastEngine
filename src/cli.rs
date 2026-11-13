@@ -27,6 +27,8 @@ pub enum Cmd {
     /// Dense model: CPU greedy for N tokens, GPU teacher-forced on the same tokens; report first logit/argmax divergences
     DenseCmp { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
     /// Dense model GPU timing for tune: prints "prefill N tok in Xs" and "decode N tok in Xs = Y tok/s" (stdout), tunekey (stderr).
+    /// Batched greedy generation via batchgen::generate (step 3 refactor gate). Prints "toks i: [...]" like batch-loop.
+    BatchGen { path: String, prompts: String, n: usize },
     DenseBench { path: String, prompt: String, #[arg(default_value_t = 48)] n: usize },
     /// Two-slot independence: greedy-decode two prompts solo, then interleaved in slots 0 and 1 (run with LE_SLOTS=2); token streams must match.
     SlotTest { path: String, a: String, b: String, #[arg(default_value_t = 30)] n: usize },
