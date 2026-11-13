@@ -66,6 +66,8 @@ Steps, each a separate commit with its own gate:
 4. Scheduler: each iteration picks active sequences, runs one batched step, samples per sequence, admits new requests and retires finished ones. Gate: token-for-token match to single-sequence greedy at 1/2/4/8 clients.
 5. Benchmark vs `llama-server -np 1/2/4/8` on the same prompts, under machine-lock, with power mode recorded.
 
+Progress (2026-11-13): step 1 done (6651df4, slot test passes). Step 3a/3b done behind LE_ROWS=1 (9e67797, e044661; per-row position, slot and length in dn_prep_rows / dn_attn_rows; gates identical). Step 4 bookkeeping done: src/sched.rs (FIFO admit, retire promotes, cancel; 3 unit tests, a2654e9). Still open: decode_batch (step 2 proper, N=1 and N=2 gates), wiring the scheduler into the server loop, and the 1/2/4/8 token-identity gate and benchmark.
+
 Blocker to flag: step 1 touches every KV kernel and the graph capture. It is multi-session work, not a single change.
 
 ## Later phases (added by projects-45)
