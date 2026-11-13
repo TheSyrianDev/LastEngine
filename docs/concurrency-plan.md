@@ -13,7 +13,7 @@ KV bytes per token (MiniCPM5-2B, from GGUF metadata): 42 layers x 2 KV heads x 1
 
 ## Memory math for 4 GB
 
-Budget: about 1.9 GB free for KV plus scratch at ctx 20000 with MiniCPM5. Per-token KV size is not yet measured in this doc; get it from the model config (layers, kv heads, head dim, f16 bytes) before any sizing decision. Target sizing (to fill in after measuring):
+Budget: about 1.9 GB free for KV plus scratch at ctx 20000 with MiniCPM5. Per-token KV size is 42 KiB (see above). Sage is still TBD. Target sizing:
 
 | Model | Context | Concurrent slots | KV per slot | Fits? |
 |---|---|---|---|---|
