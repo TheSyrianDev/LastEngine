@@ -109,4 +109,8 @@ codes=$(cat $T/q*.code | tr '\n' ' ')
 ok_n=$(cat $T/q*.code | grep -o 200 | wc -l); busy=$(for f in $T/q*.json; do python3 -c "import json,sys;d=json.load(open('$f'));print(d.get('error',{}).get('code',''))" 2>/dev/null; done | grep -c server_busy)
 [ "$ok_n" -ge 1 ] && [ $((ok_n + busy)) -eq 12 ] && [ "$(curl -s -o /dev/null -w '%{http_code}' $B/health)" = 200 ] && ok "queue: 12 concurrent -> $ok_n x 200, $busy x 429 server_busy, server healthy" || bad "queue" "codes: $codes"
 
+# 12 /v1/models metadata: id, n_params and n_ctx present
+mj=$(curl -s -m 10 "$B/v1/models")
+[ "$(echo "$mj" | python3 -c "import json,sys;d=json.load(sys.stdin)['data'][0];m=d['meta'];print(bool(d['id']) and m['n_ctx']>0 and m['n_params']>0)" 2>/dev/null)" = True ] && ok "/v1/models meta has n_ctx and n_params" || bad "/v1/models meta" "$mj"
+
 echo "----"; echo "passed $PASS, failed $FAIL"; rm -rf "$T"; [ "$FAIL" = 0 ]

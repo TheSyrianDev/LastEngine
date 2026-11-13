@@ -90,7 +90,7 @@ async fn stats_requests(State(a): State<Arc<App>>, Query(q): Query<std::collecti
 
 async fn models(State(a): State<Arc<App>>) -> Json<Value> {
     let be = &a.be;
-    Json(json!({"object":"list","data":[{"id":be.model_id(),"object":"model","created":0,"owned_by":"lastengine","meta":{"n_params":be.n_params()}}]}))
+    Json(json!({"object":"list","data":[{"id":be.model_id(),"object":"model","created":0,"owned_by":"lastengine","meta":{"n_params":be.n_params(),"n_ctx":be.n_ctx()}}]}))
 }
 
 async fn props(State(a): State<Arc<App>>) -> Json<Value> {
