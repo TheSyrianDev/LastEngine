@@ -183,3 +183,45 @@ mod route_tests {
         assert!(!batched_eligible(0.0, 1.0, 0, 0.0, 0.0, 1.0, None, false, true));
     }
 }
+
+/// One step of the batched loop: plan, call `step`, advance every planned row, and return the ids of
+/// sequences that finished (with reason) and removed from `seqs`. Returns None when nothing was planned.
+/// Used by the server worker, which admits new requests between steps (see `run_loop` for a fixed set).
+pub fn step_once<F>(seqs: &mut Vec<(u64, Seq)>, eos: &[u32], ctx_len: usize, max_rows: usize, step: &mut F) -> Option<Vec<(u64, Finish)>>
+where F: FnMut(&StepInput) -> Vec<u32> {
+    let view: Vec<Seq> = seqs.iter().map(|(_, s)| s.clone()).collect();
+    let plan = plan_step(&view, ctx_len, max_rows);
+    if plan.rows.is_empty() { return None; }
+    let toks = step(&plan);
+    assert_eq!(toks.len(), plan.rows.len(), "step must return one token per row");
+    let mut fin = vec![];
+    let mut rm = vec![];
+    for (k, &row) in plan.rows.iter().enumerate() {
+        if let Some(r) = advance(&mut seqs[row].1, toks[k], eos, ctx_len) { rm.push((row, r)); }
+    }
+    rm.sort_by(|a, b| b.0.cmp(&a.0));
+    for (row, r) in rm { let (id, _) = seqs.remove(row); fin.push((id, r)); }
+    Some(fin)
+}
+
+#[cfg(test)]
+mod step_tests {
+    use super::*;
+    fn seq(slot: usize, pos: usize, tok: u32, max: usize) -> Seq { Seq { slot, pos, next_tok: tok, generated: 0, max_tokens: max } }
+
+    #[test]
+    fn admission_between_steps_joins_the_batch() {
+        let mut seqs = vec![(1u64, seq(0, 10, 5, 4))];
+        let mut step = |p: &StepInput| p.toks.iter().map(|t| t + 1).collect::<Vec<u32>>();
+        assert_eq!(step_once(&mut seqs, &[], 4096, 8, &mut step), Some(vec![]));
+        // A new request is admitted into slot 1 mid-run.
+        seqs.push((2, seq(1, 20, 9, 2)));
+        assert_eq!(step_once(&mut seqs, &[], 4096, 8, &mut step), Some(vec![]));
+        let f = step_once(&mut seqs, &[], 4096, 8, &mut step).unwrap();
+        assert_eq!(f, vec![(2, Finish::Length)]);
+        assert_eq!(seqs.len(), 1);
+        let f = step_once(&mut seqs, &[], 4096, 8, &mut step).unwrap();
+        assert_eq!(f, vec![(1, Finish::Length)]);
+        assert!(step_once(&mut seqs, &[], 4096, 8, &mut step).is_none());
+    }
+}
