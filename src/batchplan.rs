@@ -228,3 +228,35 @@ mod step_tests {
         assert!(step_once(&mut seqs, &[], 4096, 8, &mut step).is_none());
     }
 }
+
+/// vLLM-style token budget step (pure): decodes first (1 token each, running order), then admits waiting prefills
+/// while budget remains. `allocate` returns false when the KV pool cannot hold a request (it is skipped, not dropped).
+pub fn budget_step(running: &[usize], waiting: &[(usize, usize)], budget: usize, mut allocate: impl FnMut(usize, usize) -> bool) -> (Vec<usize>, Vec<usize>) {
+    let mut used = 0usize;
+    let mut decodes = vec![];
+    for &id in running { if used + 1 <= budget { decodes.push(id); used += 1; } }
+    let mut admits = vec![];
+    for &(id, ntok) in waiting {
+        if used >= budget { break; }
+        let take = ntok.min(budget - used);
+        if !allocate(id, take) { break; } // FIFO fairness: stop at the first request that does not fit
+        admits.push(id); used += take;
+    }
+    (decodes, admits)
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    #[test]
+    fn budget_never_exceeded_and_decodes_first() {
+        let (d, a) = budget_step(&[1, 2, 3], &[(10, 100), (11, 5)], 8, |_, _| true);
+        assert_eq!(d, vec![1, 2, 3]);
+        assert_eq!(a, vec![10]); // 5 budget left after decodes, 10 takes all 5, 11 gets none
+    }
+    #[test]
+    fn fifo_stops_at_first_unallocatable() {
+        let (_, a) = budget_step(&[], &[(1, 4), (2, 4), (3, 4)], 100, |id, _| id != 2);
+        assert_eq!(a, vec![1]); // 2 fails, 3 must not jump the queue
+    }
+}
