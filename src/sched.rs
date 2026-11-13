@@ -87,4 +87,27 @@ mod tests {
         assert!(!s.cancel_waiting(1));
         assert_eq!(s.retire(0), Some(3));
     }
+
+    #[test]
+    fn retire_on_empty_queue_leaves_slot_free() {
+        let mut s = Scheduler::new(2);
+        s.admit(1);
+        assert_eq!(s.retire(0), None);
+        assert_eq!(s.active(), vec![]);
+        assert_eq!(s.admit(2), Admit::Slot(0));
+    }
+
+    #[test]
+    fn cancel_unknown_id_is_noop() {
+        let mut s = Scheduler::new(1);
+        s.admit(1);
+        assert!(!s.cancel_waiting(99));
+        assert_eq!(s.waiting_len(), 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one slot")]
+    fn zero_slots_rejected() {
+        let _ = Scheduler::new(0);
+    }
 }
