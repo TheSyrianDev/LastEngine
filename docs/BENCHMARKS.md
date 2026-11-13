@@ -164,3 +164,13 @@ Aggregate is flat from N=2 because the backend mutex serializes requests (one ge
 
 ## Known bug (batched path)
 Batched decode is identical to solo for 1-6 rows. Rows 7-8 diverge (slot 6 at N=7). The server caps batched rows at 6 (BATCH_ROW_CAP). Numbers above 6 concurrent slots are not batched and must not be read as batched results.
+
+## llama-server -np comparison (ai-8c, commit 88344d9)
+MiniCPM5-2B Q4_K_M, llama-server b12182, -ngl 42, q8_0 KV, 8K ctx per slot, ~4.3K-token prompts, 128 gen, quiet GPU.
+| np | agg tok/s | latency |
+|---|---|---|
+| 1 | 38.4 | 3.3 s |
+| 2 | 47.8 | 5.3 s |
+| 4 | 51.4 | 9.9 s |
+| 6 | 52.6 | 14.5 s |
+Raw: bench/results/np-scale/ (ai-8c). Compare with LastEngine rows above only after matching prompt length and context settings; these numbers are not yet matched to our conc_bench.
