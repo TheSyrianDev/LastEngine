@@ -48,7 +48,15 @@ pub fn run(model: &str, ctx: usize) {
     let mut m = load(); m.insert(k.clone(), e.clone());
     let p = path(); std::fs::create_dir_all(p.parent().unwrap()).ok();
     std::fs::write(&p, serde_json::to_string_pretty(&m).unwrap()).expect("write cache");
-    println!("{}", serde_json::json!({"key": k, "kv": e.kv, "chunk": e.chunk, "prefill_tps": e.prefill_tps, "decode_tps": e.decode_tps, "cache": p}));
+    // Device profile for serve auto-load (schema 1): settings are the env vars serve applies when unset.
+    let sha = model_sha(model).expect("model sha");
+    let mut settings = BTreeMap::new();
+    settings.insert("LE_KV".to_string(), e.kv.clone());
+    settings.insert("LE_TMAX".to_string(), e.chunk.to_string());
+    let prof = Profile { schema: PROFILE_SCHEMA, engine: env!("CARGO_PKG_VERSION").into(), device: gpu_name(), model_sha: sha.clone(), ctx, settings, prefill_tps: e.prefill_tps, decode_tps: e.decode_tps, tuned_at: format!("unix:{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)) };
+    let pp_path = profile_path(&prof.device, &sha, ctx);
+    write_profile(&pp_path, &prof).expect("write profile");
+    println!("{}", serde_json::json!({"key": k, "kv": e.kv, "chunk": e.chunk, "prefill_tps": e.prefill_tps, "decode_tps": e.decode_tps, "cache": p, "profile": pp_path}));
 }
 
 /// Per-device profile (docs/autotune-plan.md, schema 1). Written by `tune`, read by `serve` (wiring pending).
