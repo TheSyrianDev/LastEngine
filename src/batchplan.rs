@@ -158,3 +158,28 @@ mod greedy_tests {
         assert_eq!(greedy_rows(&rows), vec![1, 0, 1]);
     }
 }
+
+/// Routing rule for the batched path: only deterministic plain-text requests may use it.
+/// Sampled requests (temperature > 0, or any penalty/top-k/top-p/min-p/seed), tool requests and
+/// thinking-enabled requests stay on the single-sequence `generate` path until the batched loop
+/// supports them. Mirrors the constraints documented in docs/concurrency-plan.md.
+pub fn batched_eligible(temperature: f32, top_p: f32, top_k: usize, min_p: f32, presence_penalty: f32, repeat_penalty: f32, seed: Option<u64>, has_tools: bool, thinking: bool) -> bool {
+    temperature <= 0.0 && (top_p == 0.0 || top_p == 1.0) && top_k == 0 && min_p == 0.0
+        && presence_penalty == 0.0 && (repeat_penalty == 0.0 || repeat_penalty == 1.0) && seed.is_none()
+        && !has_tools && !thinking
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::*;
+    #[test]
+    fn only_plain_greedy_is_batched() {
+        assert!(batched_eligible(0.0, 1.0, 0, 0.0, 0.0, 1.0, None, false, false));
+        assert!(batched_eligible(0.0, 0.0, 0, 0.0, 0.0, 0.0, None, false, false));
+        assert!(!batched_eligible(0.7, 1.0, 0, 0.0, 0.0, 1.0, None, false, false));
+        assert!(!batched_eligible(0.0, 1.0, 40, 0.0, 0.0, 1.0, None, false, false));
+        assert!(!batched_eligible(0.0, 1.0, 0, 0.0, 0.0, 1.0, Some(7), false, false));
+        assert!(!batched_eligible(0.0, 1.0, 0, 0.0, 0.0, 1.0, None, true, false));
+        assert!(!batched_eligible(0.0, 1.0, 0, 0.0, 0.0, 1.0, None, false, true));
+    }
+}
