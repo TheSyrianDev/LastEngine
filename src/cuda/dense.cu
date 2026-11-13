@@ -85,6 +85,12 @@ extern "C" __global__ void dn_attn_rows(const float* q, const __half* kc, const 
     o[h * hd + d] = a / L * g;
   }
 }
+// Row-batched V write (phase 2 step 2): row r holds n_row values at slot rslot[r], position rpos[r]. i indexes N*n_row.
+extern "C" __global__ void dn_cvt_rows(const float* in, __half* base, const int* rpos, const int* rslot, int slot_stride, int n_row, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+  int r = i / n_row, j = i - r * n_row;
+  base[(size_t)rslot[r] * slot_stride + (size_t)rpos[r] * n_row + j] = __float2half(in[i]);
+}
 extern "C" __global__ void dn_cvt_half(const float* in, __half* out, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) out[i] = __float2half(in[i]); }
 // Decode variant: destination row is pdev[0] (device-resident position), so the launch args do not change per token.
 extern "C" __global__ void dn_cvt_half_d(const float* in, __half* base, const int* pdev, int n) { int i = blockIdx.x * blockDim.x + threadIdx.x; if (i < n) base[(size_t)pdev[0] * n + i] = __float2half(in[i]); }
