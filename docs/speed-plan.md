@@ -218,3 +218,4 @@ Incidents: a 10-hour hung ncu run blocked the lock (CEO killed it). My retry at 
 - New is about 14% slower. Default stays off.
 - dense_cmp_gate with LE_MMQR2=1: 14/15 max |dlogprob| 0.0760; 15/15 max 0.0560. Same as default, so the variant is numerically unchanged.
 - Read: the 128-register cap likely causes spills and does not help the ~8-block grid for this prompt. The ncu grid limit (8 blocks) is for the 512-token prompt; the 5K prompt has more blocks, so residency is not the bottleneck at this size. Next candidate, not coded: more blocks for small token counts (smaller row tile) instead of fewer registers.
+- Next-up (parked by peer): dense prefill gap, smaller row tile for small token counts (mmq128r2 at 128 regs was 14% slower; try smaller tile instead).
