@@ -28,6 +28,8 @@ pub enum Cmd {
     DenseCmp { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
     /// Two-slot independence: greedy-decode two prompts solo, then interleaved in slots 0 and 1 (run with LE_SLOTS=2); token streams must match.
     SlotTest { path: String, a: String, b: String, #[arg(default_value_t = 30)] n: usize },
+    /// Phase 2 step 2 gate: greedy N tokens for two prompts, solo vs decode_batch over both slots (LE_SLOTS=2). Prints per-slot match counts.
+    BatchTest { path: String, a: String, b: String, #[arg(default_value_t = 30)] n: usize },
     /// Greedy-decode N tokens on the GPU and print JSON {prompt_ids,gen_ids,top} (top = per step top-5 [id,logprob]) for teacher-forced comparison with another engine
     TfDump { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },

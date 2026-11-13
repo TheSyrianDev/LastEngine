@@ -183,6 +183,37 @@ async fn main() {
             println!("slot A {}/{} tokens match solo; slot B {}/{} match solo", oa.iter().zip(&ra).filter(|(x, y)| x == y).count(), n, ob.iter().zip(&rb).filter(|(x, y)| x == y).count(), n);
             if oa == ra && ob == rb { println!("SLOT INDEPENDENCE OK"); } else { println!("SLOT INDEPENDENCE FAIL"); std::process::exit(1); }
         }
+        cli::Cmd::BatchTest { path, a, b, n } => {
+            let g = gguf::Gguf::open(&path).expect("open");
+            let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
+            let am = |v: &[f32]| v.iter().enumerate().max_by(|x, y| x.1.partial_cmp(y.1).unwrap()).unwrap().0 as u32;
+            let (ia, ib) = (tk.encode(&a), tk.encode(&b));
+            let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
+            assert!(gp.slots() >= 2, "run with LE_SLOTS=2");
+            let mut solo = |ids: &[u32], gp: &mut gpu::dense::DenseGpu| -> Vec<u32> {
+                gp.reset(); gp.set_slot(0);
+                let mut lg = gp.prefill(ids); let mut out = vec![];
+                for _ in 0..n { let t = am(&lg); out.push(t); lg = gp.forward(t); }
+                out
+            };
+            let ra = solo(&ia, &mut gp); let rb = solo(&ib, &mut gp);
+            // Batched: prefill both prompts into their slots, then one decode_batch call per round covering both rows.
+            gp.reset();
+            gp.set_slot(0); let la0 = gp.prefill(&ia);
+            gp.set_slot(1); let lb0 = gp.prefill(&ib);
+            let (mut pa, mut pb) = (ia.len(), ib.len());
+            let (mut la, mut lb) = (la0, lb0);
+            let (mut oa, mut ob) = (vec![], vec![]);
+            for _ in 0..n {
+                let (ta, tb) = (am(&la), am(&lb));
+                oa.push(ta); ob.push(tb);
+                let outs = gp.decode_batch(&[ta, tb], &[0, 1], &[pa, pb]);
+                la = outs[0].clone(); lb = outs[1].clone();
+                pa += 1; pb += 1;
+            }
+            println!("batch A {}/{} tokens match solo; batch B {}/{} match solo", oa.iter().zip(&ra).filter(|(x, y)| x == y).count(), n, ob.iter().zip(&rb).filter(|(x, y)| x == y).count(), n);
+            if oa == ra && ob == rb { println!("BATCH DECODE OK"); } else { println!("BATCH DECODE FAIL"); std::process::exit(1); }
+        }
         cli::Cmd::TfDump { path, prompt, n } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
