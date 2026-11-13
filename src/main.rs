@@ -253,6 +253,7 @@ async fn main() {
                 // outs[i] holds tokens fed in, which equal the greedy choices the solo run emitted at each step.
                 let m = outs[i].iter().zip(&refs[i]).filter(|(a, b)| a == b).count();
                 println!("slot {i}: {m}/{} tokens match solo", refs[i].len());
+                if std::env::var("LE_PRINT_TOK").is_ok() { println!("  toks {i}: {:?}", outs[i]); }
                 if outs[i] != refs[i] { ok = false;
                     if let Some(k) = outs[i].iter().zip(&refs[i]).position(|(a, b)| a != b) { println!("  slot {i} first diverge at step {k}: solo top1-top2 gap {:.6}", ref_gaps[i][k]); if k >= 1 { let d = ref_lgs[i][k].iter().zip(&bat_lgs[i][k-1]).map(|(a,b)| (a-b).abs()).fold(0f32, f32::max); println!("  aligned: solo logits after {} feeds vs batch logits after same feeds: max diff {:.6}; fed solo tok {} batch tok {}", k, d, refs[i][k-1], outs[i][k]); } } }
             }
