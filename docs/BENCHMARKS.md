@@ -161,3 +161,6 @@ RTX 3050 Laptop, MiniCPM5-2B Q4_K_M, `serve --ctx 4096` with `LE_SLOTS=4`, `tool
 | 4 | 2.68 | 256 | 95.4 |
 
 Aggregate is flat from N=2 because the backend mutex serializes requests (one generation at a time). This is the baseline the step-4 batched loop must beat. llama-server `-np 1/2/4/8` numbers still to be measured under the same lock.
+
+## Known bug (batched path)
+Batched decode is identical to solo for 1-6 rows. Rows 7-8 diverge (slot 6 at N=7). The server caps batched rows at 6 (BATCH_ROW_CAP). Numbers above 6 concurrent slots are not batched and must not be read as batched results.

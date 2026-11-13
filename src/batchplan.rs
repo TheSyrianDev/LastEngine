@@ -159,6 +159,9 @@ mod greedy_tests {
     }
 }
 
+/// Interim cap on rows per batched step. Rows 7 and 8 diverge from solo decode (known bug, see docs/concurrency-plan.md); keep at 6 until root-caused.
+pub const BATCH_ROW_CAP: usize = 6;
+
 /// Routing rule for the batched path: only deterministic plain-text requests may use it.
 /// Sampled requests (temperature > 0, or any penalty/top-k/top-p/min-p/seed), tool requests and
 /// thinking-enabled requests stay on the single-sequence `generate` path until the batched loop

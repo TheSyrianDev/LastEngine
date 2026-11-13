@@ -96,3 +96,10 @@ Reference: github.com/satellitedown/cinference (NInfer fork) reports ~450 tok/s 
 - Per-token KV for MiniCPM5 is 42 KiB at f16 (see above). K8V4 would reduce V to 4-bit and K to 8-bit, roughly 0.5x of f16 for the cache (about 21 KiB/token) before scale overhead.
 - Value: fits about twice the slots or context in the 1.9 GB budget at ctx 20000.
 - Gate: dense_cmp (argmax agreement and max |dlogprob|) against f16 KV, plus the API suite; quality loss must be measured, not assumed.
+
+## Known bug: batched decode rows 7-8 (2026-11-13)
+- Batch-loop gate (CLI batch-loop, LE_SLOTS=N, LE_ROWS=1, MiniCPM5-2B Q4_K_M, 20 tokens): N=1-6 every slot identical to solo (20/20 or 30/30).
+- N=7: slot 6 5/20 match. N=8: slot 6 5/20, slot 7 12/20.
+- Not caused by LE_MMQR (128-row GEMM tile) or LE_ROWS toggles.
+- Interim: batched_eligible route caps rows at BATCH_ROW_CAP = 6 (src/batchplan.rs). Rows above 6 must stay on the single path.
+- Suspects: row kernels dn_prep_rows, dn_attn_rows, dn_cvt_rows (src/cuda/dense.cu) and decode_batch metadata (src/gpu/dense.rs:279). First read of the kernels found no obvious bug.
