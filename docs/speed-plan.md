@@ -209,3 +209,12 @@ Caveats: the two kernels were not the same GEMM shape (launch index and token co
 Proposed single fix (not coded, awaiting CEO go-ahead): cut registers in mmq128r_impl below ~128 so 2 blocks fit per SM, and/or split the grid so the 128-row variant launches at least 20 blocks for small token counts. Measure first with a same-shape A/B before any default change.
 
 Incidents: a 10-hour hung ncu run blocked the lock (CEO killed it). My retry at 22:15 and a llama ncu run after the CEO's stop instruction were both killed by the CEO. Lock released. Do not run --set full; if retried, use SpeedOfLight and MemoryWorkloadAnalysis with --launch-count 1 and timeout outside sudo.
+
+## mmq128r2 A/B: launch_bounds(256,2) register cap (opt-in LE_MMQR2=1), 2026-11-13
+
+- Same-session A/B on the 5023-token prompt, first evt wall (whole prefill), 3 starts each, machine-lock held, balanced power mode:
+  - old (LE_MMQR2=0): 2403.5 / 2401.6 / 2416.8 ms
+  - new (LE_MMQR2=1): 2744.0 / 2747.5 / 2749.3 ms
+- New is about 14% slower. Default stays off.
+- dense_cmp_gate with LE_MMQR2=1: 14/15 max |dlogprob| 0.0760; 15/15 max 0.0560. Same as default, so the variant is numerically unchanged.
+- Read: the 128-register cap likely causes spills and does not help the ~8-block grid for this prompt. The ncu grid limit (8 blocks) is for the 512-token prompt; the 5K prompt has more blocks, so residency is not the bottleneck at this size. Next candidate, not coded: more blocks for small token counts (smaller row tile) instead of fewer registers.
