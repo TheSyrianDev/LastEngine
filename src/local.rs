@@ -88,7 +88,8 @@ impl Splitter {
             if self.mode == 0 {
                 // MiniCPM-style calls have no <tool_call> wrapper: the text starts at <function name="
                 const FN: &str = "<function name=\"";
-                let (pt, pf) = (self.buf.find("<tool_call>"), self.buf.find(FN));
+                let pf = match (self.buf.find(FN), self.buf.find("<function=")) { (Some(x), Some(y)) => Some(x.min(y)), (x, y) => x.or(y) };
+                let pt = self.buf.find("<tool_call>");
                 if let Some(pf) = pf.filter(|&f| pt.map_or(true, |t| f < t)) {
                     let head = self.buf[..pf].to_string();
                     if !head.is_empty() { out.push(Delta::Content(head)); }
@@ -106,7 +107,7 @@ impl Splitter {
             // hold back a possible partial marker at the end
             let mut hold = 0;
             for i in 1..marker.len().min(self.buf.len() + 1) { if self.buf.is_char_boundary(self.buf.len() - i) && marker.starts_with(&self.buf[self.buf.len() - i..]) { hold = i; } }
-            if self.mode == 0 { for i in 1..16usize.min(self.buf.len() + 1) { if self.buf.is_char_boundary(self.buf.len() - i) && "<function name=\"".starts_with(&self.buf[self.buf.len() - i..]) { hold = hold.max(i); } } }
+            if self.mode == 0 { for i in 1..16usize.min(self.buf.len() + 1) { if self.buf.is_char_boundary(self.buf.len() - i) && ("<function name=\"".starts_with(&self.buf[self.buf.len() - i..]) || "<function=".starts_with(&self.buf[self.buf.len() - i..])) { hold = hold.max(i); } } }
             let emit_to = self.buf.len() - hold;
             if emit_to > 0 { let t = self.buf[..emit_to].to_string(); out.push(if self.mode == 1 { Delta::Reasoning(t) } else { Delta::Content(t) }); self.buf = self.buf[emit_to..].to_string(); }
             return;
@@ -121,7 +122,9 @@ impl Splitter {
 
 fn parse_tools(s: &str) -> Vec<ToolCall> {
     let mut v = vec![];
-    for blk in s.split("<tool_call>").skip(1) {
+    // Calls are normally wrapped in <tool_call>. Some models emit bare <function=...> text in content; parse that too.
+    let blocks: Vec<&str> = if s.contains("<tool_call>") { s.split("<tool_call>").skip(1).collect() } else { vec![s] };
+    for blk in blocks {
         if let Some(a) = blk.find("<function name=\"") {
             let rest = &blk[a + 16..];
             let Some(e) = rest.find('"') else { continue };
@@ -268,5 +271,23 @@ impl Backend for Local {
         let tool_calls = parse_tools(&sp.tool);
         if !tool_calls.is_empty() && reason == "stop" { reason = "tool_calls"; }
         Usage { prompt_tokens: ids.len(), completion_tokens: n, cached_tokens: cached, prefill_ms, tool_calls, finish_reason: reason }
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::parse_tools;
+    #[test]
+    fn bare_function_markup_without_wrapper() {
+        let c = parse_tools("<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "get_weather");
+        assert!(c[0].arguments.contains("Paris"));
+    }
+    #[test]
+    fn wrapped_call_still_parses() {
+        let c = parse_tools("<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].name, "get_weather");
     }
 }
