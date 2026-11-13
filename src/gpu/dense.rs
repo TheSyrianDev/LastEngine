@@ -24,6 +24,8 @@ pub struct DenseGpu {
     drow: Dp, rows: bool,
     /// decode_batch metadata: [pos x N][slot x N][len x N][zeros x N] as i32.
     dmeta: Dp,
+    /// Block table for decode_batch (LE_BT=1): i32 [row][block], identity map slot*mb+j, mb = ctx_len/16.
+    dbtab: Dp, bt: bool,
     /// CUDA graphs of the decode layer loop, keyed by the per-layer split-K choice.
     graphs: HashMap<Vec<bool>, GraphBox>,
     kc: Vec<Dp>, vc: Vec<Dp>, conv: Vec<Dp>, pos: usize, ctx_len: usize,
@@ -66,7 +68,7 @@ impl DenseGpu {
         let ptx = compile_ptx_with_opts(kernel_source(), opts).unwrap_or_else(|e| panic!("nvrtc: {e:?}"));
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
-        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "mmq128r2_2", "mmq128r2_8", "mmq128r2_11", "mmq128r2_12", "mmq128r2_13", "mmq128r2_14", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_prep_rows", "dn_attn_rows", "dn_cvt_rows", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
+        for n in ["quant_x", "matvec_8", "matvec_12", "matvec_14", "matvec_11", "matvec_13", "matvec_2", "rmsnorm", "add_inplace", "swiglu", "swiglu_gu", "dn_prep", "dn_prep_rows_bt", "dn_cvt_rows_bt", "dn_cvt_half", "dn_cvt_half_d", "dn_attn", "dn_flash_128", "dn_flash_128b", "dn_qkv_dec", "rms_quant", "zero_f", "mmq128r2_2", "mmq128r2_8", "mmq128r2_11", "mmq128r2_12", "mmq128r2_13", "mmq128r2_14", "dn_attn_split", "dn_attn_gqa", "dn_attn_comb", "dn_prep_rows", "dn_attn_rows", "dn_cvt_rows", "dn_shortconv", "dn_shortconv_b", "rmsnorm_b", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq128_2", "mmq128_8", "mmq128_11", "mmq128_12", "mmq128_13", "mmq128_14", "mmq128r_2", "mmq128r_8", "mmq128r_11", "mmq128r_12", "mmq128r_13", "mmq128r_14"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
         let mat = |name: &str| -> W { let (t, b) = m.bytes(name); let d = dup(b); W { cell: dup(&[d]), ty: t.ty, rows: t.dims[1], cols: t.dims[0], raw: d } };
@@ -124,7 +126,7 @@ impl DenseGpu {
         DenseGpu {
             _ctx: ctx, st, f, out_norm: vecd("output_norm.weight"), out_w, ff,
             x: fb(m.n_embd), h: fb(m.n_embd), q: fb(m.n_head * hd), k: fb(nkv * hd), v: fb(nkv * hd), g: fb(big), o: fb(m.n_head * hd), t1: fb(big), t2: fb(m.n_embd), u: fb(ffn), a: fb(2 * ffn), logits: fb(m.vocab),
-            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), drow: dalloc(4 * 64), dmeta: dalloc(4 * CH * 4), rows: std::env::var("LE_ROWS").map_or(false, |v| v == "1"), fused_qkv: std::env::var("LE_DN_QKV").map_or(true, |v| v != "0"), rmsq: std::env::var("LE_RMSQ").map_or(true, |v| v != "0"), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
+            part: dalloc(m.n_head * 128 * (hd + 2) * 4), dpos: dalloc(8), drow: dalloc(4 * 64), dmeta: dalloc(4 * CH * 4), dbtab: dalloc(4 * CH * (ctx_len / 16 + 1)), bt: std::env::var("LE_BT").map_or(false, |v| v == "1"), rows: std::env::var("LE_ROWS").map_or(false, |v| v == "1"), fused_qkv: std::env::var("LE_DN_QKV").map_or(true, |v| v != "0"), rmsq: std::env::var("LE_RMSQ").map_or(true, |v| v != "0"), graphs: HashMap::new(), xqb: dalloc(big.max(32768)), xdb: dalloc(big / 8 + 64), xsb: dalloc(big / 8 + 64),
             kc, vc, conv, pos: 0, ctx_len, lay, kv_base, slots, slot: 0, slot_pos: vec![0; slots],
             bx: dalloc(CH * m.n_embd * 4), bh: dalloc(CH * m.n_embd * 4), bq: dalloc(CH * m.n_head * hd * 4), bk: dalloc(CH * nkv * hd * 4), bv: dalloc(CH * nkv * hd * 4),
             bg: dalloc(CH * (3 * m.n_embd).max(m.n_head) * 4), bo: dalloc(CH * m.n_head * hd * 4), bt1: dalloc(CH * m.n_embd * 4), bt2: dalloc(CH * m.n_embd * 4), bgu: dalloc(CH * 2 * ffn * 4), ba: dalloc(CH * ffn * 4),
@@ -299,6 +301,13 @@ impl DenseGpu {
         let lfm = m.kind == Kind::Lfm3;
         let (dpos, dslot, dlen, dzero) = (self.dmeta, self.dmeta + (t * 4) as u64, self.dmeta + (2 * t * 4) as u64, self.dmeta + (3 * t * 4) as u64);
         let slot_stride = (self.ctx_len * nkv * hd) as i32;
+        let mb = self.ctx_len / 16;
+        if self.bt {
+            assert!(self.ctx_len % 16 == 0, "LE_BT needs ctx_len multiple of 16");
+            let tab: Vec<i32> = slots.iter().flat_map(|&s| (0..mb).map(move |j| (s * mb + j) as i32)).collect();
+            unsafe { result::memcpy_htod_sync(self.dbtab, &tab).unwrap(); }
+        }
+        let dbtab = self.dbtab;
         let neox = m.neox as i32;
         for l in 0..m.n_layer {
             let d = &self.lay[l];
@@ -309,8 +318,13 @@ impl DenseGpu {
             let base = if d.swa { m.rope_base_swa } else { m.rope_base };
             let ff = if d.swa { 0 } else { self.ff };
             self.launch3("dn_prep_rows", (nh as u32, t as u32, 1), 128, &[P(self.bq), P(self.bq), I(0), I(hd as i32), I(m.rope_dim as i32), F(base), P(ff), I(neox), P(d.qn), F(m.eps), P(dpos), I(0), P(dzero), I(0)]);
+            if self.bt {
+                self.launch3("dn_prep_rows_bt", (nkv as u32, t as u32, 1), 128, &[P(self.bk), P(self.kv_base[l].0), I(1), I(hd as i32), I(m.rope_dim as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(dpos), I((nkv * hd) as i32), P(dbtab), I(mb as i32)]);
+                self.launch3("dn_cvt_rows_bt", ((t * nkv * hd).div_ceil(128) as u32, 1, 1), 128, &[P(self.bv), P(self.kv_base[l].1), P(dpos), P(dbtab), I(mb as i32), I((nkv * hd) as i32), I((t * nkv * hd) as i32)]);
+            } else {
             self.launch3("dn_prep_rows", (nkv as u32, t as u32, 1), 128, &[P(self.bk), P(self.kv_base[l].0), I(1), I(hd as i32), I(m.rope_dim as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(dpos), I((nkv * hd) as i32), P(dslot), I(slot_stride)]);
             self.launch3("dn_cvt_rows", ((t * nkv * hd).div_ceil(128) as u32, 1, 1), 128, &[P(self.bv), P(self.kv_base[l].1), P(dpos), P(dslot), I(slot_stride), I((nkv * hd) as i32), I((t * nkv * hd) as i32)]);
+            }
             let win = if d.swa { m.window } else { 0 };
             self.launch3("dn_attn_rows", (nh as u32, t as u32, 1), 256, &[P(self.bq), P(self.kv_base[l].0), P(self.kv_base[l].1), P(if lfm { self.bg } else { 0 }), P(self.bo), I(win as i32), I(nh as i32), I(nkv as i32), I(hd as i32), P(dlen), P(dslot), I(slot_stride)]);
             self.bqx(self.bo, t, nh * hd);

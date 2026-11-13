@@ -313,3 +313,39 @@ extern "C" __global__ void dn_attn_comb(const float* part, const float* gate, fl
     o[h * hd + d] = a / L * g;
   }
 }
+
+// Block-table variants (vLLM step 2): physical token = btab[r*mb + pos/16]*16 + pos%16 (block size 16, mb = blocks per slot).
+// Used by decode_batch only. With the identity table btab[r*mb+j] = slot*mb + j this equals the rslot/slot_stride form exactly.
+extern "C" __global__ void dn_prep_rows_bt(const float* in, void* out, int out_half, int hd, int rope_dim, float base, const float* ff, int neox, const float* nw, float eps, const int* rpos, int rstride, const int* btab, int mb) {
+  __shared__ float v[256]; __shared__ float red[8];
+  int h = blockIdx.x; int r = blockIdx.y; int pos = rpos[r];
+  size_t phys = (size_t)btab[(size_t)r * mb + pos / 16] * 16 + (pos & 15);
+  size_t tb = (size_t)r * gridDim.x * hd; size_t ob = phys * (size_t)rstride; in += tb + (size_t)h * hd;
+  for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = in[i];
+  __syncthreads();
+  float sc = 1.f;
+  if (nw) {
+    float s = 0.f; for (int i = threadIdx.x; i < hd; i += blockDim.x) s += v[i] * v[i];
+    s = warp_sum(s); if ((threadIdx.x & 31) == 0) red[threadIdx.x >> 5] = s; __syncthreads();
+    float t = 0.f; for (int w = 0; w < (int)(blockDim.x >> 5); w++) t += red[w];
+    sc = rsqrtf(t / hd + eps); __syncthreads();
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = v[i] * sc * nw[i];
+    __syncthreads();
+  }
+  int half = rope_dim / 2;
+  for (int i = threadIdx.x; i < half; i += blockDim.x) {
+    float th = pos * powf(base, -(2.f * i) / rope_dim); if (ff) th /= ff[i];
+    float s, c; sincosf(th, &s, &c);
+    int ia = neox ? i : 2 * i, ib = neox ? i + half : 2 * i + 1;
+    float a = v[ia], b = v[ib]; v[ia] = a * c - b * s; v[ib] = a * s + b * c;
+  }
+  __syncthreads();
+  if (out_half) { __half* o = (__half*)out + ob + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
+  else { float* o = (float*)out + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
+}
+extern "C" __global__ void dn_cvt_rows_bt(const float* in, __half* base, const int* rpos, const int* btab, int mb, int n_row, int n) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x; if (i >= n) return;
+  int r = i / n_row, j = i - r * n_row; int pos = rpos[r];
+  size_t phys = (size_t)btab[(size_t)r * mb + pos / 16] * 16 + (pos & 15);
+  base[phys * (size_t)n_row + j] = __float2half(in[i]);
+}
