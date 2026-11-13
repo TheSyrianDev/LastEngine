@@ -254,7 +254,7 @@ async fn main() {
                 let m = outs[i].iter().zip(&refs[i]).filter(|(a, b)| a == b).count();
                 println!("slot {i}: {m}/{} tokens match solo", refs[i].len());
                 if outs[i] != refs[i] { ok = false;
-                    if let Some(k) = outs[i].iter().zip(&refs[i]).position(|(a, b)| a != b) { println!("  slot {i} first diverge at step {k}: solo top1-top2 gap {:.6}", ref_gaps[i][k]); let d = ref_lgs[i][k].iter().zip(&bat_lgs[i][k]).map(|(a,b)| (a-b).abs()).fold(0f32, f32::max); println!("  max |solo-batch| logit diff at that step {:.6}", d); } }
+                    if let Some(k) = outs[i].iter().zip(&refs[i]).position(|(a, b)| a != b) { println!("  slot {i} first diverge at step {k}: solo top1-top2 gap {:.6}", ref_gaps[i][k]); if k >= 1 { let d = ref_lgs[i][k].iter().zip(&bat_lgs[i][k-1]).map(|(a,b)| (a-b).abs()).fold(0f32, f32::max); println!("  aligned: solo logits after {} feeds vs batch logits after same feeds: max diff {:.6}; fed solo tok {} batch tok {}", k, d, refs[i][k-1], outs[i][k]); } } }
             }
             println!("steps {steps}");
             if ok { println!("BATCH LOOP OK"); } else { println!("BATCH LOOP FAIL"); std::process::exit(1); }
