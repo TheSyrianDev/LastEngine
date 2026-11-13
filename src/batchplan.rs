@@ -84,3 +84,57 @@ mod tests {
         assert_eq!(advance(&mut s, 9, &[], 4096), Some(Finish::Length));
     }
 }
+
+/// Drive one batched-decode loop over a fixed set of requests, with a caller-supplied step function.
+/// `step(plan) -> sampled tokens` (one per row of the plan, same order). Finished sequences are
+/// reported through `done(id, reason)`. Returns the number of steps taken. Pure logic: the GPU
+/// backend supplies `step` as a `decode_batch` + sampler call.
+pub fn run_loop<F, D>(seqs: &mut Vec<(u64, Seq)>, eos: &[u32], ctx_len: usize, max_rows: usize, mut step: F, mut done: D) -> usize
+where F: FnMut(&StepInput) -> Vec<u32>, D: FnMut(u64, Finish) {
+    let mut steps = 0;
+    while !seqs.is_empty() {
+        let view: Vec<Seq> = seqs.iter().map(|(_, s)| s.clone()).collect();
+        let plan = plan_step(&view, ctx_len, max_rows);
+        if plan.rows.is_empty() { break; }
+        let toks = step(&plan);
+        assert_eq!(toks.len(), plan.rows.len(), "step must return one token per row");
+        steps += 1;
+        let mut retire = vec![];
+        for (k, &row) in plan.rows.iter().enumerate() {
+            if let Some(r) = advance(&mut seqs[row].1, toks[k], eos, ctx_len) { retire.push((row, r)); }
+        }
+        // Remove from the back so indices stay valid.
+        retire.sort_by(|a, b| b.0.cmp(&a.0));
+        for (row, r) in retire { let (id, _) = seqs.remove(row); done(id, r); }
+    }
+    steps
+}
+
+#[cfg(test)]
+mod loop_tests {
+    use super::*;
+    fn seq(slot: usize, pos: usize, tok: u32, max: usize) -> Seq { Seq { slot, pos, next_tok: tok, generated: 0, max_tokens: max } }
+
+    #[test]
+    fn loop_runs_all_sequences_to_their_limits() {
+        let mut seqs = vec![(1u64, seq(0, 10, 5, 3)), (2u64, seq(1, 20, 6, 5))];
+        let mut finished = vec![];
+        let steps = run_loop(&mut seqs, &[], 4096, 8, |p| p.toks.iter().map(|t| t + 1).collect(), |id, r| finished.push((id, r)));
+        assert_eq!(steps, 5);
+        assert_eq!(finished, vec![(1, Finish::Length), (2, Finish::Length)]);
+        assert!(seqs.is_empty());
+    }
+
+    #[test]
+    fn loop_retires_on_eos_and_keeps_others() {
+        let mut seqs = vec![(1u64, seq(0, 10, 0, 100)), (2u64, seq(1, 10, 0, 100))];
+        let mut finished = vec![];
+        // Sequence 1 emits EOS (2) immediately; sequence 2 keeps going until its length limit.
+        let mut calls = 0;
+        run_loop(&mut seqs, &[2], 4096, 8, |p| { calls += 1; p.slots.iter().map(|&sl| if sl == 0 { 2 } else { 7 }).collect() }, |id, r| finished.push((id, r)));
+        // Seq 1 finishes at the first step; seq 2 continues alone for its full 100 tokens.
+        assert_eq!(finished, vec![(1, Finish::Eos), (2, Finish::Length)]);
+        assert_eq!(calls, 100);
+        assert!(seqs.is_empty());
+    }
+}
