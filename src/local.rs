@@ -48,7 +48,7 @@ fn fix_messages(msgs: &[Value]) -> Vec<Value> {
         }
         if m["content"].is_null() { m["content"] = json!(""); }
         if let Some(tc) = m["tool_calls"].as_array_mut() {
-            for c in tc { if let Some(s) = c["function"]["arguments"].as_str() { if let Ok(v) = serde_json::from_str::<Value>(s) { c["function"]["arguments"] = v; } } }
+            for c in tc { if let Some(s) = c["function"]["arguments"].as_str() { c["function"]["arguments"] = serde_json::from_str::<Value>(s).ok().filter(|v| v.is_object()).unwrap_or_else(|| json!({"_raw": s})); } }
         }
         m
     }).collect()
