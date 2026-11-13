@@ -165,7 +165,7 @@ async fn chat(State(app): State<Arc<App>>, raw: axum::body::Bytes) -> axum::resp
     }
     if let Some(t) = body["temperature"].as_f64() { if !(0.0..=2.0).contains(&t) { return api_error(400, "invalid_request_error", "invalid_temperature", "'temperature' must be between 0 and 2"); } }
     if let Some(p) = body["top_p"].as_f64() { if !(p > 0.0 && p <= 1.0) { return api_error(400, "invalid_request_error", "invalid_top_p", "'top_p' must be in (0, 1]"); } }
-    if let Some(m) = body["max_tokens"].as_u64().or(body["max_completion_tokens"].as_u64()) { if m == 0 { return api_error(400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be at least 1"); } }
+    for k in ["max_tokens", "max_completion_tokens"] { if !body[k].is_null() && body[k].as_u64().map_or(true, |m| m == 0) { return api_error(400, "invalid_request_error", "invalid_max_tokens", "'max_tokens' must be a positive integer"); } }
     // tool_choice: "none" hides tools; a named function keeps only that tool, so the model can only call it.
     let tc = &body["tool_choice"];
     let all_tools = body.get("tools").and_then(|t| t.as_array()).cloned().unwrap_or_default();
