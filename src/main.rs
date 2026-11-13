@@ -224,12 +224,13 @@ async fn main() {
             let mut gp = gpu::dense::DenseGpu::new(dense::Dense::load(&path, &g), 4096);
             assert!(gp.slots() >= ps.len(), "run with LE_SLOTS>={}", ps.len());
             // Solo reference per prompt, slot 0.
-            let mut refs = vec![];
+            let mut refs = vec![]; let mut ref_gaps: Vec<Vec<f32>> = vec![]; let mut ref_lgs: Vec<Vec<Vec<f32>>> = vec![];
             for ids in &ps {
                 gp.reset(); gp.set_slot(0);
                 let mut lg = gp.prefill(ids); let mut out = vec![];
-                for _ in 0..n { let t = am(&lg); out.push(t); lg = gp.forward(t); }
-                refs.push(out);
+                let mut gaps = vec![]; let mut lgs: Vec<Vec<f32>> = vec![];
+                for _ in 0..n { let t = am(&lg); let (mut t1, mut t2) = (f32::MIN, f32::MIN); for &v in &lg { if v > t1 { t2 = t1; t1 = v; } else if v > t2 { t2 = v; } } gaps.push(t1 - t2); lgs.push(lg.clone()); out.push(t); lg = gp.forward(t); }
+                refs.push(out); ref_gaps.push(gaps); ref_lgs.push(lgs);
             }
             // Batched via run_loop: prefill each prompt into its own slot, then loop.
             gp.reset();
@@ -238,12 +239,13 @@ async fn main() {
                 gp.set_slot(i); let lg = gp.prefill(ids);
                 seqs.push((i as u64, batchplan::Seq { slot: i, pos: ids.len(), next_tok: am(&lg), generated: 0, max_tokens: n }));
             }
-            let mut outs: Vec<Vec<u32>> = vec![vec![]; ps.len()];
+            let mut outs: Vec<Vec<u32>> = vec![vec![]; ps.len()]; let mut bat_lgs: Vec<Vec<Vec<f32>>> = vec![vec![]; ps.len()];
             let mut pending: Vec<(usize, u32)> = vec![];
             let steps = batchplan::run_loop(&mut seqs, &[], 4096, gp.slots(), |plan| {
                 // Record the token each row is about to consume, then run one batched decode.
                 for (k, &tok) in plan.toks.iter().enumerate() { outs[plan.slots[k]].push(tok); pending.push((plan.slots[k], tok)); }
                 let logits = gp.decode_batch(&plan.toks, &plan.slots, &plan.poss);
+                for (k, row) in logits.iter().enumerate() { bat_lgs[plan.slots[k]].push(row.clone()); }
                 batchplan::greedy_rows(&logits)
             }, |_, _| {});
             let mut ok = true;
@@ -251,7 +253,8 @@ async fn main() {
                 // outs[i] holds tokens fed in, which equal the greedy choices the solo run emitted at each step.
                 let m = outs[i].iter().zip(&refs[i]).filter(|(a, b)| a == b).count();
                 println!("slot {i}: {m}/{} tokens match solo", refs[i].len());
-                if outs[i] != refs[i] { ok = false; }
+                if outs[i] != refs[i] { ok = false;
+                    if let Some(k) = outs[i].iter().zip(&refs[i]).position(|(a, b)| a != b) { println!("  slot {i} first diverge at step {k}: solo top1-top2 gap {:.6}", ref_gaps[i][k]); let d = ref_lgs[i][k].iter().zip(&bat_lgs[i][k]).map(|(a,b)| (a-b).abs()).fold(0f32, f32::max); println!("  max |solo-batch| logit diff at that step {:.6}", d); } }
             }
             println!("steps {steps}");
             if ok { println!("BATCH LOOP OK"); } else { println!("BATCH LOOP FAIL"); std::process::exit(1); }
