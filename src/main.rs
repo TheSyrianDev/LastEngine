@@ -13,6 +13,7 @@ mod quant;
 mod sched;
 mod batchplan;
 mod batchgen;
+mod reqsched;
 mod blockalloc;
 mod blocktable;
 mod batchworker;
