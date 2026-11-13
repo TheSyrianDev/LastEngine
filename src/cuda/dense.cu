@@ -25,12 +25,12 @@ extern "C" __global__ void dn_prep(const float* in, void* out, int out_half, int
   if (out_half) { __half* o = (__half*)out + ob + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = __float2half(v[i]); }
   else { float* o = (float*)out + ob + tb + (size_t)h * hd; for (int i = threadIdx.x; i < hd; i += blockDim.x) o[i] = v[i]; }
 }
-// Row-batched variant of dn_prep (phase 2 step 3): row r (blockIdx.y) takes its position from rpos[r]; K/V rows land at rpos[r]*rstride.
+// Row-batched variant of dn_prep (phase 2 step 3): row r (blockIdx.y) takes its position from rpos[r] and KV slot from rslot[r]; writes at rslot[r]*slot_stride + rpos[r]*rstride.
 // Grid (heads, rows). Same math as dn_prep; for rows=1 with rpos[0]=pos it must equal dn_prep(pdev=[pos]).
-extern "C" __global__ void dn_prep_rows(const float* in, void* out, int out_half, int hd, int rope_dim, float base, const float* ff, int neox, const float* nw, float eps, const int* rpos, int rstride) {
+extern "C" __global__ void dn_prep_rows(const float* in, void* out, int out_half, int hd, int rope_dim, float base, const float* ff, int neox, const float* nw, float eps, const int* rpos, int rstride, const int* rslot, int slot_stride) {
   __shared__ float v[256]; __shared__ float red[8];
   int h = blockIdx.x; int r = blockIdx.y; int pos = rpos[r];
-  size_t tb = (size_t)r * gridDim.x * hd; size_t ob = (size_t)pos * rstride; in += tb + (size_t)h * hd;
+  size_t tb = (size_t)r * gridDim.x * hd; size_t ob = (size_t)rslot[r] * (size_t)slot_stride + (size_t)pos * rstride; in += tb + (size_t)h * hd;
   for (int i = threadIdx.x; i < hd; i += blockDim.x) v[i] = in[i];
   __syncthreads();
   float sc = 1.f;

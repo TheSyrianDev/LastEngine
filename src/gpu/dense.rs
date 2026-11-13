@@ -309,7 +309,7 @@ impl DenseGpu {
                 let neox = m.neox as i32;
                 if self.fused_qkv { self.launch("dn_qkv_dec", (nh + nkv) as u32, 128, 0, &[P(self.q), P(self.k), P(self.v), P(self.kc[l]), P(self.vc[l]), P(self.dpos), I(self.pos as i32), I(nh as i32), I(nkv as i32), I(hd as i32), I(m.rope_dim as i32), F(base), P(ff), I(neox), P(d.qn), P(d.kn), F(m.eps)]); } else {
                 self.launch("dn_prep", nh as u32, 128, 0, &[P(self.q), P(self.q), I(0), I(hd as i32), I(m.rope_dim as i32), I(self.pos as i32), F(base), P(ff), I(neox), P(d.qn), F(m.eps), P(self.dpos), I(0)]);
-                if self.rows { self.launch3("dn_prep_rows", (nkv as u32, 1, 1), 128, &[P(self.k), P(self.kc[l]), I(1), I(hd as i32), I(m.rope_dim as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(self.drow), I((nkv * hd) as i32)]); } else {
+                if self.rows { self.launch3("dn_prep_rows", (nkv as u32, 1, 1), 128, &[P(self.k), P(self.kc[l]), I(1), I(hd as i32), I(m.rope_dim as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(self.drow), I((nkv * hd) as i32), P(self.drow + 8), I((self.ctx_len * nkv * hd * 2) as i32)]); } else {
                 self.launch("dn_prep", nkv as u32, 128, 0, &[P(self.k), P(self.kc[l]), I(1), I(hd as i32), I(m.rope_dim as i32), I(self.pos as i32), F(base), P(ff), I(neox), P(d.kn), F(m.eps), P(self.dpos), I((nkv * hd) as i32)]); }
                 self.launch("dn_cvt_half_d", (nkv * hd).div_ceil(128) as u32, 128, 0, &[P(self.v), P(self.vc[l]), P(self.dpos), I((nkv * hd) as i32)]);
                 }
