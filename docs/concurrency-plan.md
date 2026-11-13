@@ -77,7 +77,8 @@ Blocker to flag: step 1 touches every KV kernel and the graph capture. It is mul
 
 Reference: github.com/satellitedown/cinference (NInfer fork) reports ~450 tok/s on Qwen3.8-27B on an RTX 5090, using (a) 8 batched lanes, (b) MTP speculative decoding, (c) K8V4 KV cache. Figures are their claim, not measured here.
 
-**Phase 9 candidate: MTP speculative decoding (window up to 10, CUDA graphs per topology class).**
+**Phase 9 candidate (EXPERIMENTAL, lowest priority): MTP speculative decoding (window up to 10, CUDA graphs per topology class).**
+- Omar reports Cinference's MTP speculative decoding always fails on his machine. If ever built, it MUST fall back automatically to normal decode on any failure (load, capture, or verification mismatch), with no change in output.
 - Uses the model's own multi-token-prediction heads as the draft.
 - Our models, checked 2026-11-13:
   - `MiniCPM5-2B-Q4_K_M.gguf` (arch `llama`, 42 layers): no `nextn`/`mtp` metadata or tensors found in the header. No MTP heads, so it would need a separate draft model.
@@ -85,7 +86,7 @@ Reference: github.com/satellitedown/cinference (NInfer fork) reports ~450 tok/s 
   - Sage: not checked (RAM busy).
 - Gate: token-for-token identical to greedy non-speculative output; net tok/s gain at 1 client.
 
-**Phase 10 candidate: K8V4 KV cache (K 8-bit, V 4-bit).**
+**Phase 10 candidate (stays a candidate): K8V4 KV cache (K 8-bit, V 4-bit).**
 - Per-token KV for MiniCPM5 is 42 KiB at f16 (see above). K8V4 would reduce V to 4-bit and K to 8-bit, roughly 0.5x of f16 for the cache (about 21 KiB/token) before scale overhead.
 - Value: fits about twice the slots or context in the 1.9 GB budget at ctx 20000.
 - Gate: dense_cmp (argmax agreement and max |dlogprob|) against f16 KV, plus the API suite; quality loss must be measured, not assumed.
