@@ -12,6 +12,7 @@ mod server;
 mod quant;
 mod sched;
 mod batchplan;
+mod batchworker;
 mod quant_ik;
 #[path = "quant_ik_tables.rs"]
 mod quant_ik_tables;
