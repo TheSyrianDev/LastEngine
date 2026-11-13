@@ -10,6 +10,7 @@ mod gpu;
 mod local;
 mod server;
 mod quant;
+mod sched;
 mod quant_ik;
 #[path = "quant_ik_tables.rs"]
 mod quant_ik_tables;
