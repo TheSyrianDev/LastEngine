@@ -30,3 +30,9 @@ Branch `concurrency-p3`, local only, nothing pushed. Last commit `c740d84`.
 - S5 DONE: per-request sampler `batchgen::Picker` (temperature/top_p, xorshift per request), commit c740d84; unit test 47/47; smoke tools/s5_sampling_smoke.sh non-empty. Determinism across restarts not yet gated (seed is a per-request counter).
 - -np 8 bench: docs/BENCHMARKS.md section added. Our batch path flat at ~96 tok/s from N=4; llama -np 8 reaches 336 at N=8. Known bug: batched rows >6 diverge (BATCH_ROW_CAP=6), so the N=8 LE number is invalid. N=1/2 LE rows lost; rerun tools/np8_bench.sh.
 - Open next: fix rows 7-8 divergence, then scale-up of batch throughput; determinism gate for sampling; push needs Omar's approval.
+
+## Update (step 1 and step 2)
+- Step 1 DONE e2fe0f0: serve_interleaved (budget_step decodes + chunked prefill via DenseGpu::prefill_at), LE_CHUNK/LE_BUDGET. tools/chunk_gate.sh: 4/4 concurrent requests equal solo. Not benchmarked yet.
+- Step 2 DONE (profile): tools/prof_decode_n4.sh (LE_PROF=1 batch-gen, N=4, 64 tokens). Per-kernel share of decode_batch: mmq128r_12 74%, mmq128r_14 16%, matvec_14 2%, quant_x 2%, dn_flash_128b 0.8%. dn_attn_rows was NOT the bottleneck; the earlier hypothesis (attention limits throughput) is wrong.
+- Finding: decode_batch runs its weight GEMM through the prefill-style mmq128r kernel even at 4 rows, so each weight is streamed with little reuse across rows. The next lever is a small-N Q4_K GEMV that reads each weight once and produces all N row outputs (N<=8). Step 3 = write and gate that kernel (batch-invariance and solo-equality gates).
+- Still open: rows above 6 diverge (BATCH_ROW_CAP=6); sampling determinism gate; beat llama.cpp (not met: N=8 LE 96 tok/s vs llama 337).
