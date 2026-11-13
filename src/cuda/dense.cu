@@ -101,12 +101,14 @@ extern "C" __global__ void rms_quant(const float* x, const float* w, float* o, s
   // Wider n: sum loop is per-warp, so latency is one warp's pass over n; blocks run in parallel across the grid.
   __shared__ float r_s;
   int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-  if (warp == 0) {
-    float s = 0.f; for (int i = lane; i < n; i += 32) s += x[i] * x[i];
-    s = warp_sum(s); if (lane == 0) r_s = rsqrtf(s / n + eps);
-  }
+  // Same reduction order as rmsnorm/rmsnorm_b (256-thread strided sum, warp sums, then warp 0 over warp partials).
+  // A different order gives ULP-level differences in r that flip near-tie tokens between solo and batched decode.
+  __shared__ float red[32];
+  float s = 0.f; for (int i = threadIdx.x; i < n; i += blockDim.x) s += x[i] * x[i];
+  s = warp_sum(s); if (lane == 0) red[warp] = s; __syncthreads();
+  if (threadIdx.x < 32) { float v = threadIdx.x < (blockDim.x >> 5) ? red[threadIdx.x] : 0.f; v = warp_sum(v); if (threadIdx.x == 0) r_s = v; }
   __syncthreads();
-  float r = r_s;
+  float r = rsqrtf(r_s / n + eps);
   int nu = n / 32;
   for (int u = blockIdx.x * (blockDim.x >> 5) + warp; u < nu; u += gridDim.x * (blockDim.x >> 5)) {
     float v = x[u * 32 + lane] * r * w[u * 32 + lane];
