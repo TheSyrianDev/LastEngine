@@ -1,3 +1,5 @@
+<p align="center"><a href="https://github.com/TheSyrianDev/LastAI">Last AI</a> · <a href="https://github.com/TheSyrianDev/LastEngine">Last Engine</a> · <a href="https://github.com/TheSyrianDev/hf-dl">hf-dl</a></p>
+
 # LastEngine
 
 Clean-room LLM inference engine in Rust (CUDA kernels via NVRTC), aimed at MoE models on small GPUs (RTX 3050 4 GB first).
