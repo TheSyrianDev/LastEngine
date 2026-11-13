@@ -149,3 +149,15 @@ Caveats:
 - The llama.cpp r=3 run is unusable: the spread (±25 to ±140 tok/s) is far above the single-run values (326 / 314 / 23.5) from earlier the same day. GPU was idle at 2 MiB before the run and at 0 % after. Cause not found; treat the llama.cpp numbers from this run as invalid and re-run before quoting.
 - LastEngine prompts match the target token counts within about 1 %, so prefill is comparable in size. Its three 16K decode values also show run-to-run variance.
 - LastEngine's 4K prefill is higher here than in the earlier single run (763 with 3043 tokens), probably because the calibrated prompts are longer and the earlier run was shorter; not a like-for-like comparison with that row.
+
+## Concurrency baseline (2026-11-13, pre-step-4)
+
+RTX 3050 Laptop, MiniCPM5-2B Q4_K_M, `serve --ctx 4096` with `LE_SLOTS=4`, `tools/conc_bench.sh 8396 N 64` (N parallel chat requests, 64 max tokens, temperature 0). Machine lock held.
+
+| N | wall (s) | completion tokens | aggregate tok/s |
+|---|---|---|---|
+| 1 | 0.74 | 64 | 86.6 |
+| 2 | 1.34 | 128 | 95.2 |
+| 4 | 2.68 | 256 | 95.4 |
+
+Aggregate is flat from N=2 because the backend mutex serializes requests (one generation at a time). This is the baseline the step-4 batched loop must beat. llama-server `-np 1/2/4/8` numbers still to be measured under the same lock.
