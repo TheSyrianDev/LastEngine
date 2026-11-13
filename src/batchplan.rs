@@ -138,3 +138,23 @@ mod loop_tests {
         assert!(seqs.is_empty());
     }
 }
+
+/// Greedy (argmax) token per row from `decode_batch` logits. Ties go to the lowest index, like `local::sample` at temperature 0.
+/// Sampling with temperature > 0 is not in the batched path yet; callers must route such requests to the single-sequence path.
+pub fn greedy_rows(logits: &[Vec<f32>]) -> Vec<u32> {
+    logits.iter().map(|row| {
+        let mut best = 0usize;
+        for (i, &v) in row.iter().enumerate() { if v > row[best] { best = i; } }
+        best as u32
+    }).collect()
+}
+
+#[cfg(test)]
+mod greedy_tests {
+    use super::*;
+    #[test]
+    fn argmax_per_row_lowest_index_on_tie() {
+        let rows = vec![vec![0.1, 3.0, 2.0], vec![5.0, 5.0, 1.0], vec![-1.0, -0.5, -2.0]];
+        assert_eq!(greedy_rows(&rows), vec![1, 0, 1]);
+    }
+}
