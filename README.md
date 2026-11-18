@@ -4,6 +4,8 @@ Clean-room LLM inference engine in Rust (CUDA kernels via NVRTC), aimed at MoE m
 
 License: PolyForm Noncommercial 1.0.0 (see LICENSE, NOTICE). Source-available, not open source.
 
+<p align="center"><a href="https://github.com/TheSyrianDev/LastAI">Last AI</a> · <a href="https://github.com/TheSyrianDev/LastHarness">LastHarness</a> · LastEngine · <a href="https://github.com/TheSyrianDev/Model-Downloader">Model-Downloader</a></p>
+
 ## Rules
 - No code from the previous LastEngine / RustingStrata tree (kept at ~/Projects/LastEngine-legacy, tag `legacy-final`, used only as a benchmark baseline binary).
 - Ideas from other engines come from READMEs, papers and format specs only. See docs/TECHNIQUES.md.
