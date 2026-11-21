@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # CUDA is loaded dynamically at runtime (cudarc dynamic-loading), so
+      # the build needs no toolkit on the runner. Tests that need NVRTC or
+      # a device skip themselves when CUDA is absent (see gpu::nvrtc_compile).
+      - name: Build
+        run: cargo build --all-targets
+      - name: Test
+        run: cargo test
+      # fmt/clippy gates are deliberately not enforced yet: the tree has
+      # ~476 fmt diffs and clippy warnings as of 2026-11-21. Add them as
+      # required checks after a dedicated cleanup pass, not mixed into
+      # feature work.
