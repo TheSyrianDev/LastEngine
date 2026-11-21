@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""API conformance checks for what LastHarness/llama-swap use. usage: lhd_conformance.py MODEL.gguf [--keep]
+"""API conformance checks for what the lai core and llama-swap use. usage: lai_conformance.py MODEL.gguf [--keep]
 Starts `lastengine serve` on a spare port and checks: /health 503->200, /v1/models, /props, usage/timings, stream usage,
 stop strings, tool_calls, prefix-cache reuse, slot save/restore, cancel on client disconnect."""
 import json, os, socket, subprocess, sys, tempfile, time, urllib.request, urllib.error
