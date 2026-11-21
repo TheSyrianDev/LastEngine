@@ -191,6 +191,19 @@ impl DenseGpu {
     fn bqx(&self, x: Dp, t: usize, cols: usize) { let u = t * cols / 32; self.launch("quant_x", u.div_ceil(8) as u32, 256, 0, &[P(x), P(self.bxq), P(self.bxd), P(self.bxs), I(u as i32)]); }
     /// out[t][rows] = W · quantised x[t][cols] (int8 tensor-core path).
     fn bmm(&self, w: W, out: Dp, t: usize) {
+        // LE_MVN=1 (opt-in): small-N batched GEMV. Each weight row is read once for all t rows,
+        // with the same per-unit math and accumulation order as the solo matvec, so outputs are
+        // batch-invariant by construction (no atomics). For t <= 8 and the types mvn covers.
+        let mvn = std::env::var("LE_MVN").map_or(false, |v| v == "1");
+        if mvn && t <= 8 && matches!(w.ty, 2 | 8 | 11 | 12 | 13 | 14) {
+            let name = format!("mvn_{}", w.ty);
+            let units = w.cols / 32; let lpr = units.min(32); let rpb = 8 * (32 / lpr);
+            let smem = (t * units * 9 + t * units) * 4;
+            let mut b = self.st.launch_builder(&self.f[&name]);
+            for a in [P(w.cell), P(self.bxq), P(self.bxd), P(self.bxs), P(out), I(w.rows as i32), I(w.cols as i32), I(t as i32), I(w.cols as i32)] { match a { P(p) => { b.arg(p); } I(i) => { b.arg(i); } F(x) => { b.arg(x); } } }
+            unsafe { b.launch(LaunchConfig { grid_dim: (w.rows.div_ceil(rpb) as u32, 1, 1), block_dim: (256, 1, 1), shared_mem_bytes: smem as u32 }).expect("mvn launch"); }
+            return;
+        }
         let wide = std::env::var("LE_MMQ128").map_or(true, |v| v != "0");
         let name = match (w.ty, wide) { (2, false) => "mmq_2", (8, false) => "mmq_8", (11, false) => "mmq_11", (12, false) => "mmq_12", (13, false) => "mmq_13", (14, false) => "mmq_14",
             (2, true) => "mmq128_2", (8, true) => "mmq128_8", (11, true) => "mmq128_11", (12, true) => "mmq128_12", (13, true) => "mmq128_13", (14, true) => "mmq128_14",

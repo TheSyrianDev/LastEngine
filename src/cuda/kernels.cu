@@ -391,6 +391,61 @@ __device__ void mv_impl(const u8* const* ptrs, const signed char* xq, const floa
 #define MV(TY) extern "C" __global__ void matvec_##TY(const u8* const* p, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols, int xstride) { mv_impl<TY>(p, xq, xd, xs, o, rows, cols, xstride); }
 MV(2) MV(8) MV(11) MV(12) MV(13) MV(14) MV(16) MV(17) MV(18) MV(29) MV(134) MV(135) MV(137) MV(138) MV(139) MV(140) MV(141) MV(144) MV(145) MV(146) MV(152) MV(153) MV(154) MV(155) MV(156) MV(157) MV(158) MV(19) MV(20) MV(21) MV(22) MV(23)
 
+// Small-N batched GEMV (steal-plan P1.2): out[s*rows + r] = W[r,:] . x[s] for nslot rows at once.
+// Each weight row is read ONCE and dotted against every slot's quantised activations, which sit in
+// shared memory (units*9 ints + 2*units floats per slot). Same per-unit math and same lane->unit
+// assignment as mv_impl, so with nslot=1 the result is bitwise equal to matvec_TY. The accumulation
+// order per output is fixed (u ascending, then the same shfl_xor tree), independent of nslot: no
+// atomics, no split-K, batch-invariant by construction. Grid (ceil(rows/rpb), 1); 256 threads.
+template <int TY>
+__device__ void mvn_impl(const u8* const* ptrs, const signed char* xq, const float* xd, const int* xs, float* out, int rows, int cols, int nslot, int xstride) {
+  extern __shared__ int sm[];
+  int units = cols >> 5;
+  int* sxq = sm; float* sxd = (float*)(sm + nslot * units * 9);
+  for (int i = threadIdx.x; i < nslot * units * 8; i += 256) {
+    int s = i / (units * 8), k = i % (units * 8);
+    sxq[s * units * 9 + (k >> 3) * 9 + (k & 7)] = ((const int*)(xq + (size_t)s * xstride))[k];
+  }
+  for (int i = threadIdx.x; i < nslot * units; i += 256) {
+    int s = i / units, u = i % units;
+    sxd[s * units + u] = xd[(size_t)s * (xstride >> 5) + u];
+  }
+  __syncthreads();
+  const int UB = Q<TY>::UB, BY = Q<TY>::BYTES;
+  int lpr = units < 32 ? units : 32, rpw = 32 / lpr;
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  int r = (blockIdx.x * 8 + warp) * rpw + lane / lpr, li = lane % lpr;
+  bool ok = r < rows;
+  const u8* row = ptrs[0] + (size_t)(ok ? r : 0) * ((cols / (UB * 32)) * BY + Q<TY>::HDR);
+  // One weight pass: load each unit once, dot it against every slot.
+  float acc[8]; // nslot <= 8
+  #pragma unroll
+  for (int s = 0; s < 8; s++) acc[s] = 0.f;
+  if (ok) for (int u = li; u < units; u += lpr) {
+    int w[8]; float s0, s1, mn; uloadr<TY>(row + Q<TY>::HDR + (u / UB) * BY, u % UB, w, s0, s1, mn, row);
+    int a0[8], a1[8];
+    #pragma unroll
+    for (int s = 0; s < 8; s++) { a0[s] = 0; a1[s] = 0; }
+    for (int i = 0; i < 4; i++) {
+      #pragma unroll
+      for (int s = 0; s < 8; s++) {
+        if (s < nslot) { const int* xq_s = sxq + s * units * 9 + u * 9; a0[s] = DP(w[i], xq_s[i], a0[s]); a1[s] = DP(w[4 + i], xq_s[4 + i], a1[s]); }
+      }
+    }
+    #pragma unroll
+    for (int s = 0; s < 8; s++) if (s < nslot) acc[s] += sxd[s * units + u] * (s0 * (float)a0[s] + s1 * (float)a1[s]);
+  }
+  #pragma unroll
+  for (int s = 0; s < 8; s++) {
+    if (s >= nslot) break;
+    float a = acc[s];
+    for (int o = lpr >> 1; o; o >>= 1) a += __shfl_xor_sync(FULL, a, o);
+    if (ok && li == 0) out[(size_t)s * rows + r] = a;
+  }
+}
+#define MVN(TY) extern "C" __global__ void mvn_##TY(const u8* const* p, const signed char* xq, const float* xd, const int* xs, float* o, int rows, int cols, int nslot, int xstride) { mvn_impl<TY>(p, xq, xd, xs, o, rows, cols, nslot, xstride); }
+MVN(2) MVN(8) MVN(11) MVN(12) MVN(13) MVN(14)
+
 // F32 matvec (router, tiny projections): same shape
 extern "C" __global__ void matvecf(const u8* const* p, const float* x, float* o, int rows, int cols, int xstride) {
   extern __shared__ float xs[];
