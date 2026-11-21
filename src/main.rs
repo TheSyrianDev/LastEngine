@@ -8,6 +8,7 @@ mod dense;
 mod gguf;
 mod gpu;
 mod local;
+mod lora;
 mod server;
 mod quant;
 mod sched;
@@ -293,7 +294,7 @@ async fn main() {
             println!("steps {steps}");
             if ok { println!("BATCH LOOP OK"); } else { println!("BATCH LOOP FAIL"); std::process::exit(1); }
         }
-        cli::Cmd::TfDump { path, prompt, n } => {
+        cli::Cmd::TfDump { path, prompt, n, lora } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
             if let Err(e) = dense::check_arch(&g) { eprintln!("lastengine: {e}"); std::process::exit(1); }
@@ -304,7 +305,9 @@ async fn main() {
                 let ids2 = ids.clone(); let mut first = true;
                 Box::new(move |t| if first { first = false; gp.prefill(&ids2) } else { gp.forward(t.unwrap()) })
             } else {
-                let m = std::sync::Arc::new(cpu_ref::Model::load(&path, &g));
+                let mut model = cpu_ref::Model::load(&path, &g);
+                if let Some(lp) = &lora { let n = model.attach_lora(lp).unwrap_or_else(|e| { eprintln!("lastengine: {e}"); std::process::exit(1) }); eprintln!("lora: mounted {n} tensors from {lp}"); }
+                let m = std::sync::Arc::new(model);
                 let mut gp = gpu::Gpu::new(m, 4096, 128);
                 let ids2 = ids.clone(); let mut first = true;
                 Box::new(move |t| if first { first = false; gp.prefill(&ids2) } else { gp.forward(t.unwrap()) })
@@ -332,10 +335,12 @@ async fn main() {
             ix.sort_by(|a, b| logits[*b].partial_cmp(&logits[*a]).unwrap());
             for i in ix.iter().take(top) { println!("{} {:?} logprob {:.4}", i, tk.decode_bytes(&[*i as u32]).iter().map(|b| *b as char).collect::<String>(), logits[*i] - lse); }
         }
-        cli::Cmd::Gpu { path, prompt, top, margin } => {
+        cli::Cmd::Gpu { path, prompt, top, margin, lora } => {
             let g = gguf::Gguf::open(&path).expect("open");
             let tk = tokenizer::Tokenizer::from_gguf(&g).expect("tokenizer");
-            let m = std::sync::Arc::new(cpu_ref::Model::load(&path, &g));
+            let mut model = cpu_ref::Model::load(&path, &g);
+            if let Some(lp) = &lora { let n = model.attach_lora(lp).unwrap_or_else(|e| { eprintln!("lastengine: {e}"); std::process::exit(1) }); eprintln!("lora: mounted {n} tensors from {lp}"); }
+            let m = std::sync::Arc::new(model);
             let mut gp = gpu::Gpu::new(m, std::env::var("LE_CTX").ok().and_then(|v| v.parse().ok()).unwrap_or(2048), margin);
             let ids = tk.encode(&prompt);
             let t0 = std::time::Instant::now();

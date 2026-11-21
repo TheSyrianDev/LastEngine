@@ -1,24 +1,27 @@
 #!/usr/bin/env python3
 """Teacher-forced comparison of LastEngine vs llama.cpp.
-usage: tf_compare.py MODEL.gguf PROMPT N [--cpu-moe]
+usage: tf_compare.py MODEL.gguf PROMPT N [--cpu-moe] [--lora ADAPTER.gguf]
 LastEngine greedy-decodes N tokens (lastengine tf-dump); llama-server then scores each prefix prompt+gen[:k]
 (token-id prompts, n_probs). Reports top-1 agreement, near-tie disagreements (our token within 0.1 logprob of
 llama's best) and mean |dlogprob| of our chosen token. Pass bar: top-1 >= 98% counting near-ties as agreement."""
 import json, subprocess, sys, time, urllib.request, os
 model, prompt, n = sys.argv[1], sys.argv[2], int(sys.argv[3])
 moe = "--cpu-moe" in sys.argv
+lora = sys.argv[sys.argv.index("--lora") + 1] if "--lora" in sys.argv else None
 root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-out = open(os.environ["TF_DUMP"]).read().strip().splitlines()[-1] if os.environ.get("TF_DUMP") else subprocess.run([f"{root}/target/release/lastengine", "tf-dump", model, prompt, str(n)], capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
+out = open(os.environ["TF_DUMP"]).read().strip().splitlines()[-1] if os.environ.get("TF_DUMP") else subprocess.run([f"{root}/target/release/lastengine", "tf-dump", model, prompt, str(n)] + (["--lora", lora] if lora else []), capture_output=True, text=True, check=True).stdout.strip().splitlines()[-1]
 d = json.loads(out); pids, gen, top = d["prompt_ids"], d["gen_ids"], d["top"]
 port = int(os.environ.get("LLAMA_PORT", "8397"))
 external = "LLAMA_PORT" in os.environ
-cmd = [os.environ.get("LLAMA_SERVER") or os.path.expanduser("~/AI/engines/llama-mainline/build/bin/llama-server"), "-m", model, "--port", str(port), "-c", "8192", "-ngl", "99", "--no-webui"] + (["--cpu-moe"] if moe else [])
+cmd = [os.environ.get("LLAMA_SERVER") or os.path.expanduser("~/AI/engines/llama-mainline/build/bin/llama-server"), "-m", model, "--port", str(port), "-c", "8192", "-ngl", "99", "--no-webui"] + (["--cpu-moe"] if moe else []) + (["--lora", lora] if lora else [])
 srv = None if external else subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 def post(path, body):
     r = urllib.request.Request(f"http://127.0.0.1:{port}{path}", json.dumps(body).encode(), {"content-type": "application/json"})
     return json.load(urllib.request.urlopen(r, timeout=300))
 try:
     for _ in range(300):
+        if srv is not None and srv.poll() is not None:
+            raise SystemExit(f"llama-server exited with {srv.returncode} before answering on port {port}")
         try: urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=2); break
         except Exception: time.sleep(2)
     agree = near = 0; dsum = 0.0; cnt = 0; bad = []

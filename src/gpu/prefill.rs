@@ -82,6 +82,7 @@ impl Gpu {
             if ly.full {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
                 self.dense(ly.q.unwrap(), 0, pf.b0, t); self.dense(ly.k.unwrap(), 0, pf.b1, t); self.dense(ly.v.unwrap(), 0, pf.b2, t);
+                self.lora_add_b(l, "attn_q.weight", pf.h, pf.b0, t); self.lora_add_b(l, "attn_k.weight", pf.h, pf.b1, t); self.lora_add_b(l, "attn_v.weight", pf.h, pf.b2, t);
                 self.launch("attn_prep_b", ((nh + nkv) as u32, t as u32), 256, 0, &[P(pf.b0), P(pf.b1), P(pf.b2), P(ly.qn), P(ly.kn), P(pf.y), P(pf.b3), P(self.kc[l]), P(self.vc[l]),
                     I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos0 as i32), F(c.eps), P(if self.kvq == 3 { self.kscr } else { self.ksc[l] }), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
                 if self.kvq == 3 { self.tcq_after_prep(l, t, pos0, pf.b2, pf.y); }
@@ -99,11 +100,12 @@ impl Gpu {
                     }
     }
                 if self.kvq == 3 { self.launch("tcq_rot", ((t * nh * hd / 128) as u32, 1), 128, 0, &[P(pf.o), P(pf.b3), I(1)]); }
-                self.pqx(pf.o, nu(nh * hd), 1, 0); self.dense(ly.o.unwrap(), 1, pf.b1, t);
+                self.pqx(pf.o, nu(nh * hd), 1, 0); self.dense(ly.o.unwrap(), 1, pf.b1, t); self.lora_add_b(l, "attn_output.weight", pf.o, pf.b1, t);
                 self.launch("add_inplace", ((t * c.n_embd).div_ceil(256) as u32, 1), 256, 0, &[P(pf.x), P(pf.b1), I((t * c.n_embd) as i32)]);
             } else {
                 let ch = c.d_inner + 2 * c.n_group * c.d_state;
                 self.dense(ly.qkv.unwrap(), 0, pf.b0, t); self.dense(ly.gate.unwrap(), 0, pf.b1, t);
+                self.lora_add_b(l, "attn_qkv.weight", pf.h, pf.b0, t); self.lora_add_b(l, "attn_gate.weight", pf.h, pf.b1, t);
                 self.fmm(ly.beta.unwrap(), pf.h, pf.b2, t); self.fmm(ly.alpha.unwrap(), pf.h, pf.b3, t);
                 let dr = |s: &Gpu, nm: &str, p: Dp, w: usize| if s.dbg && l == 0 && s.dbg_pos >= pos0 && s.dbg_pos < pos0 + t { s.dump(nm, p + ((s.dbg_pos - pos0) * w * 4) as u64, w) };
                 dr(self, "qkv", pf.b0, ch); dr(self, "gate", pf.b1, 4096); dr(self, "beta", pf.b2, 32); dr(self, "alpha", pf.b3, 32);
@@ -117,7 +119,7 @@ impl Gpu {
                     I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps), I(t as i32), I(ch as i32)]);
                 }
                 dr(self, "conv", pf.y, ch); dr(self, "dout", pf.o, 4096);
-                self.pqx(pf.o, nu(c.d_inner), 1, 0); self.dense(ly.ssm_out.unwrap(), 1, pf.b1, t);
+                self.pqx(pf.o, nu(c.d_inner), 1, 0); self.dense(ly.ssm_out.unwrap(), 1, pf.b1, t); self.lora_add_b(l, "ssm_out.weight", pf.o, pf.b1, t);
                 self.launch("add_inplace", ((t * c.n_embd).div_ceil(256) as u32, 1), 256, 0, &[P(pf.x), P(pf.b1), I((t * c.n_embd) as i32)]);
             }
             // ---- MoE ----
@@ -147,9 +149,10 @@ impl Gpu {
             self.launch("router_topk_b", (t as u32, 1), 256, 0, &[P(pf.lg), I(c.n_expert as i32), I(k as i32), P(pf.idx), P(pf.rw)]);
             // shared expert (dense) while the host reads the routing
             self.dense(ly.sh_gate, 0, pf.sg, t); self.dense(ly.sh_up, 0, pf.su, t);
+            self.lora_add_b(l, "ffn_gate_shexp.weight", pf.h, pf.sg, t); self.lora_add_b(l, "ffn_up_shexp.weight", pf.h, pf.su, t);
             self.launch("swiglu", ((t * c.ff_shexp).div_ceil(256) as u32, 1), 256, 0, &[P(pf.sg), P(pf.su), P(pf.sa), I((t * c.ff_shexp) as i32)]);
-            self.pqx(pf.sa, nu(c.ff_shexp), 1, 0); self.dense(ly.sh_down, 1, pf.sd, t);
-            self.fmm(ly.shg_in, pf.h, pf.shg, t);
+            self.pqx(pf.sa, nu(c.ff_shexp), 1, 0); self.dense(ly.sh_down, 1, pf.sd, t); self.lora_add_b(l, "ffn_down_shexp.weight", pf.sa, pf.sd, t);
+            self.fmm(ly.shg_in, pf.h, pf.shg, t); self.lora_add_b(l, "ffn_gate_inp_shexp.weight", pf.h, pf.shg, t);
             let mut idx = vec![0i32; t * k];
             unsafe { result::memcpy_dtoh_sync(&mut idx, pf.idx).unwrap() };
             // group pairs by expert

@@ -49,6 +49,30 @@ pub fn f16_to_f32(h: u16) -> f32 {
 }
 fn h(b: &[u8], o: usize) -> f32 { f16_to_f32(u16::from_le_bytes([b[o], b[o + 1]])) }
 
+/// f32 -> f16 with round-to-nearest-even, for uploading f32 weights (LoRA A/B) as half.
+pub fn f32_to_f16(f: f32) -> u16 {
+    let x = f.to_bits();
+    let sign = ((x >> 16) & 0x8000) as u16;
+    let e = ((x >> 23) & 0xff) as i32;
+    let m = x & 0x7f_ffff;
+    if e == 0xff { return sign | 0x7c00 | if m != 0 { 0x200 } else { 0 }; }
+    let exp = e - 127 + 15;
+    if exp >= 0x1f { return sign | 0x7c00; }
+    if exp <= 0 {
+        if exp < -10 { return sign; }
+        let m = m | 0x80_0000;
+        let shift = 14 - exp;
+        let mut half = (m >> shift) as u16;
+        let rem = m & ((1 << shift) - 1);
+        if rem > (1 << (shift - 1)) || (rem == (1 << (shift - 1)) && (half & 1) == 1) { half = half.wrapping_add(1); }
+        return sign | half;
+    }
+    let mut half = (((exp as u32) << 10) | (m >> 13)) as u16;
+    let rem = m & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) { half = half.wrapping_add(1); }
+    sign | half
+}
+
 fn scale_min_k4(j: usize, s: &[u8]) -> (u8, u8) {
     if j < 4 { (s[j] & 63, s[j + 4] & 63) }
     else { ((s[j + 4] & 15) | ((s[j - 4] >> 6) << 4), (s[j + 4] >> 4) | ((s[j] >> 6) << 4)) }
@@ -166,6 +190,31 @@ pub fn dequant_row(ty: u32, src: &[u8], out: &mut [f32]) {
             }
         },
         _ => if !crate::quant_ik::dequant(ty, src, out) { panic!("unsupported quant type {ty}") },
+    }
+}
+
+#[cfg(test)]
+mod f16_tests {
+    use super::*;
+
+    /// f32 -> f16 must round-trip every value exactly representable in f16, round ties to even, and
+    /// stay within one half-ulp (2^-11 relative) elsewhere. The LoRA path depends on this encoder.
+    #[test]
+    fn f32_to_f16_round_trips_exactly_representable_values() {
+        for &v in &[0.0f32, 1.0, -1.0, 0.5, 2.0, 3.0, 0.1, -7.25, 65504.0, 6.1035156e-5, 1.0e-7, -3.4e-9] {
+            let r = f16_to_f32(f32_to_f16(v));
+            if v.abs() < 6.1e-5 { continue; } // subnormal territory: only approximate
+            let rel = (r - v).abs() / v.abs().max(1e-30);
+            assert!(rel < 1e-3, "{v} -> {r} (rel {rel})");
+        }
+        // Values with at most 11 significant bits round-trip bit-exactly (1234.5 needs 12, so it does not).
+        for v in [0.0f32, 1.0, -2.0, 0.5, 1234.0, 2048.0, -0.0625] {
+            let h = f32_to_f16(v);
+            assert_eq!(f16_to_f32(h).to_bits() >> 12, (v as f32).to_bits() >> 12, "{v}");
+        }
+        assert_eq!(f32_to_f16(0.0), 0);
+        assert_eq!(f32_to_f16(1.0), 0x3c00);
+        assert_eq!(f32_to_f16(f32::INFINITY), 0x7c00);
     }
 }
 

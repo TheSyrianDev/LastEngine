@@ -1,9 +1,10 @@
 //! Slow, simple f32 CPU reference forward pass for qwen35moe (Gated-DeltaNet + gated attention + shared-expert MoE).
 //! Purpose: correctness oracle for the fast backends. Dequantizes weight rows on the fly.
-use crate::{gguf::{Gguf, Value}, quant};
+use crate::{gguf::{Gguf, Value}, lora::Lora, quant};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 #[derive(Clone)]
 pub struct Cfg {
@@ -20,6 +21,8 @@ pub struct Model {
     pub kv_repeat_interleave: bool,
     /// clover_moe GGUFs store the raw A_log in `ssm_a`; the decay rate is `-exp(A_log)`.
     pub ssm_a_raw: bool,
+    /// Mounted LoRA adapter, if any. Its deltas are added to every targeted matvec result.
+    pub lora: Option<Arc<Lora>>,
 }
 
 #[derive(Clone)]
@@ -55,7 +58,21 @@ impl Model {
         let t = g.tensors.iter().map(|t| (t.name.clone(), T { ty: t.ggml_type, off: (g.data_start + t.offset) as usize,
             dims: t.dims.iter().map(|d| *d as usize).collect() })).collect();
         let vocab = g.tensors.iter().find(|t| t.name == "token_embd.weight").unwrap().dims[1] as usize;
-        Model { cfg, mmap, t, vocab, ssm_a_raw: arch == "clover_moe", kv_repeat_interleave: std::env::var("KV_INTERLEAVE").is_ok() }
+        Model { cfg, mmap, t, vocab, ssm_a_raw: arch == "clover_moe", kv_repeat_interleave: std::env::var("KV_INTERLEAVE").is_ok(), lora: None }
+    }
+
+    /// Mount a LoRA adapter on this model. Fails loudly rather than silently running the base: an
+    /// adapter that targets no tensor of this model is almost always the wrong adapter.
+    pub fn attach_lora(&mut self, path: &str) -> Result<usize, String> {
+        let l = Lora::load(path)?;
+        let missing: Vec<&String> = l.pairs.keys().filter(|n| !self.t.contains_key(*n)).collect();
+        if !missing.is_empty() {
+            return Err(format!("{path}: {} of {} adapter tensors do not exist in this model, e.g. {}",
+                missing.len(), l.len(), missing[0]));
+        }
+        let n = l.len();
+        self.lora = Some(Arc::new(l));
+        Ok(n)
     }
 
     pub fn embed(&self, token: u32) -> Vec<f32> {
@@ -111,10 +128,15 @@ impl Model {
         let (cols, rows) = (t.dims[0], t.dims[1]);
         let rb = quant::row_bytes(t.ty, cols);
         let base = expert * rows * rb;
-        (0..rows).into_par_iter().map_init(|| vec![0f32; cols], |buf, r| {
+        let mut y: Vec<f32> = (0..rows).into_par_iter().map_init(|| vec![0f32; cols], |buf, r| {
             quant::dequant_row(t.ty, &b[base + r * rb..base + (r + 1) * rb], buf);
             buf.iter().zip(x).map(|(a, b)| a * b).sum::<f32>()
-        }).collect()
+        }).collect();
+        // Mounted adapter: y += (alpha/rank) B (A x). Expert slabs and the head are never targeted.
+        if let Some(l) = &self.lora {
+            if let Some(d) = l.delta(name, x) { for (a, b) in y.iter_mut().zip(d) { *a += b; } }
+        }
+        y
     }
 
     pub fn forward(&self, st: &mut State, token: u32, pos: usize) -> Vec<f32> {

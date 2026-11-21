@@ -20,7 +20,7 @@ pub enum Cmd {
     Inspect { path: String },
     H2d { path: String },
     /// GPU forward: top-N logprobs + 32-token greedy decode.
-    Gpu { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize, #[arg(default_value_t = 128)] margin: usize },
+    Gpu { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize, #[arg(default_value_t = 128)] margin: usize, #[arg(long)] lora: Option<String> },
     /// CPU reference: print top-N next-token logprobs for PROMPT.
     /// Clover block-diffusion draft quality check on the CPU reference (draft a block, compare with greedy AR)
     CloverDraft { path: String, prompt: String, #[arg(default_value_t = 1)] blocks: usize },
@@ -37,7 +37,7 @@ pub enum Cmd {
     /// Step-4 gate: run prompts through batchplan::run_loop (decode_batch + greedy_rows, one slot each) and compare with solo greedy decode. Prompts separated by '|'.
     BatchLoop { path: String, prompts: String, #[arg(default_value_t = 30)] n: usize },
     /// Greedy-decode N tokens on the GPU and print JSON {prompt_ids,gen_ids,top} (top = per step top-5 [id,logprob]) for teacher-forced comparison with another engine
-    TfDump { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize },
+    TfDump { path: String, prompt: String, #[arg(default_value_t = 100)] n: usize, #[arg(long)] lora: Option<String> },
     Ref { path: String, prompt: String, #[arg(default_value_t = 5)] top: usize },
     Dequant { path: String, name: String, n: usize, out: String },
     Template { path: String },
@@ -78,4 +78,8 @@ pub struct ServeArgs {
     /// Use the built-in stub backend (no model needed); for protocol tests.
     #[arg(long)]
     pub stub: bool,
+    /// Mount a LoRA adapter (GGUF, `adapter.type = lora`) on the served model. Mounted at run time,
+    /// so the base GGUF stays untouched and the delta keeps f16/f32 precision.
+    #[arg(long)]
+    pub lora: Option<String>,
 }

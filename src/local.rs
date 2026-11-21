@@ -20,7 +20,7 @@ struct Inner { gpu: Arc<Mutex<Eng>>, hist: Vec<u32>, rng: u64, snap: Option<(Vec
 pub struct Local { batch: Option<Mutex<std::sync::mpsc::Sender<crate::reqsched::Request>>>, inner: Mutex<Inner>, tok: Tokenizer, tmpl: String, name: String, n_ctx: usize, n_params: u64, bos: String, eos: String }
 
 impl Local {
-    pub fn load(path: &str, ctx: usize, margin: usize, tmpl_file: Option<&str>) -> Result<Local, String> {
+    pub fn load(path: &str, ctx: usize, margin: usize, tmpl_file: Option<&str>, lora: Option<&str>) -> Result<Local, String> {
         let g = Gguf::open(path).map_err(|e| format!("{e}"))?;
         let tok = Tokenizer::from_gguf(&g)?;
         let tmpl = match tmpl_file {
@@ -31,8 +31,14 @@ impl Local {
         let name = std::path::Path::new(path).file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
         let n_params = g.tensors.iter().map(|t| t.dims.iter().product::<u64>()).sum();
         crate::dense::check_arch(&g)?;
-        let gpu = if crate::dense::Dense::supports(&g).is_some() { Eng::Dense(crate::dense::DenseEng::new(crate::dense::Dense::load(path, &g), ctx)) }
-                  else { Eng::Gpu(Gpu::new(Arc::new(Model::load(path, &g)), ctx, margin)) };
+        let gpu = if crate::dense::Dense::supports(&g).is_some() {
+            if lora.is_some() { return Err("a LoRA adapter is only supported on the MoE GPU path, not on dense models".into()); }
+            Eng::Dense(crate::dense::DenseEng::new(crate::dense::Dense::load(path, &g), ctx))
+        } else {
+            let mut m = Model::load(path, &g);
+            if let Some(lp) = lora { let n = m.attach_lora(lp)?; eprintln!("lora: mounted {n} tensors from {lp}"); }
+            Eng::Gpu(Gpu::new(Arc::new(m), ctx, margin))
+        };
         let s = |id: Option<u32>| id.map(|i| tok.tokens[i as usize].clone()).unwrap_or_default();
         let (bos, eos) = (s(tok.bos), s(tok.eos));
         let mut eos_ids: Vec<u32> = ["<|im_end|>", "<|endoftext|>"].iter().filter_map(|t| tok.tokens.iter().position(|x| x == t).map(|i| i as u32)).collect();

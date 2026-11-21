@@ -405,6 +405,47 @@ extern "C" __global__ void matvecf(const u8* const* p, const float* x, float* o,
   if (lane == 0) o[(size_t)slot * rows + r] = a;
 }
 
+// LoRA mount: o += scale * B (A x), with A [rank][cols] and B [rows][rank] kept in f16 (the adapter's own
+// precision, so a full 290-tensor adapter is 41 MB of VRAM). Two stages in one launch: one warp per
+// A row writes t[rank] in f32, then every thread adds its B row's contribution.
+extern "C" __global__ void lora_mv(const float* x, const __half* a, const __half* b, float* o, int rank, int cols, int rows, float scale) {
+  extern __shared__ float t[];
+  int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, nw = blockDim.x >> 5;
+  for (int r = warp; r < rank; r += nw) {
+    const __half* ar = a + (size_t)r * cols; float s = 0.f;
+    for (int i = lane; i < cols; i += 32) s += __half2float(ar[i]) * x[i];
+    s = warp_sum(s);
+    if (lane == 0) t[r] = s;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+    const __half* br = b + (size_t)i * rank; float s = 0.f;
+    for (int r = 0; r < rank; r++) s += __half2float(br[r]) * t[r];
+    o[i] += scale * s;
+  }
+}
+
+// Batched LoRA mount for prefill: one block per token, o[token] += scale * B (A x[token]).
+extern "C" __global__ void lora_mmb(const float* x, const __half* a, const __half* b, float* o, int rank, int cols, int rows, int t, float scale) {
+  int tok = blockIdx.x; if (tok >= t) return;
+  extern __shared__ float sh[];
+  const float* xt = x + (size_t)tok * cols;
+  int nw = blockDim.x >> 5, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+  for (int r = warp; r < rank; r += nw) {
+    const __half* ar = a + (size_t)r * cols; float s = 0.f;
+    for (int i = lane; i < cols; i += 32) s += __half2float(ar[i]) * xt[i];
+    s = warp_sum(s);
+    if (lane == 0) sh[r] = s;
+  }
+  __syncthreads();
+  float* ot = o + (size_t)tok * rows;
+  for (int i = threadIdx.x; i < rows; i += blockDim.x) {
+    const __half* br = b + (size_t)i * rank; float s = 0.f;
+    for (int r = 0; r < rank; r++) s += __half2float(br[r]) * sh[r];
+    ot[i] += scale * s;
+  }
+}
+
 // ---- elementwise / norms ----
 extern "C" __global__ void rmsnorm(const float* x, const float* w, float* o, int n, float eps) {
   __shared__ float red[32];

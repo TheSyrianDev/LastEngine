@@ -22,6 +22,8 @@ struct Lay {
     qkv: Option<W>, gate: Option<W>, beta: Option<W>, alpha: Option<W>, ssm_out: Option<W>, conv_w: Dp, a_log: Dp, dt_b: Dp, ssm_norm: Dp, wr: Dp, bd_ls: Dp, bd_hb: Dp, bd_hc: Dp,
     ety: [u32; 3], ebytes: [usize; 3],
 }
+/// One mounted LoRA pair on the device: A is [rank][cols], B is [rows][rank], both f16.
+struct LoraW { a: Dp, b: Dp, rank: usize, rows: usize, cols: usize, scale: f32 }
 pub struct Mtp { eh: W, enorm: Dp, hnorm: Dp, shn: Dp }
 enum A { P(Dp), I(i32), F(f32) }
 use A::*;
@@ -36,7 +38,7 @@ pub struct Gpu {
     arena: Dp, slot_bytes: usize, n_slots: usize, slot_of: HashMap<(usize, usize), usize>, key_of: Vec<Option<(usize, usize)>>, last_use: Vec<u64>, tick: u64,
     cs: sys::CUstream, ev: sys::CUevent, stg: *mut u8, pf_pending: bool, store: *mut u8, store_off: Vec<usize>, ph: Dp, plog: Dp, pidx: Dp, prw: Dp, pf_extra: usize,
     pf: Option<Box<prefill::Pf>>, dbg: bool, dbg_pos: usize, mmq: bool, wave: u64, comp_ev: [sys::CUevent; 4], cp_ev: [sys::CUevent; 4],
-    pv_part: Dp, kscr: Dp, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, tab_h: *mut i32, tab_d: Dp, prot: Vec<bool>, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, pub preview: bool, pub draft_on: bool, pub drafts_iters: u64, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
+    pv_part: Dp, kscr: Dp, loras: Vec<HashMap<&'static str, LoraW>>, pub(crate) pheat: Vec<u32>, rope_f: Dp, rope_ms: f32, pub kvq: i32, tab_h: *mut i32, tab_d: Dp, prot: Vec<bool>, nall: usize, mtp: Option<Mtp>, hprev: Dp, mcat: Dp, snap: Vec<(Dp, Dp)>, pub rows_out: Vec<Vec<f32>>, pub want_rows: bool, pub preview: bool, pub draft_on: bool, pub drafts_iters: u64, ksc: Vec<Dp>, vsc: Vec<Dp>, pub hits: u64, pub misses: u64, pub pf_issued: u64, pub ctx_len: usize, pub pos: usize,
 }
 
 unsafe impl Send for Gpu {}
@@ -69,7 +71,7 @@ impl Gpu {
         let module = ctx.load_module(ptx).expect("module");
         let mut f = HashMap::new();
         for n in ["matvecf", "quant_x", "matvec_2", "matvec_8", "matvec_11", "matvec_12", "matvec_13", "matvec_14", "matvec_16", "matvec_17", "matvec_18", "matvec_19", "matvec_20", "matvec_21", "matvec_22", "matvec_23", "matvec_29", "matvec_134", "matvec_135", "matvec_137", "matvec_138", "matvec_139", "matvec_140", "matvec_141", "matvec_144", "matvec_145", "matvec_146", "matvec_152", "matvec_153", "matvec_154", "matvec_155", "matvec_156", "matvec_157", "matvec_158", "mmq_2", "mmq_8", "mmq_11", "mmq_12", "mmq_13", "mmq_14", "mmq_16", "mmq_17", "mmq_18", "mmq_19", "mmq_20", "mmq_21", "mmq_22", "mmq_23", "mmq_29", "mmq_134", "mmq_135", "mmq_137", "mmq_138", "mmq_139", "mmq_140", "mmq_141", "mmq_144", "mmq_145", "mmq_146", "mmq_152", "mmq_153", "mmq_154", "mmq_155", "mmq_156", "mmq_157", "mmq_158", "add_rmsnorm", "build_ptrs", "rmsnorm", "add_inplace", "swiglu",
-                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step",
+                  "router_topk", "moe_combine", "attn_prep", "attn_scores", "attn_softmax", "attn_pv", "attn_pv_split", "attn_pv_reduce", "tcq_encode", "tcq_rot", "delta_conv", "delta_step", "lora_mv", "lora_mmb",
                   "mm_2", "mm_8", "mm_11", "mm_12", "mm_13", "mm_14", "mm_16", "mm_17", "mm_18", "mm_19", "mm_20", "mm_21", "mm_22", "mm_23", "mm_29", "mm_134", "mm_135", "mm_137", "mm_138", "mm_139", "mm_140", "mm_141", "mm_144", "mm_145", "mm_146", "mm_152", "mm_153", "mm_154", "mm_155", "mm_156", "mm_157", "mm_158", "mmf", "mmf2", "rmsnorm_b", "router_topk_b", "moe_combine_b", "attn_prep_b", "attn_scores_b", "attn_softmax_b", "attn_pv_b", "attn_flash_256", "attn_flash_256_nc", "delta_conv_pv", "delta_pv", "delta_conv_b", "delta_step_b"] {
             f.insert(n, module.load_function(n).unwrap_or_else(|e| panic!("{n}: {e:?}")));
         }
@@ -112,6 +114,22 @@ impl Gpu {
         }
         let out_norm = vec1("output_norm.weight");
         let out_w = mat("output.weight");
+        // Mounted adapter: upload only the tensors it names, as f16. A base run allocates nothing here.
+        let roles = ["attn_q.weight", "attn_k.weight", "attn_v.weight", "attn_output.weight", "attn_qkv.weight", "attn_gate.weight",
+                     "ssm_out.weight", "ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight", "ffn_gate_inp_shexp.weight"];
+        let loras: Vec<HashMap<&'static str, LoraW>> = (0..nall).map(|l| {
+            let mut map = HashMap::new();
+            if let Some(lr) = &m.lora {
+                for role in roles {
+                    let Some(p) = lr.pairs.get(&format!("blk.{l}.{role}")) else { continue };
+                    let a: Vec<u16> = p.a.iter().map(|v| crate::quant::f32_to_f16(*v)).collect();
+                    let b: Vec<u16> = p.b.iter().map(|v| crate::quant::f32_to_f16(*v)).collect();
+                    map.insert(role, LoraW { a: dup(&a), b: dup(&b), rank: p.rank, rows: p.rows, cols: p.cols, scale: lr.alpha / p.rank as f32 });
+                }
+            }
+            map
+        }).collect();
+        if let Some(lr) = &m.lora { eprintln!("lora: mounted {} tensors from {}", lr.len(), lr.path); }
         let (hd, nkv, nh) = (c.head_dim, c.n_kv, c.n_head);
         let conv_ch = c.d_inner + 2 * c.n_group * c.d_state;
         let (rope_tab, rope_ms) = {
@@ -208,7 +226,7 @@ impl Gpu {
             shg_t: a(c.ff_shexp), shu_t: a(c.ff_shexp), sha_t: a(c.ff_shexp), shd_t: a(c.n_embd),
             ptr_g: pbase, ptr_u: pbase + 64, ptr_d: pbase + 128,
             xqb: [dalloc(16384), dalloc(16384)], xdb: [dalloc(2048), dalloc(2048)], xsb: [dalloc(2048), dalloc(2048)],
-            conv, sdelta, kc, vc, lay, out_norm, out_w,
+            conv, sdelta, kc, vc, lay, loras, out_norm, out_w,
             arena, slot_bytes, n_slots, slot_of: HashMap::new(), key_of: vec![None; n_slots], last_use: vec![0; n_slots], tick: 0, hits: 0, misses: 0, ctx_len, pos: 0, kscr: dalloc(prefill::tmax().max(1) * nkv * hd * 4), pv_part: dalloc((ctx_len / 256 + 2) * nh * hd * 4), pheat: vec![0; c.n_layer * c.n_expert], rope_f, rope_ms, kvq, ksc, vsc,
             f, st, _ctx: ctx, m,
         }
@@ -236,6 +254,22 @@ impl Gpu {
             &[P(ptrs), P(self.xqb[set]), P(self.xdb[set]), P(self.xsb[set]), P(out), I(rows as i32), I(cols as i32), I(xstride as i32)]);
     }
     pub fn mv(&self, w: W, x: Dp, set: usize, out: Dp) { self.mv_ptrs(w.ty, w.cell, x, set, out, w.rows, w.cols, 0, 1); }
+    /// Add the mounted LoRA delta for one projection: `out += (alpha/rank) * B (A x)`. `x` is the raw
+    /// f32 activation the projection itself just read. No-op when the layer/tensor is not targeted.
+    fn lora_add(&self, l: usize, role: &'static str, x: Dp, out: Dp) {
+        if let Some(p) = self.loras.get(l).and_then(|m| m.get(role)) {
+            self.launch("lora_mv", (1, 1), 256, (p.rank * 4) as u32,
+                &[P(x), P(p.a), P(p.b), P(out), I(p.rank as i32), I(p.cols as i32), I(p.rows as i32), F(p.scale)]);
+        }
+    }
+    /// Same delta over a prefill batch: `x` and `out` are [t][cols] and [t][rows]. The prompt pass has its
+    /// own batched GEMMs, so without this the adapter would only shape the decode, not the answer.
+    fn lora_add_b(&self, l: usize, role: &'static str, x: Dp, out: Dp, t: usize) {
+        if let Some(p) = self.loras.get(l).and_then(|m| m.get(role)) {
+            self.launch("lora_mmb", (t as u32, 1), 256, (p.rank * 4) as u32,
+                &[P(x), P(p.a), P(p.b), P(out), I(p.rank as i32), I(p.cols as i32), I(p.rows as i32), I(t as i32), F(p.scale)]);
+        }
+    }
     fn rms(&self, x: Dp, w: Dp, o: Dp, n: usize) { self.launch("rmsnorm", (1, 1), 256, 0, &[P(x), P(w), P(o), I(n as i32), F(self.m.cfg.eps)]); }
     fn dump(&self, label: &str, p: Dp, n: usize) { let mut v = vec![0f32; n]; unsafe { sys::cuStreamSynchronize(self.st.cu_stream()).result().unwrap(); result::memcpy_dtoh_sync(&mut v, p).unwrap() }; eprintln!("  {label} {:.4} {}", v.iter().map(|a| a * a).sum::<f32>().sqrt(), v[..4].iter().map(|a| format!("{a:.3}")).collect::<Vec<_>>().join(",")); }
     fn add(&self, x: Dp, y: Dp, n: usize) { self.launch("add_inplace", (n.div_ceil(256) as u32, 1), 256, 0, &[P(x), P(y), I(n as i32)]); }
@@ -535,6 +569,7 @@ impl Gpu {
             if ly.full {
                 let (nh, nkv, hd) = (c.n_head, c.n_kv, c.head_dim);
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.q.unwrap(), self.h, 0, self.t0); self.mv(ly.k.unwrap(), self.h, 0, self.t1); self.mv(ly.v.unwrap(), self.h, 0, self.t2);
+                self.lora_add(l, "attn_q.weight", self.h, self.t0); self.lora_add(l, "attn_k.weight", self.h, self.t1); self.lora_add(l, "attn_v.weight", self.h, self.t2);
                 self.launch("attn_prep", ((nh + nkv) as u32, 1), 256, 0, &[P(self.t0), P(self.t1), P(self.t2), P(ly.qn), P(ly.kn), P(self.y), P(self.t3), P(self.kc[l]), P(self.vc[l]),
                     I(nh as i32), I(nkv as i32), I(hd as i32), I(c.rope_dim as i32), F(self.rope_ms), I(pos as i32), F(c.eps), P(if self.kvq == 3 { self.kscr } else { self.ksc[l] }), P(self.vsc[l]), I(self.kvq), P(self.rope_f)]);
                 if self.kvq == 3 { self.tcq_after_prep(l, 1, pos, self.t2, self.y); }
@@ -545,17 +580,18 @@ impl Gpu {
                 self.launch3("attn_pv_split", (nkv as u32, nsp as u32, 1), hd as u32, 0, &[P(self.scores), P(self.vc[l]), P(self.pv_part), I(nkv as i32), I(nh as i32), I(hd as i32), I(n as i32), I(self.ctx_len as i32), P(self.vsc[l]), I(self.kvq), I(256)]);
                 self.launch("attn_pv_reduce", (nh as u32, 1), hd as u32, 0, &[P(self.pv_part), P(self.t3), P(self.t0), I(nh as i32), I(hd as i32), I(nsp as i32), I(self.kvq)]);
                 if self.kvq == 3 { self.launch("tcq_rot", ((nh * hd / 128) as u32, 1), 128, 0, &[P(self.t0), P(self.t3), I(1)]); }
-                self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1);
+                self.qx(self.t0, nh * hd, 1); self.mv(ly.o.unwrap(), self.t0, 1, self.t1); self.lora_add(l, "attn_output.weight", self.t0, self.t1);
             } else {
                 let ch = c.d_inner + 2 * c.n_group * c.d_state;
                 self.qx(self.h, c.n_embd, 0); self.mv(ly.qkv.unwrap(), self.h, 0, self.t0); self.mv(ly.gate.unwrap(), self.h, 0, self.t1);
+                self.lora_add(l, "attn_qkv.weight", self.h, self.t0); self.lora_add(l, "attn_gate.weight", self.h, self.t1);
                 self.mv(ly.beta.unwrap(), self.h, 0, self.t2); self.mv(ly.alpha.unwrap(), self.h, 0, self.t3);
                 if self.dbg && pos == self.dbg_pos && l == 0 { self.dump("qkv", self.t0, ch); self.dump("gate", self.t1, 4096); self.dump("beta", self.t2, 32); self.dump("alpha", self.t3, 32); }
                 self.launch("delta_conv", (ch.div_ceil(256) as u32, 1), 256, 0, &[P(self.t0), P(ly.conv_w), P(self.conv[l]), P(self.y), I(ch as i32), I(c.conv_k as i32)]);
                 self.launch("delta_step", (c.n_vhead as u32, 1), 128, 0, &[P(self.y), P(self.t3), P(self.t2), P(ly.a_log), P(ly.dt_b), P(self.t1), P(ly.ssm_norm), P(self.sdelta[l]), P(self.t0),
                     I(c.n_group as i32), I(c.n_vhead as i32), I(c.d_state as i32), F(c.eps)]);
                 if self.dbg && pos == self.dbg_pos && l == 0 { self.dump("conv", self.y, ch); self.dump("dout", self.t0, 4096); }
-                self.qx(self.t0, c.d_inner, 1); self.mv(ly.ssm_out.unwrap(), self.t0, 1, self.t1);
+                self.qx(self.t0, c.d_inner, 1); self.mv(ly.ssm_out.unwrap(), self.t0, 1, self.t1); self.lora_add(l, "ssm_out.weight", self.t0, self.t1);
             }
             // MoE
             if self.dbg && pos == self.dbg_pos { self.dump("mix", self.x, c.n_embd); }
@@ -572,9 +608,10 @@ impl Gpu {
                 self.launch("router_topk", (1, 1), 32, 0, &[P(self.plog), I(c.n_expert as i32), I(kk as i32), P(self.pidx), P(self.prw)]);
             }
             self.mv(ly.sh_gate, self.h, 0, self.shg_t); self.mv(ly.sh_up, self.h, 0, self.shu_t);
+            self.lora_add(l, "ffn_gate_shexp.weight", self.h, self.shg_t); self.lora_add(l, "ffn_up_shexp.weight", self.h, self.shu_t);
             self.swiglu(self.shg_t, self.shu_t, self.sha_t, c.ff_shexp);
-            self.qx(self.sha_t, c.ff_shexp, 1); self.mv(ly.sh_down, self.sha_t, 1, self.shd_t);
-            self.mv(ly.shg_in, self.h, 0, self.shg);
+            self.qx(self.sha_t, c.ff_shexp, 1); self.mv(ly.sh_down, self.sha_t, 1, self.shd_t); self.lora_add(l, "ffn_down_shexp.weight", self.sha_t, self.shd_t);
+            self.mv(ly.shg_in, self.h, 0, self.shg); self.lora_add(l, "ffn_gate_inp_shexp.weight", self.h, self.shg);
             let mut both = [0i32; 32];
             unsafe { result::memcpy_dtoh_sync(&mut both, self.idx).unwrap() };
             let idx = &both[..16]; let pi = &both[16..32];

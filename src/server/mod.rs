@@ -33,7 +33,8 @@ pub async fn run(a: ServeArgs) -> Result<(), String> {
         let (ctx, margin) = (a.ctx.unwrap_or(8192), a.vram_margin.unwrap_or(128));
         let tf = a.chat_template_file.clone();
         if let Err(e) = crate::tune::apply_profile_env(&path, ctx).map(|_| ()) { eprintln!("profile: {e}"); }
-        let l = tokio::task::spawn_blocking(move || crate::local::Local::load(&path, ctx, margin, tf.as_deref())).await.map_err(|e| e.to_string())??;
+        let lr = a.lora.clone();
+        let l = tokio::task::spawn_blocking(move || crate::local::Local::load(&path, ctx, margin, tf.as_deref(), lr.as_deref())).await.map_err(|e| e.to_string())??;
         Arc::new(l)
     };
     let max_queue = std::env::var("LE_MAX_QUEUE").ok().and_then(|v| v.parse().ok()).unwrap_or(8usize);
